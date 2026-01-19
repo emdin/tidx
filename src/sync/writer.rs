@@ -72,7 +72,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     let staging_table = format!("txs_staging_{}", std::process::id());
     
     conn.execute(
-        &format!("CREATE TEMP TABLE IF NOT EXISTS {} (LIKE txs INCLUDING DEFAULTS) ON COMMIT DROP", staging_table),
+        &format!("CREATE TEMP TABLE IF NOT EXISTS {} (LIKE txs INCLUDING DEFAULTS)", staging_table),
         &[],
     )
     .await?;
@@ -169,7 +169,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     let staging_table = format!("logs_staging_{}", std::process::id());
     
     conn.execute(
-        &format!("CREATE TEMP TABLE IF NOT EXISTS {} (LIKE logs INCLUDING DEFAULTS) ON COMMIT DROP", staging_table),
+        &format!("CREATE TEMP TABLE IF NOT EXISTS {} (LIKE logs INCLUDING DEFAULTS)", staging_table),
         &[],
     )
     .await?;
