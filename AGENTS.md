@@ -44,9 +44,6 @@ docker run --rm --network host ghcr.io/tempoxyz/tempo-bench:latest \
 # Start syncing + HTTP API on port 8080 (requires DB)
 cargo run -- up --rpc https://rpc.testnet.tempo.xyz --db postgres://ak47:ak47@localhost:5432/ak47
 
-# Start HTTP API only (no syncing)
-cargo run -- serve --db postgres://ak47:ak47@localhost:5432/ak47
-
 # Check status
 cargo run -- status --db postgres://ak47:ak47@localhost:5432/ak47
 ```
@@ -76,7 +73,7 @@ cargo bench
 ## Architecture
 
 - `src/api/` - HTTP API server (axum router, handlers)
-- `src/cli/` - CLI commands (up, serve, status, query, sync, compress)
+- `src/cli/` - CLI commands (up, status, query, sync, compress)
 - `src/service/` - Shared business logic (status, query execution)
 - `src/sync/` - Sync engine, RPC fetcher, decoder, writer
 - `src/db/` - Database pool and schema management

@@ -18,7 +18,6 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Up(args) => cli::up::run(args).await,
-        Commands::Serve(args) => cli::serve::run(args).await,
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Sync(args) => cli::sync::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,
