@@ -148,6 +148,8 @@ async fn handle_query_live(
     };
 
     let stream = async_stream::stream! {
+        let mut last_block_num: u64 = 0;
+
         // Execute initial query
         match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
             Ok(result) => {
@@ -168,7 +170,13 @@ async fn handle_query_live(
         // Stream updates on each new block
         loop {
             match rx.recv().await {
-                Ok(_update) => {
+                Ok(update) => {
+                    // Skip if we've already processed this block or earlier
+                    if update.block_num <= last_block_num {
+                        continue;
+                    }
+                    last_block_num = update.block_num;
+
                     match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
                         Ok(result) => {
                             yield Ok(SseEvent::default()
