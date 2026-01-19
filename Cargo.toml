@@ -1,0 +1,81 @@
+[package]
+name = "ak47"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/tempoxyz/ak47"
+description = "High-throughput Tempo blockchain indexer"
+
+[[bin]]
+name = "ak47"
+path = "src/main.rs"
+
+[lib]
+name = "ak47"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = "0.14"
+postgres-types = { version = "0.2", features = ["derive"] }
+
+# Ethereum/Tempo primitives
+alloy = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Crypto
+sha3 = "0.10"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Hex encoding
+hex = "0.4"
+
+[dev-dependencies]
+# Testing & Benchmarks
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+rand = "0.9"
+hex-literal = "0.4"
+
+[[bench]]
+name = "write_bench"
+harness = false
+
+[[bench]]
+name = "query_bench"
+harness = false
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[profile.bench]
+debug = true
+
+[profile.test]
+opt-level = 1
