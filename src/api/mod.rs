@@ -148,16 +148,15 @@ async fn handle_query_live(
     };
 
     let stream = async_stream::stream! {
-        let mut last_result_hash: Option<String> = None;
+        let mut last_block_num: u64 = 0;
+        let mut pending_blocks: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
-        // Execute initial query
+        // Execute initial query to get current state
         match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
             Ok(result) => {
-                let response = QueryResponse { result, ok: true };
-                last_result_hash = Some(format!("{:?}", response.result.rows));
                 yield Ok(SseEvent::default()
                     .event("result")
-                    .json_data(response)
+                    .json_data(QueryResponse { result, ok: true })
                     .unwrap());
             }
             Err(e) => {
@@ -171,40 +170,67 @@ async fn handle_query_live(
 
         // Stream updates on each new block
         loop {
-            match rx.recv().await {
-                Ok(_update) => {
-                    match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
-                        Ok(result) => {
-                            let response = QueryResponse { result, ok: true };
-                            let result_hash = format!("{:?}", response.result.rows);
-                            
-                            // Skip if result is identical to last sent
-                            if Some(&result_hash) == last_result_hash.as_ref() {
-                                continue;
-                            }
-                            last_result_hash = Some(result_hash);
-
-                            yield Ok(SseEvent::default()
-                                .event("result")
-                                .json_data(response)
-                                .unwrap());
-                        }
-                        Err(e) => {
-                            yield Ok(SseEvent::default()
-                                .event("error")
-                                .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                .unwrap());
+            // First, drain any pending broadcasts into our queue
+            loop {
+                match rx.try_recv() {
+                    Ok(update) => {
+                        if update.block_num > last_block_num {
+                            pending_blocks.push_back(update.block_num);
                         }
                     }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                        yield Ok(SseEvent::default()
+                            .event("lagged")
+                            .json_data(serde_json::json!({ "skipped": n }))
+                            .unwrap());
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        return;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    yield Ok(SseEvent::default()
-                        .event("lagged")
-                        .json_data(serde_json::json!({ "skipped": n }))
-                        .unwrap());
+            }
+
+            // Process pending blocks one at a time in order
+            if let Some(block_num) = pending_blocks.pop_front() {
+                if block_num <= last_block_num {
+                    continue;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
+                last_block_num = block_num;
+
+                // Query with block_num filter to get THIS specific block's data
+                let filtered_sql = inject_block_filter(&sql, block_num);
+                match crate::service::execute_query(&pool, &filtered_sql, signature.as_deref(), &options).await {
+                    Ok(result) => {
+                        yield Ok(SseEvent::default()
+                            .event("result")
+                            .json_data(QueryResponse { result, ok: true })
+                            .unwrap());
+                    }
+                    Err(e) => {
+                        yield Ok(SseEvent::default()
+                            .event("error")
+                            .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                            .unwrap());
+                    }
+                }
+            } else {
+                // No pending blocks, wait for next broadcast
+                match rx.recv().await {
+                    Ok(update) => {
+                        if update.block_num > last_block_num {
+                            pending_blocks.push_back(update.block_num);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        yield Ok(SseEvent::default()
+                            .event("lagged")
+                            .json_data(serde_json::json!({ "skipped": n }))
+                            .unwrap());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
         }
@@ -331,6 +357,54 @@ fn parse_time_filter(after: &str) -> Result<String, ApiError> {
         let parsed = chrono::DateTime::parse_from_rfc3339(after)
             .map_err(|_| ApiError::BadRequest("Invalid timestamp format. Use RFC3339 or relative time (e.g., '1h', '7d')".into()))?;
         Ok(format!("block_timestamp > '{}'", parsed.to_rfc3339()))
+    }
+}
+
+/// Inject a block number filter into SQL query for live streaming.
+/// Transforms queries to only return data for the specific block.
+/// Uses 'num' for blocks table, 'block_num' for txs/logs tables.
+fn inject_block_filter(sql: &str, block_num: u64) -> String {
+    let sql_upper = sql.to_uppercase();
+    
+    // Determine column name based on table being queried
+    let col = if sql_upper.contains("FROM BLOCKS") || sql_upper.contains("FROM \"BLOCKS\"") {
+        "num"
+    } else {
+        "block_num"
+    };
+    
+    // Find WHERE clause position
+    if let Some(where_pos) = sql_upper.find("WHERE") {
+        // Insert after WHERE
+        let insert_pos = where_pos + 5;
+        format!(
+            "{} {} = {} AND {}",
+            &sql[..insert_pos],
+            col,
+            block_num,
+            &sql[insert_pos..]
+        )
+    } else if let Some(order_pos) = sql_upper.find("ORDER BY") {
+        // Insert WHERE before ORDER BY
+        format!(
+            "{} WHERE {} = {} {}",
+            &sql[..order_pos],
+            col,
+            block_num,
+            &sql[order_pos..]
+        )
+    } else if let Some(limit_pos) = sql_upper.find("LIMIT") {
+        // Insert WHERE before LIMIT
+        format!(
+            "{} WHERE {} = {} {}",
+            &sql[..limit_pos],
+            col,
+            block_num,
+            &sql[limit_pos..]
+        )
+    } else {
+        // Append WHERE at end
+        format!("{} WHERE {} = {}", sql, col, block_num)
     }
 }
 
