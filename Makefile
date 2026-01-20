@@ -3,12 +3,12 @@
 .DEFAULT_GOAL := help
 
 # Docker compose file selection
-# Use --devnet flag for local devnet (TimescaleDB + Tempo node)
+# Use DEVNET=1 for local devnet (TimescaleDB + Tempo node)
 # Default uses production compose (external RPCs)
 ifeq ($(DEVNET),1)
-COMPOSE := docker compose -f docker-compose.devnet.yml
+COMPOSE := docker compose -f docker/dev/docker-compose.yml
 else
-COMPOSE := docker compose -f docker-compose.yml
+COMPOSE := docker compose -f docker/prod/docker-compose.yml
 endif
 
 # Default seed parameters
@@ -81,7 +81,7 @@ check:
 	@cargo clippy --all-targets
 
 # Devnet compose for tests
-DEVNET_COMPOSE := docker compose -f docker-compose.devnet.yml
+DEVNET_COMPOSE := docker compose -f docker/dev/docker-compose.yml
 
 # Run tests (sequential execution due to shared DB)
 test:

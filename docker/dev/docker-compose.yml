@@ -49,13 +49,15 @@ services:
       - /data
 
   ak47:
-    build: .
+    build:
+      context: ../..
+      dockerfile: Dockerfile
     command:
       - up
       - --config
       - /config.toml
     volumes:
-      - ./config.test.toml:/config.toml:ro
+      - ./config.toml:/config.toml:ro
     depends_on:
       timescaledb:
         condition: service_healthy

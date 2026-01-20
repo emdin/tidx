@@ -76,7 +76,7 @@ ak47 status
 
 ```bash
 git clone https://github.com/tempoxyz/ak47 && cd ak47
-docker compose up -d
+make up
 
 # Query data
 curl "http://localhost:8080/query?sql=SELECT * FROM blocks ORDER BY num DESC LIMIT 5"

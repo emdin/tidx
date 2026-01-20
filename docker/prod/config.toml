@@ -1,0 +1,26 @@
+# AK47 Indexer Configuration
+
+[http]
+enabled = true
+port = 8080
+bind = "0.0.0.0"
+
+[prometheus]
+enabled = true
+port = 9090
+
+[[chains]]
+name = "moderato"
+chain_id = 42431
+rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.moderato.tempo.xyz"
+database_url = "postgres://ak47:ak47@timescaledb:5432/ak47_moderato"
+backfill = true
+batch_size = 100
+
+[[chains]]
+name = "mainnet"
+chain_id = 4217
+rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.tempo.xyz"
+database_url = "postgres://ak47:ak47@timescaledb:5432/ak47_mainnet"
+backfill = true
+batch_size = 100

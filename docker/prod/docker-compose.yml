@@ -17,7 +17,9 @@ services:
     restart: unless-stopped
 
   ak47:
-    build: .
+    build:
+      context: ../..
+      dockerfile: Dockerfile
     command:
       - up
       - --config
