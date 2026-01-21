@@ -99,18 +99,19 @@ impl SyncState {
     /// Returns the number of blocks remaining to backfill
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.synced_num.saturating_sub(1), // Haven't started, need to fill 0..(synced-1)
-            Some(0) => 0,                              // Complete
-            Some(n) => n,                              // Blocks 0..n remain
+            None => self.tip_num,     // Haven't started, need to fill 0..tip_num
+            Some(0) => 0,             // Complete
+            Some(n) => n,             // Blocks 0..n remain
         }
     }
 
     /// Returns the indexed range (low, high).
-    /// Forward sync starts at chain head; backfill fills history.
+    /// During backfill, we have blocks from backfill_num up to tip_num.
+    /// After backfill completes (backfill_num=0), range is 0 to tip_num.
     pub fn indexed_range(&self) -> (u64, u64) {
         match self.backfill_num {
-            Some(n) => (n, self.synced_num),          // Backfill in progress or complete
-            None => (self.synced_num, self.synced_num), // Only forward sync, just head
+            Some(n) => (n, self.tip_num),             // Backfill in progress: n..tip_num
+            None => (self.tip_num, self.tip_num),     // Not started: just the tip
         }
     }
 

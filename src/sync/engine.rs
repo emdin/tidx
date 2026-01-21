@@ -589,17 +589,25 @@ async fn tick_gapfill(
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
-    let mut gaps = detect_gaps(pool).await?;
+    let all_gaps = detect_gaps(pool).await?;
 
-    // Also check for gap between synced_num and tip_num
+    // Only fill gaps WITHIN the synced region (between backfill_num and tip_num)
+    // The region below backfill_num is pending backfill work, not gaps
+    let backfill_floor = state.backfill_num.unwrap_or(state.tip_num);
+    let mut gaps: Vec<_> = all_gaps
+        .into_iter()
+        .filter(|(start, end)| *start >= backfill_floor && *end <= state.tip_num)
+        .collect();
+
+    // Also check for gap between the contiguous synced region and tip_num
     // This happens when realtime jumped ahead to follow head
-    if state.tip_num > state.synced_num + 1 {
-        // There's a gap between where we were contiguous and where realtime is now
-        // We need to fill synced_num+1 to tip_num-1 (the blocks realtime skipped)
-        let lag_gap_start = state.synced_num + 1;
+    // Note: synced_num represents the highest CONTIGUOUS block, which during backfill
+    // should be at most tip_num (if no gaps exist in the synced region)
+    let contiguous_floor = backfill_floor.max(state.synced_num);
+    if state.tip_num > contiguous_floor + 1 {
+        let lag_gap_start = contiguous_floor + 1;
         let lag_gap_end = state.tip_num.saturating_sub(1);
-        if lag_gap_end >= lag_gap_start {
-            // Check if this gap overlaps with detected gaps or is separate
+        if lag_gap_end >= lag_gap_start && lag_gap_start >= backfill_floor {
             let lag_gap = (lag_gap_start, lag_gap_end);
             if !gaps.iter().any(|(s, e)| *s <= lag_gap_start && *e >= lag_gap_end) {
                 gaps.push(lag_gap);

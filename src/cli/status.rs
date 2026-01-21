@@ -82,22 +82,30 @@ async fn print_status(config: &Config) -> Result<()> {
             println!("│  └─ Lag:       {realtime_lag} blocks");
             println!("│");
 
-            // Gap-fill status
-            let gaps = detect_gaps(&pool).await.unwrap_or_default();
-            println!("│  Gap-Fill");
-            println!("│  ├─ Synced:    {}", state.synced_num);
-            if gaps.is_empty() {
-                println!("│  └─ Gaps:      ✓ No gaps");
-            } else {
+            // Gap-fill status - only show TRUE gaps (discontinuities within synced range)
+            // Filter out ranges that are just pending backfill work
+            let all_gaps = detect_gaps(&pool).await.unwrap_or_default();
+            let backfill_floor = state.backfill_num.unwrap_or(state.tip_num);
+            let gaps: Vec<_> = all_gaps
+                .into_iter()
+                .filter(|(start, end)| {
+                    // Only show gaps that are WITHIN the synced range
+                    // (between backfill_num and tip_num)
+                    *start >= backfill_floor && *end <= state.tip_num
+                })
+                .collect();
+
+            if !gaps.is_empty() {
                 let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-                println!("│  ├─ Gaps:      {} ({} blocks total)", gaps.len(), format_number(total_gap_blocks));
+                println!("│  Gaps");
+                println!("│  ├─ Count:     {} ({} blocks total)", gaps.len(), format_number(total_gap_blocks));
                 for (i, (start, end)) in gaps.iter().enumerate() {
                     let size = end - start + 1;
                     let prefix = if i == gaps.len() - 1 { "└" } else { "├" };
                     println!("│  │  {prefix}─ {} → {} ({} blocks)", format_number(*start), format_number(*end), format_number(size));
                 }
+                println!("│");
             }
-            println!("│");
 
             // Backfill status
             let remaining = state.backfill_remaining();
@@ -105,7 +113,7 @@ async fn print_status(config: &Config) -> Result<()> {
             match state.backfill_num {
                 None if remaining > 0 => {
                     println!("│  ├─ Status:   Pending");
-                    println!("│  └─ Needed:   {} blocks (0 → {})", format_number(remaining), state.synced_num.saturating_sub(1));
+                    println!("│  └─ Needed:   {} blocks (0 → {})", format_number(remaining), format_number(state.tip_num));
                 }
                 None => {
                     println!("│  └─ Status:   Not needed");
@@ -114,8 +122,8 @@ async fn print_status(config: &Config) -> Result<()> {
                     println!("│  └─ Status:   ✓ Complete (genesis reached)");
                 }
                 Some(n) => {
-                    let total = state.synced_num;
-                    let done = state.synced_num.saturating_sub(n);
+                    let total = state.tip_num;
+                    let done = state.tip_num.saturating_sub(n);
                     let pct = if total > 0 {
                         (done as f64 / total as f64 * 100.0) as u64
                     } else {
@@ -171,7 +179,14 @@ async fn print_json_status(config: &Config) -> Result<()> {
 
         let (state, gaps) = if let Ok(pool) = db::create_pool(&chain.pg_url).await {
             let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
-            let gaps = detect_gaps(&pool).await.unwrap_or_default();
+            let all_gaps = detect_gaps(&pool).await.unwrap_or_default();
+            // Filter to only TRUE gaps (within synced range, not pending backfill)
+            let backfill_floor = state.as_ref().map(|s| s.backfill_num.unwrap_or(s.tip_num)).unwrap_or(0);
+            let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
+            let gaps: Vec<_> = all_gaps
+                .into_iter()
+                .filter(|(start, end)| *start >= backfill_floor && *end <= tip)
+                .collect();
             (state, gaps)
         } else {
             (None, vec![])
