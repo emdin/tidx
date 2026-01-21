@@ -69,7 +69,7 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
                           encode("from", 'hex'), encode("to", 'hex'), value, encode(input, 'hex'),
                           gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
                           encode(nonce_key, 'hex'), nonce, encode(fee_token, 'hex'),
-                          encode(fee_payer, 'hex'), calls, call_count, valid_before, valid_after,
+                          encode(fee_payer, 'hex'), calls::text, call_count, valid_before, valid_after,
                           signature_type
                    FROM txs ORDER BY block_num, idx LIMIT 100000"#,
                 &[],
@@ -116,7 +116,7 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
                         gas_used = gas_used.map_or("NULL".to_string(), |g| g.to_string()),
                         fee_token = fee_token.map_or("NULL".to_string(), |f| format!("'0x{f}'")),
                         fee_payer = fee_payer.map_or("NULL".to_string(), |f| format!("'0x{f}'")),
-                        calls = calls.map_or("NULL".to_string(), |c| format!("'{c}'")),
+                        calls = calls.map_or("NULL".to_string(), |c| format!("'{}'", c.replace('\'', "''"))),
                         valid_before = valid_before.map_or("NULL".to_string(), |v| v.to_string()),
                         valid_after = valid_after.map_or("NULL".to_string(), |v| v.to_string()),
                         sig_type = sig_type.map_or("NULL".to_string(), |s| s.to_string()),
