@@ -159,7 +159,6 @@ chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
 pg_url = "postgres://user:pass@localhost:5432/ak47_mainnet"
 duckdb_path = "/data/mainnet.duckdb"  # Optional: enables OLAP queries
-backfill = true
 batch_size = 100
 
 [[chains]]
@@ -216,7 +215,6 @@ Chain configuration
 | `rpc_url` | string | ✓ | - | JSON-RPC endpoint URL |
 | `pg_url` | string | ✓ | - | PostgreSQL connection string |
 | `duckdb_path` | string | - | - | Path to DuckDB file (enables OLAP). Omit to disable DuckDB for this chain |
-| `backfill` | bool | - | `true` | Enable backfill to genesis |
 | `batch_size` | u64 | - | `100` | Blocks per RPC batch request |
 
 ## CLI
@@ -439,7 +437,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 
 ## Sync Architecture
 
-ak47 uses three concurrent sync operations to maximize throughput while ensuring realtime data availability:
+ak47 uses two concurrent sync operations: **Realtime** follows the chain head, while **Gap Sync** fills all missing blocks from most recent to earliest.
 
 ```
 Block Numbers:  0                                                              HEAD
@@ -447,95 +445,73 @@ Block Numbers:  0                                                              H
                 ▼                                                                ▼
     ════════════╪════════════════════════════════════════════════════════════════╪═══▶ time
                 │                                                                │
-    INDEXED:    ░░░░░░░░░░░████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░██████████
-                │         │               │                            │        │
-                ▼         ▼               ▼                            ▼        ▼
-              genesis  backfill_num   synced_num                   tip_num   head_num
-               (0)       (500)          (800)                       (1900)    (2000)
-                │         │               │                            │        │
-                └─────────┘               └────────────────────────────┘        │
-                 BACKFILL                         GAP-FILL                      │
-              (toward genesis)              (fills skipped blocks)              │
-                                                                       └────────┘
-                                                                        REALTIME
-                                                                     (following head)
+    INDEXED:    ░░░░░░░░░░░████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░██████████
+                │          │               │                           │        │
+                ▼          ▼               ▼                           ▼        ▼
+              genesis    gap 2           gap 1                      tip_num   head_num
+               (0)     (fills 2nd)    (fills 1st)                   (1900)    (2000)
+                │                                                              │
+                │◄─────────────────── GAP SYNC ───────────────────────────────►│
+                │           Fills ALL gaps, most recent first                  │
+                │                                                    └─────────┘
+                │                                                     REALTIME
+                │                                                  (following head)
+                │
+                └─── Eventually reaches genesis (block 0)
 
 Legend:
   ████  = indexed blocks
-  ░░░░  = not yet indexed
+  ░░░░  = gaps (missing blocks)
 ```
 
-### Sync Cursors
+### Sync Operations
 
-| Cursor | Description |
-|--------|-------------|
-| `head_num` | Current chain head from RPC |
-| `tip_num` | Highest block indexed (realtime keeps this near head) |
-| `synced_num` | Highest contiguous block (no gaps from backfill_num to here) |
-| `backfill_num` | Lowest block indexed going backwards toward genesis |
+| Operation | Description |
+|-----------|-------------|
+| **REALTIME** | Follows chain head immediately, maintains ~0 lag |
+| **GAP SYNC** | Detects ALL gaps, fills from most recent to earliest |
 
-### Metrics
+### How Gap Sync Works
 
-| Metric | Formula | Description |
-|--------|---------|-------------|
-| **Realtime lag** | `head_num - tip_num` | Should be ~0, realtime keeps up with new blocks |
-| **Gap** | `tip_num - synced_num` | Blocks realtime skipped, gap-fill backfills these |
-| **Backfill remaining** | `backfill_num` | Blocks left to index toward genesis |
+1. **Detect all gaps** — SQL query finds every discontinuity in the `blocks` table, plus the gap from genesis to the first synced block
+2. **Sort by recency** — Gaps sorted by end block descending (most recent first)
+3. **Fill one gap at a time** — Each gap is filled backwards (end → start)
+4. **Repeat** — When a gap is closed, moves to the next most recent gap
 
-### Concurrent Operations
+```sql
+-- Detect gaps between existing blocks
+SELECT prev_num + 1 as gap_start, num - 1 as gap_end
+FROM (SELECT num, LAG(num) OVER (ORDER BY num) as prev_num FROM blocks)
+WHERE num - prev_num > 1
 
-1. **REALTIME** — Jumps to chain head immediately, follows new blocks with minimal lag (~0 blocks)
-2. **GAP-FILL** — Fills the gap between `synced_num` and `tip_num` in background
-3. **BACKFILL** — Syncs historical blocks from `backfill_num` toward genesis
+-- Plus: gap from 0 to MIN(num) if MIN(num) > 0
+```
 
-### When Gaps Occur
+### Why Most Recent First?
 
-Gaps between `synced_num` and `tip_num` happen when:
+| Benefit | Explanation |
+|---------|-------------|
+| **Recent data available faster** | Users typically query recent blocks, not ancient history |
+| **Realtime gaps filled quickly** | If realtime jumps ahead, those gaps are filled immediately |
+| **Graceful degradation** | Even during initial sync, recent data is always available |
 
-| Scenario | What Happens |
-|----------|--------------|
-| **Indexer restart after downtime** | Chain moved ahead while stopped. Realtime jumps to head, gap-fill backfills the missed blocks. |
-| **Slow RPC or network issues** | Realtime temporarily falls behind, then jumps ahead when connection recovers. |
-| **Initial sync** | Realtime starts near head immediately, gap-fill works backwards to meet backfill. |
-| **Rate-limited RPC** | Realtime prioritizes head, gap-fill catches up at sustainable rate. |
-
-### Multiple Gaps (Repeated Restarts)
-
-If the indexer stops and restarts multiple times, multiple non-contiguous gaps can form:
+### Example: Multiple Gaps
 
 ```
-Scenario: Indexer stops twice while chain advances
-
-  Run 1: Sync 0-100, stop
-  Run 2: Chain at 250, jump to 240-250, stop  
-  Run 3: Chain at 400, jump to 390-400
+Scenario: Initial sync with indexer restarts
 
 Block Numbers:  0          100    240  250          390  400
                 │           │      │    │            │    │
                 ▼           ▼      ▼    ▼            ▼    ▼
-    ════════════╪═══════════╪══════╪════╪════════════╪════╪═══▶ time
-                │           │      │    │            │    │
     INDEXED:    ████████████       █████             ██████
-                │           │      │    │            │    │
-                ▼           ▼      ▼    ▼            ▼    ▼
-              genesis    synced  gap1  gap1        gap2  tip/head
-               (0)        (100)  start  end        start  (400)
-                                 (101) (239)       (251)
-
-Gaps detected: [(101, 239), (251, 389)]
+                
+Gaps detected (sorted by end DESC):
+  1. (251, 389)  ← filled first (most recent)
+  2. (101, 239)  ← filled second
+  3. (0, 99)     ← filled last (if no blocks at genesis yet)
 ```
 
-The gap-fill loop uses SQL to detect **all** gaps in the `blocks` table:
-
-```sql
-SELECT prev_num + 1 as gap_start, num - 1 as gap_end
-FROM (SELECT num, LAG(num) OVER (ORDER BY num) as prev_num FROM blocks)
-WHERE num - prev_num > 1
-```
-
-This returns all gaps regardless of how many exist. Gap-fill processes them sequentially until `synced_num` catches up to `tip_num`.
-
-This architecture ensures **new blocks are always indexed immediately**, even if historical sync is incomplete.
+This architecture ensures **new blocks are always indexed immediately** while historical data is backfilled in the background, prioritizing recent gaps.
 
 ## Development
 
