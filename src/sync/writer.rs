@@ -372,8 +372,12 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
 pub async fn get_block_hash(pool: &Pool, block_num: u64) -> Result<Option<Vec<u8>>> {
     let conn = pool.get().await?;
 
+    // Use LIMIT 1 to handle edge case of duplicate block nums (different timestamps)
     let row = conn
-        .query_opt("SELECT hash FROM blocks WHERE num = $1", &[&(block_num as i64)])
+        .query_opt(
+            "SELECT hash FROM blocks WHERE num = $1 ORDER BY timestamp DESC LIMIT 1",
+            &[&(block_num as i64)],
+        )
         .await?;
 
     Ok(row.map(|r| r.get(0)))

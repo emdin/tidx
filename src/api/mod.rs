@@ -108,10 +108,10 @@ pub struct QueryParams {
     /// Event signature to create a CTE
     #[serde(default)]
     signature: Option<String>,
-    /// Chain ID to query (uses default if not specified)
-    #[serde(default, alias = "chain_id")]
+    /// Chain ID to query (required)
+    #[serde(alias = "chain_id")]
     #[serde(rename = "chainId")]
-    chain_id: Option<u64>,
+    chain_id: u64,
     /// Enable live streaming mode (SSE)
     #[serde(default)]
     live: bool,
@@ -156,10 +156,10 @@ async fn handle_query_once(
     params: QueryParams,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let pool = state
-        .get_pool(params.chain_id)
+        .get_pool(Some(params.chain_id))
         .ok_or_else(|| ApiError::BadRequest(format!(
             "Unknown chain_id: {}. Available: {:?}",
-            params.chain_id.unwrap_or(state.default_chain_id),
+            params.chain_id,
             state.pools.keys().collect::<Vec<_>>()
         )))?;
 
@@ -170,7 +170,7 @@ async fn handle_query_once(
 
     let result = crate::service::execute_query_with_engine(
         pool,
-        state.get_duckdb_pool(params.chain_id),
+        state.get_duckdb_pool(Some(params.chain_id)),
         &params.sql,
         params.signature.as_deref(),
         &options,
@@ -197,7 +197,7 @@ async fn handle_query_live(
     state: AppState,
     params: QueryParams,
 ) -> Sse<KeepAliveStream<SseStream>> {
-    let pool = match state.get_pool(params.chain_id) {
+    let pool = match state.get_pool(Some(params.chain_id)) {
         Some(p) => p.clone(),
         None => {
             let stream: SseStream = Box::pin(async_stream::stream! {

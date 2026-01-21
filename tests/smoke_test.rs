@@ -6,8 +6,10 @@ use common::testdb::TestDb;
 use ak47::query::EventSignature;
 use ak47::sync::engine::SyncEngine;
 use ak47::sync::writer::{detect_gaps, get_block_hash};
+use serial_test::serial;
 
 #[tokio::test]
+#[serial(db)]
 async fn test_sync_single_block() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
@@ -38,6 +40,7 @@ async fn test_sync_single_block() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_sync_state_persisted() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
@@ -70,6 +73,7 @@ async fn test_sync_state_persisted() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_sync_block_range() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
@@ -103,6 +107,7 @@ async fn test_sync_block_range() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_sync_logs() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
@@ -162,6 +167,7 @@ async fn test_sync_logs() {
 // ============================================================================
 
 #[tokio::test]
+#[serial(db)]
 async fn test_seeded_tx_variance() {
     let db = TestDb::new().await;
 
@@ -214,6 +220,7 @@ async fn test_seeded_tx_variance() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_seeded_log_variance() {
     let db = TestDb::new().await;
 
@@ -234,6 +241,7 @@ async fn test_seeded_log_variance() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_seeded_data_stats() {
     let db = TestDb::new().await;
 
@@ -282,6 +290,7 @@ async fn test_seeded_data_stats() {
 // ============================================================================
 
 #[tokio::test]
+#[serial(db)]
 async fn test_parent_hash_validation() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
@@ -328,6 +337,7 @@ async fn test_parent_hash_validation() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_get_block_hash() {
     let db = TestDb::new().await;
 
@@ -355,6 +365,7 @@ async fn test_get_block_hash() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_gap_detection() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -385,6 +396,7 @@ async fn test_gap_detection() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_gap_detection_multiple_gaps() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -416,6 +428,7 @@ async fn test_gap_detection_multiple_gaps() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_gap_detection_empty_table() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -431,6 +444,7 @@ async fn test_gap_detection_empty_table() {
 // ============================================================================
 
 #[tokio::test]
+#[serial(db)]
 async fn test_sync_receipts() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
@@ -496,6 +510,7 @@ async fn test_sync_receipts() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_receipt_tx_hash_matches() {
     let db = TestDb::new().await;
 
@@ -519,6 +534,7 @@ async fn test_receipt_tx_hash_matches() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_seeded_receipt_stats() {
     let db = TestDb::new().await;
 
@@ -574,6 +590,7 @@ fn default_options() -> QueryOptions {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_blocks_postgres() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -596,6 +613,7 @@ async fn test_query_blocks_postgres() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_blocks_duckdb() {
     let db = TestDb::new().await;
     let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
@@ -617,6 +635,7 @@ async fn test_query_blocks_duckdb() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_txs_point_lookup() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -636,6 +655,7 @@ async fn test_query_txs_point_lookup() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_olap_aggregation_routes_to_duckdb() {
     let db = TestDb::new().await;
     let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
@@ -656,6 +676,7 @@ async fn test_query_olap_aggregation_routes_to_duckdb() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_olap_sum_routes_to_duckdb() {
     let db = TestDb::new().await;
     let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
@@ -676,6 +697,7 @@ async fn test_query_olap_sum_routes_to_duckdb() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_logs_with_event_signature() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -699,6 +721,7 @@ async fn test_query_logs_with_event_signature() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_logs_with_event_signature_duckdb() {
     let db = TestDb::new().await;
     let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
@@ -722,6 +745,7 @@ async fn test_query_logs_with_event_signature_duckdb() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_receipts() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -742,6 +766,7 @@ async fn test_query_receipts() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_non_select() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -761,6 +786,7 @@ async fn test_query_rejects_non_select() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_forbidden_keywords() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -780,6 +806,7 @@ async fn test_query_rejects_forbidden_keywords() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_explicit_engine_hint() {
     let db = TestDb::new().await;
     let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
@@ -815,6 +842,7 @@ async fn test_query_explicit_engine_hint() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_fallback_to_postgres_without_duckdb() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -839,6 +867,7 @@ async fn test_query_fallback_to_postgres_without_duckdb() {
 // ============================================================================
 
 #[tokio::test]
+#[serial(db)]
 async fn test_event_signature_selector() {
     let sig = EventSignature::parse("Transfer(address,address,uint256)").unwrap();
     assert_eq!(sig.selector_hex(), "ddf252ad");
@@ -852,6 +881,7 @@ async fn test_event_signature_selector() {
 // ============================================================================
 
 #[tokio::test]
+#[serial(db)]
 async fn test_duckdb_event_cte() {
     let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
     let conn = duckdb.conn().await;

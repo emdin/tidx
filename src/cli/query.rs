@@ -4,36 +4,40 @@ use std::path::PathBuf;
 
 use ak47::config::Config;
 use ak47::db;
-use ak47::service::{self, QueryOptions};
+use ak47::service::{self, execute_query_with_engine, QueryOptions};
 
 #[derive(ClapArgs)]
 pub struct Args {
+    /// Chain name to query (uses first chain if not specified)
+    #[arg(long)]
+    pub chain: Option<String>,
+
     /// Path to config file
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// SQL query (SELECT only). Use event name from --signature as table.
-    pub sql: String,
-
-    /// Event signature to create a CTE (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
-    #[arg(long, short)]
-    pub signature: Option<String>,
-
-    /// Chain name to query (uses first chain if not specified)
+    /// Force query engine (postgres, duckdb). Auto-routes if not specified.
     #[arg(long)]
-    pub chain: Option<String>,
+    pub engine: Option<String>,
 
     /// Output format (table, json, csv)
     #[arg(long, default_value = "table")]
     pub format: String,
 
-    /// Query timeout in milliseconds
-    #[arg(long, default_value = "30000")]
-    pub timeout: u64,
-
     /// Maximum rows to return
     #[arg(long, default_value = "10000")]
     pub limit: i64,
+
+    /// Event signature to create a CTE (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
+    #[arg(long, short)]
+    pub signature: Option<String>,
+
+    /// SQL query (SELECT only). Use event name from --signature as table.
+    pub sql: String,
+
+    /// Query timeout in milliseconds
+    #[arg(long, default_value = "30000")]
+    pub timeout: u64,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -60,12 +64,13 @@ pub async fn run(args: Args) -> Result<()> {
         limit: args.limit,
     };
 
-    let result = service::execute_query(
+    let result = execute_query_with_engine(
         &pool,
         None, // DuckDB pool not available in CLI yet
         &args.sql,
         args.signature.as_deref(),
         &options,
+        args.engine.as_deref(),
     )
     .await?;
 

@@ -6,6 +6,7 @@ use common::testdb::TestDb;
 use ak47::sync::engine::SyncEngine;
 use ak47::sync::writer::{write_blocks, write_logs, write_txs};
 use ak47::types::{BlockRow, LogRow, TxRow};
+use serial_test::serial;
 
 fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {
     (0..count)
@@ -72,6 +73,7 @@ fn generate_logs(count: usize, block_num: i64) -> Vec<LogRow> {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_batch_write_blocks() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -104,6 +106,7 @@ async fn test_batch_write_blocks() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_batch_write_txs() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -129,6 +132,7 @@ async fn test_batch_write_txs() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_batch_write_logs() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -153,6 +157,7 @@ async fn test_batch_write_logs() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_batch_write_mixed_realistic() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -194,6 +199,7 @@ async fn test_batch_write_mixed_realistic() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_copy_large_batch_txs() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -216,6 +222,7 @@ async fn test_copy_large_batch_txs() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_copy_large_batch_logs() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -238,6 +245,7 @@ async fn test_copy_large_batch_logs() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_copy_idempotent() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -261,6 +269,7 @@ async fn test_copy_idempotent() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_pipelined_sync() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");

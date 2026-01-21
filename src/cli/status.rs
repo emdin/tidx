@@ -13,13 +13,13 @@ pub struct Args {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Watch mode - continuously update status
-    #[arg(long, short)]
-    pub watch: bool,
-
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Watch mode - continuously update status
+    #[arg(long, short)]
+    pub watch: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {

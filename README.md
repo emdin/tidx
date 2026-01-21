@@ -1,6 +1,11 @@
 <p align="center">
-  <h1 align="center">ak47</h1>
-  <p align="center"><strong>High-throughput Tempo indexer in Rust</strong></p>
+  <img src=".github/banner.png" alt="ak47" width="100%" />
+</p>
+
+<h1 align="center">ak47</h1>
+
+<p align="center">
+  <strong>High-throughput Tempo indexer in Rust</strong>
 </p>
 
 <p align="center">
@@ -28,11 +33,11 @@
 ## Table of Contents
 
 - [Quickstart](#quickstart)
-- [How It Works](#how-it-works)
+- [Overview](#overview)
 - [Query Routing](#query-routing)
 - [Installation](#installation)
 - [Configuration](#configuration)
-- [CLI Reference](#cli-reference)
+- [CLI](#cli)
 - [HTTP API](#http-api)
 - [Query Cookbook](#query-cookbook)
 - [Database Schema](#database-schema)
@@ -80,110 +85,30 @@ make up
 curl "http://localhost:8080/query?sql=SELECT * FROM blocks ORDER BY num DESC LIMIT 5"
 ```
 
-## How It Works
+## Overview
 
-ak47 uses **bidirectional sync** to give you realtime data immediately:
-
-```
-Chain:    [0]----[1]----[2]----...----[HEAD-1]----[HEAD]----[HEAD+1]
-                   ◄── Backfill ──┘              └── Forward ──►
-```
-
-1. **Forward Sync** — Starts at chain head, follows new blocks in realtime
-2. **Backfill** — Runs concurrently, filling history from head → genesis
-3. **Compression** — Columnar compression for 10-20x storage savings + faster analytics
-
-Both syncs persist progress to `sync_state`, so interrupted syncs resume automatically.
-
-### Dual Database Architecture
-
-ak47 uses a hybrid architecture with two databases working together:
+ak47 uses a hybrid PostgreSQL + DuckDB architecture that automatically routes queries to the optimal engine:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│   PostgreSQL (TimescaleDB)                 DuckDB                           │
-│  ┌─────────────────────────────┐          ┌─────────────────────────────┐   │
-│  │  • System of record         │          │  • Analytical replica       │   │
-│  │  • ACID transactions        │  ──────► │  • Columnar storage         │   │
-│  │  • Point lookups (< 1ms)    │   sync   │  • Aggregations (10-100x)   │   │
-│  │  • Indexed queries          │          │  • Window functions         │   │
-│  └─────────────────────────────┘          └─────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+                           ┌─────────────────┐
+                           │   ak47 Router   │
+                           └────────┬────────┘
+                                    │
+         ┌──────────────────────────┴──────────────────────────┐
+         │                                                     │
+         │ WHERE hash = '0x...'                 GROUP BY date  │
+         │ WHERE block_num = 123                COUNT(*), SUM()│
+         ▼                                                     ▼
+┌─────────────────────┐                         ┌─────────────────────┐
+│    PostgreSQL       │          sync           │      DuckDB         │
+│    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
+└─────────────────────┘                         └─────────────────────┘
 ```
 
-**PostgreSQL/TimescaleDB** handles:
-- All writes (system of record)
-- Point lookups by hash, address, block number
-- Recent data queries
-- Transactions and ACID guarantees
-
-**DuckDB** handles:
-- Aggregations (`GROUP BY`, `COUNT`, `SUM`, `AVG`)
-- Window functions (`ROW_NUMBER`, `RANK`, `OVER`)
-- Large table scans and joins
-- Analytical queries over millions of rows
-
-## Query Routing
-
-Queries are **automatically routed** to the optimal engine based on SQL patterns:
-
-| Pattern | Engine | Why |
-|---------|--------|-----|
-| `WHERE hash = '0x...'` | PostgreSQL | Indexed point lookup |
-| `WHERE address = '0x...'` | PostgreSQL | Indexed lookup |
-| `WHERE block_num = 123` | PostgreSQL | Indexed lookup |
-| `GROUP BY` / `HAVING` | DuckDB | Columnar aggregation |
-| `COUNT(*)`, `SUM()`, `AVG()` | DuckDB | Vectorized execution |
-| `ROW_NUMBER() OVER (...)` | DuckDB | Optimized window functions |
-| Multiple `JOIN`s | DuckDB | Columnar join optimization |
-
-### Explicit Engine Control
-
-Force a specific engine via SQL comment or query parameter:
-
-```sql
--- Force DuckDB
-/* engine=duckdb */ SELECT COUNT(*) FROM txs;
-
--- Force PostgreSQL (for freshest data)
-/* engine=postgres */ SELECT * FROM blocks ORDER BY num DESC LIMIT 1;
-```
-
-Via HTTP API:
-```bash
-# Force PostgreSQL
-curl "/query?sql=SELECT...&engine=postgres"
-
-# Force DuckDB
-curl "/query?sql=SELECT...&engine=duckdb"
-```
-
-### Status Endpoint
-
-The `/status` endpoint shows sync status for both engines per chain:
-
-```json
-{
-  "ok": true,
-  "chains": [{
-    "chain_id": 4217,
-    "synced_num": 1000000,
-    "head_num": 1000000,
-    "lag": 0,
-    "duckdb_synced_num": 999950,
-    "duckdb_lag": 50
-  }]
-}
-```
-
-### Why This Architecture?
-
-- **Best of both worlds** — Sub-millisecond point lookups AND fast analytics
-- **Isolation** — Analytical queries don't impact OLTP latency
-- **Simplicity** — Automatic routing, no manual query optimization
-- **Consistency** — PostgreSQL is source of truth, DuckDB is derived
+| Engine | Use Case | Example |
+|--------|----------|---------|
+| **PostgreSQL** | Point lookups, recent data | `WHERE hash = '0x...'` |
+| **DuckDB** | Aggregations, scans, analytics | `GROUP BY`, `COUNT(*)`, `SUM()` |
 
 ## Installation
 
@@ -208,11 +133,9 @@ cd ak47
 cargo build --release
 ```
 
-**Requirements:** TimescaleDB 2.x
-
 ## Configuration
 
-ak47 uses a TOML config file. Each `[[chains]]` block defines a chain to index
+ak47 uses a `config.toml` file to configure the indexer.
 
 ### Example
 
@@ -372,135 +295,32 @@ ak47 query \
 
 ### Query Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `sql` | string | required | SQL query (SELECT only) |
-| `signature` | string | - | Event signature for CTE generation |
-| `chainId` | number | first chain | Chain ID to query |
-| `engine` | string | auto | Force engine: `postgres` or `duckdb` |
-| `timeout_ms` | number | 5000 | Query timeout in milliseconds |
-| `limit` | number | 10000 | Maximum rows to return |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sql` | string | ✓ | - | SQL query (SELECT only) |
+| `chainId` | number | ✓ | - | Chain ID to query |
+| `signature` | string | | - | Event signature for CTE generation |
+| `engine` | string | | (auto) | Force engine: `postgres` or `duckdb` |
+| `timeout_ms` | number | | `5000` | Query timeout in milliseconds |
+| `limit` | number | | `10000` | Maximum rows to return |
 
 ### Examples
 
 ```bash
-# Simple query (auto-routed to PostgreSQL - point lookup)
-curl "http://localhost:8080/query?sql=SELECT * FROM blocks WHERE num = 12345"
+# Point lookup (auto-routed to PostgreSQL)
+curl "http://localhost:8080/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
+> {"columns":["num","hash","timestamp"],"rows":[[12345,"0xabc...","2024-01-01T00:00:00Z"]],"row_count":1,"engine":"postgres","ok":true}
 
-# Aggregation query (auto-routed to DuckDB)
-curl "http://localhost:8080/query?sql=SELECT COUNT(*) FROM txs GROUP BY type"
+# Aggregation (auto-routed to DuckDB)
+curl "http://localhost:8080/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
+> {"columns":["type","count"],"rows":[[0,50000],[2,120000]],"row_count":2,"engine":"duckdb","ok":true}
 
-# Force PostgreSQL for freshest data
-curl "http://localhost:8080/query?sql=SELECT * FROM blocks ORDER BY num DESC LIMIT 1&engine=postgres"
-
-# Response includes which engine was used
-{
-  "columns": ["num", "hash", "timestamp", ...],
-  "rows": [[123, "0x...", "2024-01-01T00:00:00Z", ...]],
-  "row_count": 5,
-  "engine": "duckdb",
-  "ok": true
-}
-```
-
-```bash
+# Status
 curl http://localhost:8080/status
-
-# Response includes DuckDB sync status per chain
-{
-  "ok": true,
-  "chains": [{
-    "chain_id": 4217,
-    "synced_num": 567890,
-    "head_num": 567890,
-    "backfill_num": 123456,
-    "lag": 0,
-    "duckdb_synced_num": 567840,
-    "duckdb_lag": 50
-  }]
-}
+> {"ok":true,"chains":[{"chain_id":4217,"synced_num":567890,"head_num":567890,"lag":0,"duckdb_synced_num":567840,"duckdb_lag":50}]}
 ```
 
-## Query Cookbook
-
-### OLTP (Point Lookups)
-
-```sql
--- Get block by number
-SELECT * FROM blocks WHERE num = 12345;
-
--- Get transaction by hash
-SELECT * FROM txs WHERE hash = '\x...';
-
--- Transactions for a specific block
-SELECT hash, "from", "to", value 
-FROM txs 
-WHERE block_num = 12345;
-
--- Logs for a specific transaction
-SELECT * FROM logs WHERE tx_hash = '\x...';
-
--- Recent transactions from an address
-SELECT * FROM txs 
-WHERE "from" = '\x...' 
-ORDER BY block_timestamp DESC 
-LIMIT 20;
-```
-
-### OLAP (Analytics)
-
-These queries are automatically routed to DuckDB for fast columnar execution:
-
-```sql
--- Transactions per hour (last 24h)
-SELECT 
-  DATE_TRUNC('hour', block_timestamp) AS hour,
-  COUNT(*) AS tx_count
-FROM txs
-WHERE block_timestamp > NOW() - INTERVAL '24 hours'
-GROUP BY hour
-ORDER BY hour DESC;
-
--- Gas usage trend (last 30 days)
-SELECT 
-  DATE_TRUNC('day', timestamp) AS day,
-  SUM(gas_used) AS total_gas,
-  AVG(gas_used)::bigint AS avg_gas
-FROM blocks
-GROUP BY day
-ORDER BY day DESC
-LIMIT 30;
-
--- Top contracts by event count
-SELECT 
-  encode(address, 'hex') AS contract,
-  COUNT(*) AS event_count
-FROM logs
-WHERE block_timestamp > NOW() - INTERVAL '7 days'
-GROUP BY address
-ORDER BY event_count DESC
-LIMIT 20;
-
--- Unique active addresses per day
-SELECT 
-  DATE_TRUNC('day', block_timestamp) AS day,
-  COUNT(DISTINCT "from") AS unique_senders
-FROM txs
-GROUP BY day
-ORDER BY day DESC
-LIMIT 30;
-```
-
-### Decoded Events (via CLI)
-
-```bash
-# Transfer events with decoded fields
-ak47 query \
-  --signature "Transfer(address indexed from, address indexed to, uint256 value)" \
-  "SELECT block_timestamp, \"from\", \"to\", value FROM Transfer ORDER BY block_timestamp DESC LIMIT 10"
-```
-
-## Database Schema
+## Schemas
 
 All tables use composite primary keys with timestamps for efficient range queries:
 
@@ -538,7 +358,6 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `nonce_key` | `BYTEA` | Nonce key (2D nonces) |
 | `nonce` | `INT8` | Nonce value |
 | `fee_token` | `BYTEA` | Fee token address |
-| `fee_payer` | `BYTEA` | Fee payer (if sponsored) |
 | `calls` | `JSONB` | Batch call data |
 | `call_count` | `INT2` | Number of calls |
 | `valid_before` | `INT8` | Validity window start |
@@ -598,14 +417,14 @@ All tables use composite primary keys with timestamps for efficient range querie
 ### Make Commands
 
 ```bash
-make up                  # Start devnet (PostgreSQL + Tempo)
-make down                # Stop services
-make test                # Run tests
 make bench               # Run benchmarks
+make clean               # Stop services + clean build
+make down                # Stop services
 make logs                # Tail indexer logs
 make seed                # Generate test transactions
 make seed-heavy          # Generate ~1M+ transactions
-make clean               # Stop services + clean build
+make test                # Run tests
+make up                  # Start devnet (PostgreSQL + Tempo)
 ```
 
 ## License
@@ -614,4 +433,4 @@ make clean               # Stop services + clean build
 
 ## Acknowledgments
 
-- [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for the indexing architecture
+- [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for everything.

@@ -125,7 +125,9 @@ pub async fn execute_query_with_engine(
     options: &QueryOptions,
     force_engine: Option<&str>,
 ) -> Result<QueryResult> {
-    let normalized = sql.trim().to_uppercase();
+    // Strip leading SQL comments before validation
+    let sql_for_validation = strip_leading_comments(sql);
+    let normalized = sql_for_validation.trim().to_uppercase();
 
     if !normalized.starts_with("SELECT") && !normalized.starts_with("WITH") {
         return Err(anyhow!("Only SELECT queries are allowed"));
@@ -159,9 +161,15 @@ pub async fn execute_query_with_engine(
     let sql = if let Some(sig_str) = signature {
         let sig = EventSignature::parse(sig_str)?;
         let used_columns = extract_column_references(sql);
+        // If empty (e.g., SELECT *), include all decoded columns
+        let filter = if used_columns.is_empty() {
+            None
+        } else {
+            Some(&used_columns)
+        };
         let cte = match engine {
-            QueryEngine::DuckDb => sig.to_cte_sql_duckdb_filtered(Some(&used_columns)),
-            QueryEngine::Postgres => sig.to_cte_sql_postgres_filtered(Some(&used_columns)),
+            QueryEngine::DuckDb => sig.to_cte_sql_duckdb_filtered(filter),
+            QueryEngine::Postgres => sig.to_cte_sql_postgres_filtered(filter),
         };
         format!("WITH {cte} {sql}")
     } else {
@@ -218,16 +226,26 @@ async fn execute_query_postgres(
         Err(_) => return Err(anyhow!("Query timeout")),
     };
 
+    // Get columns from result (even if empty, prepared statement has column info)
+    let columns: Vec<String> = if rows.is_empty() {
+        // For empty results, prepare statement to get column metadata
+        conn.prepare(&sql)
+            .await
+            .ok()
+            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
+            .unwrap_or_default()
+    } else {
+        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+    };
+
     if rows.is_empty() {
         return Ok(QueryResult {
-            columns: vec![],
+            columns,
             rows: vec![],
             row_count: 0,
             engine: Some("postgres".to_string()),
         });
     }
-
-    let columns: Vec<String> = rows[0].columns().iter().map(|c| c.name().to_string()).collect();
     let row_count = rows.len();
     metrics::record_query_rows(row_count as u64);
 
@@ -335,4 +353,27 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
         serde_json::Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }
+}
+
+/// Strips leading SQL comments (both block `/* */` and line `--`) from a query.
+fn strip_leading_comments(sql: &str) -> &str {
+    let mut s = sql.trim_start();
+    loop {
+        if s.starts_with("/*") {
+            if let Some(end) = s.find("*/") {
+                s = s[end + 2..].trim_start();
+            } else {
+                break;
+            }
+        } else if s.starts_with("--") {
+            if let Some(end) = s.find('\n') {
+                s = s[end + 1..].trim_start();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    s
 }

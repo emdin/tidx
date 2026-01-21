@@ -6,7 +6,6 @@ use super::tempo::TempoNode;
 
 static MIGRATIONS_DONE: OnceCell<()> = OnceCell::const_new();
 static TEST_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
-static SEEDING_DONE: OnceCell<()> = OnceCell::const_new();
 
 /// Test database wrapper.
 /// Uses a global lock to prevent concurrent test execution (required for shared DB).
@@ -49,49 +48,39 @@ impl TestDb {
     }
 
     async fn ensure_seeded(&self) {
-        // Skip if already seeded
-        if SEEDING_DONE.get().is_some() {
-            return;
-        }
-
-        // Check if DB already has data
+        // Check if DB already has sufficient data
         if self.block_count().await >= 10 {
-            SEEDING_DONE.get_or_init(|| async {}).await;
             return;
         }
 
-        SEEDING_DONE
-            .get_or_init(|| async {
-                println!("Seeding test database...");
-                
-                let tempo = TempoNode::from_env();
-                if tempo.wait_for_ready().await.is_err() {
-                    println!("Warning: Tempo node not ready, skipping seed");
-                    return;
-                }
+        println!("Seeding test database...");
+        
+        let tempo = TempoNode::from_env();
+        if tempo.wait_for_ready().await.is_err() {
+            println!("Warning: Tempo node not ready, skipping seed");
+            return;
+        }
 
-                // Wait for some blocks
-                tempo.wait_for_block(50).await.ok();
+        // Wait for some blocks
+        tempo.wait_for_block(50).await.ok();
 
-                let engine = SyncEngine::new(self.pool.clone(), &tempo.rpc_url)
-                    .await
-                    .expect("Failed to create sync engine");
+        let engine = SyncEngine::new(self.pool.clone(), &tempo.rpc_url)
+            .await
+            .expect("Failed to create sync engine");
 
-                let head = tempo.block_number().await.unwrap_or(50).min(100);
-                for block_num in 1..=head {
-                    if let Err(e) = engine.sync_block(block_num).await {
-                        println!("Warning: Failed to sync block {block_num}: {e}");
-                    }
-                }
+        let head = tempo.block_number().await.unwrap_or(50).min(100);
+        for block_num in 1..=head {
+            if let Err(e) = engine.sync_block(block_num).await {
+                println!("Warning: Failed to sync block {block_num}: {e}");
+            }
+        }
 
-                println!(
-                    "Seeding complete: {} blocks, {} txs, {} logs",
-                    self.block_count().await,
-                    self.tx_count().await,
-                    self.log_count().await
-                );
-            })
-            .await;
+        println!(
+            "Seeding complete: {} blocks, {} txs, {} logs",
+            self.block_count().await,
+            self.tx_count().await,
+            self.log_count().await
+        );
     }
 
     pub async fn truncate_all(&self) {

@@ -10,6 +10,7 @@ use tower::ServiceExt;
 use ak47::api::{self, inject_block_filter};
 use ak47::broadcast::Broadcaster;
 use common::testdb::TestDb;
+use serial_test::serial;
 
 fn make_pools(pool: ak47::db::Pool) -> (HashMap<u64, ak47::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -19,6 +20,7 @@ fn make_pools(pool: ak47::db::Pool) -> (HashMap<u64, ak47::db::Pool>, u64) {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_health_endpoint() {
     let db = TestDb::empty().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -44,6 +46,7 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_status_endpoint() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -72,6 +75,7 @@ async fn test_status_endpoint() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_select_blocks() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -82,7 +86,7 @@ async fn test_query_select_blocks() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/query?sql=SELECT%20num,%20hash%20FROM%20blocks%20ORDER%20BY%20num%20DESC%20LIMIT%205")
+                .uri("/query?sql=SELECT%20num,%20hash%20FROM%20blocks%20ORDER%20BY%20num%20DESC%20LIMIT%205&chainId=1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -102,6 +106,7 @@ async fn test_query_select_blocks() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_select_txs() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -112,7 +117,7 @@ async fn test_query_select_txs() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/query?sql=SELECT%20block_num,%20hash,%20%22from%22%20FROM%20txs%20LIMIT%2010")
+                .uri("/query?sql=SELECT%20block_num,%20hash,%20%22from%22%20FROM%20txs%20LIMIT%2010&chainId=1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -131,6 +136,7 @@ async fn test_query_select_txs() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_select_logs() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -141,7 +147,7 @@ async fn test_query_select_logs() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/query?sql=SELECT%20block_num,%20address,%20selector%20FROM%20logs%20LIMIT%2010")
+                .uri("/query?sql=SELECT%20block_num,%20address,%20selector%20FROM%20logs%20LIMIT%2010&chainId=1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -164,6 +170,7 @@ async fn test_query_select_logs() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_with_signature_cte() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -172,7 +179,7 @@ async fn test_query_with_signature_cte() {
 
     // URL encode: spaces=%20, commas=%2C, parens=%28/%29
     let sig = "Transfer(address%20indexed%20from%2Caddress%20indexed%20to%2Cuint256%20value)";
-    let uri = format!("/query?sql=SELECT%20*%20FROM%20Transfer%20LIMIT%205&signature={sig}");
+    let uri = format!("/query?sql=SELECT%20*%20FROM%20Transfer%20LIMIT%205&chainId=1&signature={sig}");
 
     let response = app
         .oneshot(
@@ -212,6 +219,7 @@ async fn test_query_with_signature_cte() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_non_select() {
     let db = TestDb::empty().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -222,7 +230,7 @@ async fn test_query_rejects_non_select() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/query?sql=DELETE%20FROM%20blocks")
+                .uri("/query?sql=DELETE%20FROM%20blocks&chainId=1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -241,6 +249,7 @@ async fn test_query_rejects_non_select() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_chain_id_param() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -270,6 +279,7 @@ async fn test_query_chain_id_param() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_invalid_chain_id() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -299,6 +309,7 @@ async fn test_query_invalid_chain_id() {
 }
 
 #[tokio::test]
+#[serial(db)]
 async fn test_query_live_returns_sse() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
@@ -309,7 +320,7 @@ async fn test_query_live_returns_sse() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20LIMIT%201&live=true")
+                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20LIMIT%201&chainId=1&live=true")
                 .body(Body::empty())
                 .unwrap(),
         )
