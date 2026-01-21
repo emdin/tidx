@@ -6,16 +6,63 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to release"
+      version:
+        description: "Version bump type"
         required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Bump version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump version
+        id: version
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+          
+          case "${{ inputs.version }}" in
+            major) NEW="$((MAJOR + 1)).0.0" ;;
+            minor) NEW="$MAJOR.$((MINOR + 1)).0" ;;
+            patch) NEW="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+          esac
+          
+          echo "Bumping $CURRENT -> $NEW"
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" Cargo.toml
+          echo "version=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: release v${{ steps.version.outputs.version }}"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          git push
+          git push origin "v${{ steps.version.outputs.version }}"
+
   build-linux:
     name: Build ${{ matrix.target }}
+    needs: [version]
+    if: always() && (needs.version.result == 'success' || needs.version.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -28,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.version.outputs.version && format('v{0}', needs.version.outputs.version) || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -63,6 +110,8 @@ jobs:
 
   build-macos:
     name: Build ${{ matrix.target }}
+    needs: [version]
+    if: always() && (needs.version.result == 'success' || needs.version.result == 'skipped')
     runs-on: macos-latest
     strategy:
       matrix:
@@ -75,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.version.outputs.version && format('v{0}', needs.version.outputs.version) || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +147,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build-linux, build-macos]
+    needs: [version, build-linux, build-macos]
+    if: always() && needs.build-linux.result == 'success' && needs.build-macos.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -115,5 +165,6 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.version && format('v{0}', needs.version.outputs.version) || github.ref_name }}
           files: artifacts/*.tar.gz
           generate_release_notes: true
