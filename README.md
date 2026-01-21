@@ -185,7 +185,7 @@ The `/status` endpoint shows sync status for both engines:
 
 ## Installation
 
-### One-liner
+### Quick Install
 
 ```bash
 curl -L https://raw.githubusercontent.com/tempoxyz/ak47/main/scripts/install.sh | bash
@@ -505,9 +505,11 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `hash` | `BYTEA` | Block hash |
 | `parent_hash` | `BYTEA` | Parent block hash |
 | `timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `timestamp_ms` | `INT8` | Block timestamp (milliseconds) |
 | `gas_limit` | `INT8` | Gas limit |
 | `gas_used` | `INT8` | Gas used |
 | `miner` | `BYTEA` | Block producer |
+| `extra_data` | `BYTEA` | Extra data field |
 
 ### txs
 
@@ -543,6 +545,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `block_num` | `INT8` | Block number |
 | `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
 | `log_idx` | `INT4` | Log index |
+| `tx_idx` | `INT4` | Transaction index |
 | `tx_hash` | `BYTEA` | Transaction hash |
 | `address` | `BYTEA` | Emitting contract |
 | `selector` | `BYTEA` | Event selector (topic0) |
@@ -574,6 +577,8 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `head_num` | `INT8` | Remote chain head |
 | `synced_num` | `INT8` | Highest synced block |
 | `backfill_num` | `INT8` | Lowest synced block |
+| `started_at` | `TIMESTAMPTZ` | Sync start time |
+| `updated_at` | `TIMESTAMPTZ` | Last update time |
 
 ## Development
 
