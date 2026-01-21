@@ -17,6 +17,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init(args) => cli::init::run(args),
         Commands::Up(args) => cli::up::run(args).await,
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,

@@ -59,14 +59,8 @@ curl -L https://ak47.wevm.dev/install | bash
 ### Run
 
 ```bash
-# Create config
-cat > config.toml << EOF
-[[chains]]
-name = "mainnet"
-chain_id = 4217
-rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user:pass@localhost:5432/ak47"
-EOF
+# Initialize config (interactive)
+ak47 init
 
 # Start indexing
 ak47 up
@@ -230,6 +224,7 @@ Chain configuration
 Usage: ak47 <COMMAND>
 
 Commands:
+  init         Initialize a new config.toml
   up           Start syncing blocks from the chain (continuous) and serve HTTP API
   status       Show sync status
   query        Run a SQL query (use --signature to decode event logs)
@@ -237,6 +232,19 @@ Commands:
 
 Options:
   -h, --help  Print help
+```
+
+### `ak47 init`
+
+```
+Initialize a new config.toml
+
+Usage: ak47 init [OPTIONS]
+
+Options:
+  -o, --output <OUTPUT>  Output path for config file [default: config.toml]
+      --force            Overwrite existing config file
+  -h, --help             Print help
 ```
 
 ### `ak47 up`
