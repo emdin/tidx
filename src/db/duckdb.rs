@@ -67,6 +67,20 @@ impl DuckDbPool {
         let conn = self.conn().await;
         execute_query(&conn, sql)
     }
+
+    /// Executes a streaming query and sends batches through a channel.
+    ///
+    /// Returns column names immediately, then sends row batches through the channel.
+    /// This allows SSE streaming of large result sets.
+    pub async fn query_streaming(
+        &self,
+        sql: &str,
+        batch_size: usize,
+        tx: tokio::sync::mpsc::Sender<Result<Vec<Vec<serde_json::Value>>>>,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn().await;
+        execute_query_streaming(&conn, sql, batch_size, tx)
+    }
 }
 
 /// Creates the DuckDB schema matching PostgreSQL tables.
@@ -634,6 +648,64 @@ pub fn execute_query(
     }
 
     Ok((columns, result_rows))
+}
+
+/// Executes a streaming query on DuckDB, sending batches through a channel.
+///
+/// Returns column names immediately. Row batches are sent through the channel
+/// as they are read, enabling SSE streaming of large result sets.
+pub fn execute_query_streaming(
+    conn: &Connection,
+    sql: &str,
+    batch_size: usize,
+    tx: tokio::sync::mpsc::Sender<Result<Vec<Vec<serde_json::Value>>>>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql).with_context(|| format!("Failed to prepare DuckDB query: {sql}"))?;
+
+    // Execute query and get rows iterator
+    let mut rows_iter = stmt.query([]).with_context(|| format!("Failed to execute DuckDB query: {sql}"))?;
+
+    // Get column info from the statement after execution
+    let column_count = rows_iter.as_ref().map(|r| r.column_count()).unwrap_or(0);
+    let columns: Vec<String> = if let Some(first_row) = rows_iter.as_ref() {
+        (0..column_count)
+            .map(|i| {
+                first_row
+                    .column_name(i)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "?".to_string())
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Stream rows in batches
+    let mut batch = Vec::with_capacity(batch_size);
+    while let Some(row) = rows_iter.next()? {
+        let mut values = Vec::with_capacity(column_count);
+        for i in 0..column_count {
+            let value = row_to_json_value(&row, i);
+            values.push(value);
+        }
+        batch.push(values);
+
+        if batch.len() >= batch_size {
+            // Send batch (blocking - we're in sync context)
+            if tx.blocking_send(Ok(std::mem::take(&mut batch))).is_err() {
+                // Receiver dropped, stop processing
+                break;
+            }
+            batch = Vec::with_capacity(batch_size);
+        }
+    }
+
+    // Send remaining rows
+    if !batch.is_empty() {
+        let _ = tx.blocking_send(Ok(batch));
+    }
+
+    Ok(columns)
 }
 
 /// Converts a DuckDB row column to a JSON value.

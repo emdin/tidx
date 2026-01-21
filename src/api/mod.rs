@@ -176,7 +176,7 @@ pub struct QueryParams {
     #[serde(alias = "chain_id")]
     #[serde(rename = "chainId")]
     chain_id: u64,
-    /// Enable live streaming mode (SSE)
+    /// Enable live streaming mode (SSE) - streams updates on new blocks
     #[serde(default)]
     live: bool,
     /// Query timeout in milliseconds
@@ -305,21 +305,27 @@ async fn handle_query_live(
         }
     };
 
+    let duckdb_pool = state.get_duckdb_pool(Some(params.chain_id)).await;
+
     let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
     let signature = params.signature;
+    let engine = params.engine;
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, 100000),
     };
+
+    // Detect if this is an OLAP query (aggregations, etc.)
+    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::DuckDb;
 
     let stream = async_stream::stream! {
         // Keep guard alive for the lifetime of the stream
         let _guard = connection_guard;
         let mut last_block_num: u64 = 0;
 
-        // Execute initial query (DuckDB not used in live queries - need fresh data)
-        match crate::service::execute_query(&pool, None, &sql, signature.as_deref(), &options).await {
+        // Execute initial query
+        match crate::service::execute_query_with_engine(&pool, duckdb_pool.as_ref(), &sql, signature.as_deref(), &options, engine.as_deref()).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -366,10 +372,10 @@ async fn handle_query_live(
                         last_block_num = end - MAX_CATCHUP_BLOCKS;
                     }
 
-                    let catch_up_start = last_block_num + 1;
-                    for block_num in catch_up_start..=end {
-                        let filtered_sql = inject_block_filter(&sql, block_num);
-                        match crate::service::execute_query(&pool, None, &filtered_sql, signature.as_deref(), &options).await {
+                    // For OLAP queries, re-execute the full query once per update (not per-block)
+                    // For OLTP queries, filter by each block
+                    if is_olap {
+                        match crate::service::execute_query_with_engine(&pool, duckdb_pool.as_ref(), &sql, signature.as_deref(), &options, engine.as_deref()).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -383,9 +389,28 @@ async fn handle_query_live(
                                     .unwrap());
                             }
                         }
+                        last_block_num = end;
+                    } else {
+                        let catch_up_start = last_block_num + 1;
+                        for block_num in catch_up_start..=end {
+                            let filtered_sql = inject_block_filter(&sql, block_num);
+                            match crate::service::execute_query(&pool, duckdb_pool.as_ref(), &filtered_sql, signature.as_deref(), &options).await {
+                                Ok(result) => {
+                                    yield Ok(SseEvent::default()
+                                        .event("result")
+                                        .json_data(QueryResponse { result, ok: true })
+                                        .unwrap());
+                                }
+                                Err(e) => {
+                                    yield Ok(SseEvent::default()
+                                        .event("error")
+                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                        .unwrap());
+                                }
+                            }
+                        }
+                        last_block_num = end;
                     }
-
-                    last_block_num = end;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     yield Ok(SseEvent::default()
