@@ -585,8 +585,8 @@ All tables use composite primary keys with timestamps for efficient range querie
 ### Prerequisites
 
 - [Rust 1.75+](https://rustup.rs/)
-- [Docker](https://docs.docker.com/get-docker/) & [Docker Compose](https://docs.docker.com/compose/install/)
-- [PostgreSQL client](https://www.postgresql.org/download/) (optional)
+- [Docker](https://docs.docker.com/get-docker/)
+- [PostgreSQL](https://www.postgresql.org/download/)
 
 ### Make Commands
 
@@ -601,50 +601,9 @@ make seed-heavy          # Generate ~1M+ transactions
 make clean               # Stop services + clean build
 ```
 
-### Project Structure
-
-```
-src/
-├── api/          # HTTP API (axum)
-├── cli/          # CLI commands
-├── db/           # Database pools (PostgreSQL + DuckDB)
-│   ├── pool.rs      # PostgreSQL connection pool
-│   ├── duckdb.rs    # DuckDB pool + schema + ABI macros
-│   └── schema.rs    # PostgreSQL migrations
-├── query/        # Query parsing and routing
-│   ├── parser.rs    # Event signature parser + CTE generation
-│   └── router.rs    # OLTP/OLAP query routing logic
-├── sync/         # Sync engine
-│   ├── engine.rs    # Bidirectional sync orchestration
-│   ├── fetcher.rs   # RPC data fetching
-│   ├── writer.rs    # PostgreSQL batch writer
-│   └── replicator.rs # DuckDB sync replication
-├── service/      # Shared business logic
-└── types.rs      # Core data types
-
-db/               # PostgreSQL migrations
-tests/            # Integration tests
-benches/          # Benchmarks
-```
-
-### Running Tests
-
-```bash
-# Start test infrastructure
-DEVNET=1 make up
-
-# Run all tests
-make test
-
-# Run specific test
-cargo test smoke_test -- --test-threads=1
-```
-
-Tests use real PostgreSQL and Tempo nodes (no mocks).
-
 ## License
 
-MIT License — see [LICENSE](./LICENSE)
+[LICENSE](./LICENSE)
 
 ## Acknowledgments
 
