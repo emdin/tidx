@@ -157,6 +157,10 @@ pub struct ChainConfig {
     /// Batch size for RPC requests (default: 100)
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
+
+    /// Number of concurrent gap-fill workers (default: 4)
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
 }
 
 fn default_backfill() -> bool {
@@ -165,6 +169,10 @@ fn default_backfill() -> bool {
 
 fn default_batch_size() -> u64 {
     100
+}
+
+fn default_concurrency() -> usize {
+    4
 }
 
 impl Config {

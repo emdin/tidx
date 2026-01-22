@@ -15,7 +15,8 @@ chain_id = 42431
 rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.moderato.tempo.xyz"
 pg_url = "postgres://ak47:ak47@postgres:5432/ak47_moderato"
 backfill = true
-batch_size = 100
+batch_size = 500
+concurrency = 8
 
 [[chains]]
 name = "mainnet"
@@ -23,4 +24,5 @@ chain_id = 4217
 rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.tempo.xyz"
 pg_url = "postgres://ak47:ak47@postgres:5432/ak47_mainnet"
 backfill = true
-batch_size = 100
+batch_size = 500
+concurrency = 8

@@ -15,8 +15,9 @@ use super::decoder::{decode_block, decode_log, decode_receipt, decode_transactio
 use super::fetcher::RpcClient;
 use super::replicator::ReplicatorHandle;
 use super::writer::{
-    detect_all_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num,
-    update_tip_num, write_block, write_blocks, write_logs, write_receipts, write_txs,
+    detect_all_gaps, get_block_hash, load_sync_state, save_sync_state, update_sync_rate,
+    update_synced_num, update_tip_num, write_block, write_blocks, write_logs, write_receipts,
+    write_txs,
 };
 
 pub struct SyncEngine {
@@ -25,6 +26,8 @@ pub struct SyncEngine {
     chain_id: u64,
     broadcaster: Option<Arc<Broadcaster>>,
     replicator: Option<ReplicatorHandle>,
+    batch_size: u64,
+    concurrency: usize,
 }
 
 impl SyncEngine {
@@ -40,7 +43,19 @@ impl SyncEngine {
             chain_id,
             broadcaster: None,
             replicator: None,
+            batch_size: 100,
+            concurrency: 4,
         })
+    }
+
+    pub fn with_batch_size(mut self, batch_size: u64) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
+        self
     }
 
     pub fn with_broadcaster(mut self, broadcaster: Arc<Broadcaster>) -> Self {
@@ -74,8 +89,18 @@ impl SyncEngine {
         let gapfill_pool = self.pool.clone();
         let gapfill_rpc = self.rpc.clone();
         let gapfill_chain_id = self.chain_id;
+        let gapfill_batch_size = self.batch_size;
+        let gapfill_concurrency = self.concurrency;
         let gapfill_handle = tokio::spawn(async move {
-            run_gapfill_loop(gapfill_pool, gapfill_rpc, gapfill_chain_id, gapfill_shutdown).await
+            run_gapfill_loop(
+                gapfill_pool,
+                gapfill_rpc,
+                gapfill_chain_id,
+                gapfill_batch_size,
+                gapfill_concurrency,
+                gapfill_shutdown,
+            )
+            .await
         });
 
         // Run realtime loop in foreground
@@ -439,6 +464,7 @@ impl SyncEngine {
             synced_num: num,
             tip_num: num,
             backfill_num: state.backfill_num,
+            sync_rate: state.sync_rate,
             started_at: state.started_at,
         };
         save_sync_state(&self.pool, &new_state).await?;
@@ -549,15 +575,24 @@ impl SyncEngine {
 }
 
 /// Standalone gap-fill loop that runs in a separate task
-/// Fills gaps detected in the blocks table
+/// Fills gaps detected in the blocks table using parallel workers
 async fn run_gapfill_loop(
     pool: Pool,
     rpc: RpcClient,
     chain_id: u64,
+    batch_size: u64,
+    concurrency: usize,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(&pool, chain_id).await?.unwrap_or_default();
     let mut progress = SyncProgress::new(chain_id, state.synced_num);
+
+    info!(
+        chain_id = chain_id,
+        batch_size = batch_size,
+        concurrency = concurrency,
+        "Gap-fill: starting with parallel workers"
+    );
 
     loop {
         tokio::select! {
@@ -567,7 +602,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill(&pool, &rpc, chain_id, &mut progress) => {
+            result = tick_gapfill_parallel(&pool, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -579,17 +614,17 @@ async fn run_gapfill_loop(
     Ok(())
 }
 
-/// Single tick of gap sync: detect ALL gaps and fill from most recent to earliest
-/// Unified approach - no separate "backfill" concept, just gaps to fill
-async fn tick_gap_sync(
+/// Parallel gap-fill: spawns N concurrent workers to fetch and write block ranges
+async fn tick_gapfill_parallel(
     pool: &Pool,
     rpc: &RpcClient,
     chain_id: u64,
     batch_size: u64,
+    concurrency: usize,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
-    
+
     // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
     let gaps = detect_all_gaps(pool, state.tip_num).await?;
 
@@ -605,65 +640,125 @@ async fn tick_gap_sync(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
-    
-    // Take the first (most recent) gap to fill
-    let (gap_start, gap_end) = gaps[0];
-    let gap_size = gap_end - gap_start + 1;
-    
+
+    // Collect all batch ranges to process (from most recent gaps first)
+    let mut batch_ranges: Vec<(u64, u64)> = Vec::new();
+    for (gap_start, gap_end) in &gaps {
+        let mut current_end = *gap_end;
+        while current_end >= *gap_start {
+            let current_start = current_end.saturating_sub(batch_size - 1).max(*gap_start);
+            batch_ranges.push((current_start, current_end));
+            if current_start == *gap_start {
+                break;
+            }
+            current_end = current_start.saturating_sub(1);
+        }
+    }
+
+    let total_batches = batch_ranges.len();
     debug!(
         gap_count = gap_count,
         total_blocks = total_gap_blocks,
-        current_gap = format!("{} -> {} ({} blocks)", gap_start, gap_end, gap_size),
-        "Gap sync: filling most recent gap"
+        total_batches = total_batches,
+        concurrency = concurrency,
+        "Gap sync: processing with parallel workers"
     );
 
-    // Fill this gap in batches (from end backwards to start for most recent first)
-    let mut current_end = gap_end;
+    // Process batches with N concurrent workers using JoinSet
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut batch_iter = batch_ranges.into_iter();
+    let mut completed = 0u64;
+    let mut lowest_block = u64::MAX;
+    let tick_start = std::time::Instant::now();
 
-    while current_end >= gap_start {
-        let current_start = current_end.saturating_sub(batch_size - 1).max(gap_start);
-        
-        sync_range_standalone(pool, rpc, current_start, current_end).await?;
-
-        let batch_count = current_end - current_start + 1;
-        metrics::record_blocks_indexed(chain_id, batch_count);
-        progress.report_backfill(current_start, 0, batch_count);
-
-        debug!(
-            from = current_start,
-            to = current_end,
-            "Gap sync: wrote batch"
-        );
-
-        if current_start == gap_start {
-            break;
+    // Seed initial concurrent tasks
+    for _ in 0..concurrency {
+        if let Some((start, end)) = batch_iter.next() {
+            let pool = pool.clone();
+            let rpc = rpc.clone();
+            join_set.spawn(async move {
+                let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                (start, end, result)
+            });
         }
-        current_end = current_start.saturating_sub(1);
+    }
+
+    // Process results and spawn new tasks as workers complete
+    while let Some(join_result) = join_set.join_next().await {
+        let (start, end, result) = join_result?;
+        match result {
+            Ok(()) => {
+                let batch_count = end - start + 1;
+                completed += batch_count;
+                lowest_block = lowest_block.min(start);
+                metrics::record_blocks_indexed(chain_id, batch_count);
+                progress.report_backfill(start, 0, batch_count);
+
+                debug!(
+                    from = start,
+                    to = end,
+                    completed = completed,
+                    "Gap sync: wrote batch"
+                );
+            }
+            Err(e) => {
+                error!(
+                    from = start,
+                    to = end,
+                    error = %e,
+                    "Gap sync: batch failed, will retry"
+                );
+                // Re-queue the failed batch
+                let pool = pool.clone();
+                let rpc = rpc.clone();
+                join_set.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                    (start, end, result)
+                });
+                continue;
+            }
+        }
+
+        // Spawn next batch if available
+        if let Some((start, end)) = batch_iter.next() {
+            let pool = pool.clone();
+            let rpc = rpc.clone();
+            join_set.spawn(async move {
+                let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                (start, end, result)
+            });
+        }
+    }
+
+    // Calculate and save the sync rate
+    let elapsed = tick_start.elapsed().as_secs_f64();
+    let rate = if elapsed > 0.0 {
+        completed as f64 / elapsed
+    } else {
+        0.0
+    };
+
+    if rate > 0.0 {
+        update_sync_rate(pool, chain_id, rate).await.ok();
     }
 
     info!(
-        gap_start = gap_start,
-        gap_end = gap_end,
-        remaining_gaps = gap_count - 1,
-        "Gap sync: closed gap"
+        completed = completed,
+        gap_count = gap_count,
+        lowest_block = lowest_block,
+        rate = format!("{:.1} blk/s", rate),
+        "Gap sync: completed round"
     );
 
     // Update backfill_num to track progress (lowest block we've reached)
-    let mut updated_state = state.clone();
-    updated_state.backfill_num = Some(gap_start);
-    save_sync_state(pool, &updated_state).await?;
+    if lowest_block < u64::MAX {
+        let mut updated_state = state.clone();
+        updated_state.backfill_num = Some(lowest_block);
+        save_sync_state(pool, &updated_state).await?;
+    }
 
     Ok(())
-}
-
-/// Legacy tick_gapfill - now calls unified tick_gap_sync
-async fn tick_gapfill(
-    pool: &Pool,
-    rpc: &RpcClient,
-    chain_id: u64,
-    progress: &mut SyncProgress,
-) -> Result<()> {
-    tick_gap_sync(pool, rpc, chain_id, 100, progress).await
 }
 
 /// Check if fully synced (no gaps from genesis to tip)

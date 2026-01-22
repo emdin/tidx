@@ -233,9 +233,12 @@ fn spawn_sync_engine(
     );
 
     tokio::spawn(async move {
-        // Create sync engine with broadcaster
+        // Create sync engine with broadcaster and config
         let mut engine = match SyncEngine::new(pool, &chain.rpc_url).await {
-            Ok(e) => e.with_broadcaster(broadcaster),
+            Ok(e) => e
+                .with_broadcaster(broadcaster)
+                .with_batch_size(chain.batch_size)
+                .with_concurrency(chain.concurrency),
             Err(e) => {
                 error!(error = %e, chain = %chain.name, "Failed to create sync engine");
                 return;

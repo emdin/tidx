@@ -111,19 +111,29 @@ async fn print_status(config: &Config) -> Result<()> {
                     0
                 };
                 
-                // Calculate rate from actual synced blocks and elapsed time
-                let (rate_str, eta_str) = if let Some(started) = state.started_at {
-                    let elapsed = chrono::Utc::now().signed_duration_since(started);
-                    let secs = elapsed.num_seconds() as f64;
-                    if secs > 10.0 && actual_block_count > 0 {
-                        let rate = actual_block_count as f64 / secs;
-                        let eta_secs = if rate > 0.0 { total_gap_blocks as f64 / rate } else { 0.0 };
+                // Use the rolling sync rate stored in the database
+                let (rate_str, eta_str) = if let Some(rate) = state.sync_rate {
+                    if rate > 0.0 {
+                        let eta_secs = total_gap_blocks as f64 / rate;
                         (format!("{:.0} blk/s", rate), format_eta(eta_secs))
                     } else {
                         ("--".to_string(), "calculating...".to_string())
                     }
                 } else {
-                    ("--".to_string(), "calculating...".to_string())
+                    // Fallback to overall rate if rolling rate unavailable
+                    if let Some(started) = state.started_at {
+                        let elapsed = chrono::Utc::now().signed_duration_since(started);
+                        let secs = elapsed.num_seconds() as f64;
+                        if secs > 10.0 && actual_block_count > 0 {
+                            let rate = actual_block_count as f64 / secs;
+                            let eta_secs = if rate > 0.0 { total_gap_blocks as f64 / rate } else { 0.0 };
+                            (format!("{:.0} blk/s", rate), format_eta(eta_secs))
+                        } else {
+                            ("--".to_string(), "calculating...".to_string())
+                        }
+                    } else {
+                        ("--".to_string(), "calculating...".to_string())
+                    }
                 };
                 
                 println!("│  ├─ Synced:   {} / {} ({pct}%)", format_number(actual_block_count), format_number(total_needed));
@@ -180,7 +190,7 @@ async fn print_json_status(config: &Config) -> Result<()> {
             "gaps": gaps_json,
             "backfill_block": state.as_ref().and_then(|s| s.backfill_num),
             "backfill_complete": state.as_ref().map(|s| s.backfill_complete()).unwrap_or(false),
-            "sync_rate": state.as_ref().and_then(|s| s.sync_rate()),
+            "sync_rate": state.as_ref().and_then(|s| s.current_rate()),
             "backfill_eta_secs": state.as_ref().and_then(|s| s.backfill_eta_secs()),
         });
         chains.push(chain_status);

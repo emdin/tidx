@@ -80,6 +80,9 @@ pub struct SyncState {
     pub tip_num: u64,
     /// Lowest block synced going backwards (None = not started, Some(0) = complete)
     pub backfill_num: Option<u64>,
+    /// Current sync rate in blocks/second (rolling window)
+    #[serde(default)]
+    pub sync_rate: Option<f64>,
     /// When sync started (for ETA calculations)
     #[serde(default)]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -125,8 +128,16 @@ impl SyncState {
         }
     }
 
-    /// Calculate sync rate (blocks per second) based on elapsed time
-    pub fn sync_rate(&self) -> Option<f64> {
+    /// Get the current sync rate (blocks per second)
+    /// Uses the stored rolling rate if available, otherwise calculates from elapsed time
+    pub fn current_rate(&self) -> Option<f64> {
+        // Prefer the stored rolling rate (more accurate)
+        if let Some(rate) = self.sync_rate {
+            if rate > 0.0 {
+                return Some(rate);
+            }
+        }
+        // Fallback to calculating from total elapsed time
         let started = self.started_at?;
         let elapsed = chrono::Utc::now().signed_duration_since(started);
         let secs = elapsed.num_seconds() as f64;
@@ -139,7 +150,7 @@ impl SyncState {
 
     /// Estimate time remaining for backfill to complete
     pub fn backfill_eta_secs(&self) -> Option<f64> {
-        let rate = self.sync_rate()?;
+        let rate = self.current_rate()?;
         if rate > 0.0 {
             let remaining = self.backfill_remaining();
             Some(remaining as f64 / rate)
