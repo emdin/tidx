@@ -29,9 +29,7 @@ services:
     restart: unless-stopped
 
   tidx:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: ghcr.io/tempoxyz/tidx:latest
     command:
       - up
       - --config
