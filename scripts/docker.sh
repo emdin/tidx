@@ -4,7 +4,7 @@ set -euo pipefail
 # tidx Docker installer
 # Usage: curl -L https://tidx.tempo.xyz/docker | bash
 
-REPO="tempoxyz/tidx"
+BASE_URL="https://tidx.vercel.app"
 TIDX_HOME="${TIDX_HOME:-$HOME/.tidx}"
 BIN_DIR="${TIDX_BIN:-$HOME/.local/bin}"
 
@@ -16,11 +16,11 @@ main() {
 
     # Download docker-compose and config
     echo "Downloading docker-compose.yml..."
-    curl -sL "https://raw.githubusercontent.com/$REPO/main/docker/prod/docker-compose.yml" -o "$TIDX_HOME/docker-compose.yml"
+    curl -sL "$BASE_URL/docker/prod/docker-compose.yml" -o "$TIDX_HOME/docker-compose.yml"
 
     if [ ! -f "$TIDX_HOME/config.toml" ]; then
         echo "Downloading config.toml..."
-        curl -sL "https://raw.githubusercontent.com/$REPO/main/docker/prod/config.toml" -o "$TIDX_HOME/config.toml"
+        curl -sL "$BASE_URL/docker/prod/config.toml" -o "$TIDX_HOME/config.toml"
     fi
 
     # Create tidx wrapper script
