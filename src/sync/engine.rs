@@ -7,13 +7,13 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use crate::broadcast::{BlockUpdate, Broadcaster};
-use crate::db::Pool;
+use crate::db::{DuckDbPool, Pool};
 use crate::metrics::{self, SyncProgress};
 use crate::types::SyncState;
 
 use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, timestamp_from_secs};
 use super::fetcher::RpcClient;
-use super::replicator::ReplicatorHandle;
+use super::replicator::{detect_gaps_duckdb, fill_gaps_from_postgres, ReplicatorHandle};
 use super::writer::{
     detect_all_gaps, get_block_hash, load_sync_state, save_sync_state, update_sync_rate,
     update_synced_num, update_tip_num, write_block, write_blocks, write_logs, write_receipts,
@@ -26,6 +26,7 @@ pub struct SyncEngine {
     chain_id: u64,
     broadcaster: Option<Arc<Broadcaster>>,
     replicator: Option<ReplicatorHandle>,
+    duckdb: Option<Arc<DuckDbPool>>,
     batch_size: u64,
     concurrency: usize,
 }
@@ -43,6 +44,7 @@ impl SyncEngine {
             chain_id,
             broadcaster: None,
             replicator: None,
+            duckdb: None,
             batch_size: 100,
             concurrency: 4,
         })
@@ -65,6 +67,11 @@ impl SyncEngine {
 
     pub fn with_replicator(mut self, replicator: ReplicatorHandle) -> Self {
         self.replicator = Some(replicator);
+        self
+    }
+
+    pub fn with_duckdb(mut self, duckdb: Arc<DuckDbPool>) -> Self {
+        self.duckdb = Some(duckdb);
         self
     }
 
@@ -91,6 +98,7 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
+        let gapfill_duckdb = self.duckdb.clone();
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
                 gapfill_pool,
@@ -98,6 +106,7 @@ impl SyncEngine {
                 gapfill_chain_id,
                 gapfill_batch_size,
                 gapfill_concurrency,
+                gapfill_duckdb,
                 gapfill_shutdown,
             )
             .await
@@ -578,12 +587,14 @@ impl SyncEngine {
 
 /// Standalone gap-fill loop that runs in a separate task
 /// Fills gaps detected in the blocks table using parallel workers
+/// Also fills DuckDB gaps from PostgreSQL if DuckDB is configured
 async fn run_gapfill_loop(
     pool: Pool,
     rpc: RpcClient,
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    duckdb: Option<Arc<DuckDbPool>>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(&pool, chain_id).await?.unwrap_or_default();
@@ -593,6 +604,7 @@ async fn run_gapfill_loop(
         chain_id = chain_id,
         batch_size = batch_size,
         concurrency = concurrency,
+        duckdb = duckdb.is_some(),
         "Gap-fill: starting with parallel workers"
     );
 
@@ -610,6 +622,45 @@ async fn run_gapfill_loop(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
+        }
+
+        // Fill DuckDB gaps from PostgreSQL (runs after each PG gap-fill tick)
+        if let Some(ref duck) = duckdb {
+            if let Err(e) = tick_duckdb_gapfill(&pool, duck, batch_size as i64).await {
+                error!(error = %e, "DuckDB gap-fill tick failed");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Fill any gaps in DuckDB from PostgreSQL
+async fn tick_duckdb_gapfill(
+    pg_pool: &Pool,
+    duckdb: &Arc<DuckDbPool>,
+    batch_size: i64,
+) -> Result<()> {
+    let gaps = detect_gaps_duckdb(duckdb).await?;
+    if gaps.is_empty() {
+        return Ok(());
+    }
+
+    let total_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+    info!(
+        gap_count = gaps.len(),
+        total_blocks = total_blocks,
+        "DuckDB gap-fill: detected gaps"
+    );
+
+    let gaps_i64: Vec<(i64, i64)> = gaps;
+    match fill_gaps_from_postgres(pg_pool, duckdb, &gaps_i64, batch_size).await {
+        Ok(synced) if synced > 0 => {
+            info!(synced, "DuckDB gap-fill: filled gaps");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            error!(error = %e, "DuckDB gap-fill: failed");
         }
     }
 

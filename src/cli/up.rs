@@ -63,7 +63,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
-        let (pool, replicator_handle) = initialize_chain(
+        let (pool, replicator_handle, duckdb) = initialize_chain(
             chain,
             Arc::clone(&duckdb_pools),
         ).await?;
@@ -78,6 +78,7 @@ pub async fn run(args: Args) -> Result<()> {
             chain.clone(),
             pool,
             replicator_handle,
+            duckdb,
             broadcaster.clone(),
             shutdown_tx.subscribe(),
         );
@@ -126,13 +127,14 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
                 match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher)).await {
-                    Ok((pool, replicator_handle)) => {
+                    Ok((pool, replicator_handle, duckdb)) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, pool.clone());
 
                         spawn_sync_engine(
                             event.chain,
                             pool,
                             replicator_handle,
+                            duckdb,
                             broadcaster_for_watcher.clone(),
                             shutdown_tx_for_watcher.subscribe(),
                         );
@@ -180,14 +182,14 @@ pub async fn run(args: Args) -> Result<()> {
 async fn initialize_chain(
     chain: &ChainConfig,
     duckdb_pools: SharedDuckDbPools,
-) -> Result<(Pool, Option<ReplicatorHandle>)> {
+) -> Result<(Pool, Option<ReplicatorHandle>, Option<Arc<DuckDbPool>>)> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database...");
     let pool = db::create_pool(&chain.pg_url).await?;
 
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&pool).await?;
 
-    let replicator_handle: Option<ReplicatorHandle> = if let Some(ref duckdb_path) = chain.duckdb_path {
+    let (replicator_handle, duckdb_pool) = if let Some(ref duckdb_path) = chain.duckdb_path {
         info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB");
         let duckdb_pool = Arc::new(DuckDbPool::new(duckdb_path)?);
 
@@ -208,19 +210,20 @@ async fn initialize_chain(
         let (replicator, handle) = Replicator::new(duckdb_pool.clone(), 1000);
         tokio::spawn(replicator.run());
 
-        duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool);
-        Some(handle)
+        duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool.clone());
+        (Some(handle), Some(duckdb_pool))
     } else {
-        None
+        (None, None)
     };
 
-    Ok((pool, replicator_handle))
+    Ok((pool, replicator_handle, duckdb_pool))
 }
 
 fn spawn_sync_engine(
     chain: ChainConfig,
     pool: Pool,
     replicator_handle: Option<ReplicatorHandle>,
+    duckdb: Option<Arc<DuckDbPool>>,
     broadcaster: Arc<Broadcaster>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
@@ -247,6 +250,10 @@ fn spawn_sync_engine(
 
         if let Some(handle) = replicator_handle {
             engine = engine.with_replicator(handle);
+        }
+
+        if let Some(duck) = duckdb {
+            engine = engine.with_duckdb(duck);
         }
 
         // Run the sync engine - handles both realtime sync and gap sync

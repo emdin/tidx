@@ -498,13 +498,16 @@ pub async fn backfill_from_postgres(
     Ok(synced)
 }
 
-/// Gets the current DuckDB sync status.
+/// Gets the current DuckDB sync status including any gaps.
 pub async fn get_sync_status(duckdb: &Arc<DuckDbPool>) -> Result<DuckDbSyncStatus> {
-    // Query actual max block from blocks table (authoritative source)
     let latest_block = duckdb.latest_block().await?.unwrap_or(0);
+    let gaps = detect_gaps_duckdb(duckdb).await?;
+    let gap_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
 
     Ok(DuckDbSyncStatus {
         latest_block,
+        gaps,
+        gap_blocks,
         updated_at: String::new(),
     })
 }
@@ -512,7 +515,302 @@ pub async fn get_sync_status(duckdb: &Arc<DuckDbPool>) -> Result<DuckDbSyncStatu
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DuckDbSyncStatus {
     pub latest_block: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<(i64, i64)>,
+    pub gap_blocks: i64,
     pub updated_at: String,
+}
+
+/// Detect gaps in DuckDB block sequence (between existing blocks only).
+/// Returns a list of (start, end) ranges that are missing.
+pub async fn detect_gaps_duckdb(duckdb: &Arc<DuckDbPool>) -> Result<Vec<(i64, i64)>> {
+    let conn = duckdb.conn().await;
+    let mut stmt = conn.prepare(
+        r#"
+        WITH numbered AS (
+            SELECT num, LAG(num) OVER (ORDER BY num) as prev_num
+            FROM blocks
+        )
+        SELECT prev_num + 1 as gap_start, num - 1 as gap_end
+        FROM numbered
+        WHERE num - prev_num > 1
+        ORDER BY gap_end DESC
+        "#,
+    )?;
+
+    let gaps: Vec<(i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(gaps)
+}
+
+/// Detect ALL gaps in DuckDB including from genesis to first block.
+/// Returns gaps sorted by end block descending (most recent first).
+pub async fn detect_all_gaps_duckdb(duckdb: &Arc<DuckDbPool>, tip_num: i64) -> Result<Vec<(i64, i64)>> {
+    // Get min block
+    let conn = duckdb.conn().await;
+    let min_block: Option<i64> = conn
+        .prepare("SELECT MIN(num) FROM blocks")
+        .ok()
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+    drop(conn);
+
+    let mut gaps = detect_gaps_duckdb(duckdb).await?;
+
+    // Add gap from block 1 to first block (if we have any blocks and min > 1)
+    if let Some(min) = min_block {
+        if min > 1 {
+            gaps.push((1, min - 1));
+        }
+    } else if tip_num > 0 {
+        // No blocks at all - entire range is a gap
+        gaps.push((1, tip_num));
+    }
+
+    // Filter to only gaps up to tip_num
+    gaps.retain(|(_, end)| *end <= tip_num);
+
+    // Sort by end block descending (most recent gaps first)
+    gaps.sort_by(|a, b| b.1.cmp(&a.1));
+
+    Ok(gaps)
+}
+
+/// Fill specific gap ranges in DuckDB from PostgreSQL.
+pub async fn fill_gaps_from_postgres(
+    pg_pool: &Pool,
+    duckdb: &Arc<DuckDbPool>,
+    gaps: &[(i64, i64)],
+    batch_size: i64,
+) -> Result<u64> {
+    if gaps.is_empty() {
+        return Ok(0);
+    }
+
+    let total_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+    tracing::info!(gap_count = gaps.len(), total_blocks, "Starting DuckDB gap fill from PostgreSQL");
+
+    let pg_conn = pg_pool.get().await?;
+    let mut synced = 0u64;
+
+    for (gap_start, gap_end) in gaps {
+        let mut current = *gap_start;
+        while current <= *gap_end {
+            let end = (current + batch_size - 1).min(*gap_end);
+
+            // Backfill blocks for this range
+            let block_rows = pg_conn
+                .query(
+                    "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data 
+                     FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
+                    &[&current, &end],
+                )
+                .await?;
+
+            if !block_rows.is_empty() {
+                let duck_conn = duckdb.conn().await;
+                let mut appender = duck_conn.appender("blocks")?;
+                for row in &block_rows {
+                    let num: i64 = row.get(0);
+                    let hash: Vec<u8> = row.get(1);
+                    let parent_hash: Vec<u8> = row.get(2);
+                    let timestamp: chrono::DateTime<chrono::Utc> = row.get(3);
+                    let timestamp_ms: i64 = row.get(4);
+                    let gas_limit: i64 = row.get(5);
+                    let gas_used: i64 = row.get(6);
+                    let miner: Vec<u8> = row.get(7);
+                    let extra_data: Option<Vec<u8>> = row.get(8);
+
+                    appender.append_row(duckdb::params![
+                        num,
+                        format!("0x{}", hex::encode(&hash)),
+                        format!("0x{}", hex::encode(&parent_hash)),
+                        timestamp.to_rfc3339(),
+                        timestamp_ms,
+                        gas_limit,
+                        gas_used,
+                        format!("0x{}", hex::encode(&miner)),
+                        extra_data.as_ref().map(|d| format!("0x{}", hex::encode(d))),
+                    ])?;
+                }
+                appender.flush()?;
+            }
+
+            // Backfill txs for this range
+            let tx_rows = pg_conn
+                .query(
+                    "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input,
+                            gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce,
+                            fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type
+                     FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
+                    &[&current, &end],
+                )
+                .await?;
+
+            if !tx_rows.is_empty() {
+                let duck_conn = duckdb.conn().await;
+                let mut appender = duck_conn.appender("txs")?;
+                for row in &tx_rows {
+                    let block_num: i64 = row.get(0);
+                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                    let idx: i32 = row.get(2);
+                    let hash: Vec<u8> = row.get(3);
+                    let tx_type: i16 = row.get(4);
+                    let from: Vec<u8> = row.get(5);
+                    let to: Option<Vec<u8>> = row.get(6);
+                    let value: String = row.get(7);
+                    let input: Vec<u8> = row.get(8);
+                    let gas_limit: i64 = row.get(9);
+                    let max_fee_per_gas: String = row.get(10);
+                    let max_priority_fee_per_gas: String = row.get(11);
+                    let gas_used: Option<i64> = row.get(12);
+                    let nonce_key: Vec<u8> = row.get(13);
+                    let nonce: i64 = row.get(14);
+                    let fee_token: Option<Vec<u8>> = row.get(15);
+                    let fee_payer: Option<Vec<u8>> = row.get(16);
+                    let calls: Option<serde_json::Value> = row.get(17);
+                    let call_count: i16 = row.get(18);
+                    let valid_before: Option<i64> = row.get(19);
+                    let valid_after: Option<i64> = row.get(20);
+                    let signature_type: Option<i16> = row.get(21);
+
+                    appender.append_row(duckdb::params![
+                        block_num,
+                        block_timestamp.to_rfc3339(),
+                        idx,
+                        format!("0x{}", hex::encode(&hash)),
+                        tx_type,
+                        format!("0x{}", hex::encode(&from)),
+                        to.as_ref().map(|t| format!("0x{}", hex::encode(t))),
+                        value,
+                        format!("0x{}", hex::encode(&input)),
+                        gas_limit,
+                        max_fee_per_gas,
+                        max_priority_fee_per_gas,
+                        gas_used,
+                        format!("0x{}", hex::encode(&nonce_key)),
+                        nonce,
+                        fee_token.as_ref().map(|t| format!("0x{}", hex::encode(t))),
+                        fee_payer.as_ref().map(|p| format!("0x{}", hex::encode(p))),
+                        calls.as_ref().map(|c| c.to_string()),
+                        call_count,
+                        valid_before,
+                        valid_after,
+                        signature_type,
+                    ])?;
+                }
+                appender.flush()?;
+            }
+
+            // Backfill logs for this range
+            let log_rows = pg_conn
+                .query(
+                    "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data
+                     FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
+                    &[&current, &end],
+                )
+                .await?;
+
+            if !log_rows.is_empty() {
+                let duck_conn = duckdb.conn().await;
+                duck_conn.execute("BEGIN TRANSACTION", [])?;
+                for row in &log_rows {
+                    let block_num: i64 = row.get(0);
+                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                    let log_idx: i32 = row.get(2);
+                    let tx_idx: i32 = row.get(3);
+                    let tx_hash: Vec<u8> = row.get(4);
+                    let address: Vec<u8> = row.get(5);
+                    let selector: Option<Vec<u8>> = row.get(6);
+                    let topics: Option<Vec<Vec<u8>>> = row.get(7);
+                    let data: Vec<u8> = row.get(8);
+
+                    let topics_str = format!(
+                        "[{}]",
+                        topics
+                            .as_ref()
+                            .map(|t| t.iter()
+                                .map(|topic| format!("'0x{}'", hex::encode(topic)))
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default()
+                    );
+
+                    duck_conn.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, {}, ?)",
+                            topics_str
+                        ),
+                        duckdb::params![
+                            block_num,
+                            block_timestamp.to_rfc3339(),
+                            log_idx,
+                            tx_idx,
+                            format!("0x{}", hex::encode(&tx_hash)),
+                            format!("0x{}", hex::encode(&address)),
+                            selector.as_ref().map(|s| format!("0x{}", hex::encode(s))),
+                            format!("0x{}", hex::encode(&data)),
+                        ],
+                    )?;
+                }
+                duck_conn.execute("COMMIT", [])?;
+            }
+
+            // Backfill receipts for this range
+            let receipt_rows = pg_conn
+                .query(
+                    "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address,
+                            gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer
+                     FROM receipts WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, tx_idx",
+                    &[&current, &end],
+                )
+                .await?;
+
+            if !receipt_rows.is_empty() {
+                let duck_conn = duckdb.conn().await;
+                let mut appender = duck_conn.appender("receipts")?;
+                for row in &receipt_rows {
+                    let block_num: i64 = row.get(0);
+                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                    let tx_idx: i32 = row.get(2);
+                    let tx_hash: Vec<u8> = row.get(3);
+                    let from: Vec<u8> = row.get(4);
+                    let to: Option<Vec<u8>> = row.get(5);
+                    let contract_address: Option<Vec<u8>> = row.get(6);
+                    let gas_used: i64 = row.get(7);
+                    let cumulative_gas_used: i64 = row.get(8);
+                    let effective_gas_price: Option<String> = row.get(9);
+                    let status: Option<i16> = row.get(10);
+                    let fee_payer: Option<Vec<u8>> = row.get(11);
+
+                    appender.append_row(duckdb::params![
+                        block_num,
+                        block_timestamp.to_rfc3339(),
+                        tx_idx,
+                        format!("0x{}", hex::encode(&tx_hash)),
+                        format!("0x{}", hex::encode(&from)),
+                        to.as_ref().map(|t| format!("0x{}", hex::encode(t))),
+                        contract_address.as_ref().map(|a| format!("0x{}", hex::encode(a))),
+                        gas_used,
+                        cumulative_gas_used,
+                        effective_gas_price,
+                        status,
+                        fee_payer.as_ref().map(|p| format!("0x{}", hex::encode(p))),
+                    ])?;
+                }
+                appender.flush()?;
+            }
+
+            synced += block_rows.len() as u64;
+            current = end + 1;
+        }
+    }
+
+    tracing::info!(synced, "DuckDB gap fill complete");
+    Ok(synced)
 }
 
 #[cfg(test)]
@@ -677,5 +975,198 @@ mod tests {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let status = get_sync_status(&duckdb).await.unwrap();
         assert_eq!(status.latest_block, 0);
+        assert!(status.gaps.is_empty());
+        assert_eq!(status.gap_blocks, 0);
+    }
+
+    #[tokio::test]
+    async fn test_detect_gaps_duckdb_no_gaps() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+
+        // Insert contiguous blocks 1, 2, 3
+        for num in 1..=3 {
+            let block = BlockRow {
+                num,
+                hash: vec![num as u8; 32],
+                parent_hash: vec![(num - 1) as u8; 32],
+                timestamp: Utc::now(),
+                timestamp_ms: 1704067200000 + num * 1000,
+                gas_limit: 30_000_000,
+                gas_used: 21000,
+                miner: vec![0xde; 20],
+                extra_data: None,
+            };
+            let conn = duckdb.conn().await;
+            let mut appender = conn.appender("blocks").unwrap();
+            appender
+                .append_row(duckdb::params![
+                    block.num,
+                    format!("0x{}", hex::encode(&block.hash)),
+                    format!("0x{}", hex::encode(&block.parent_hash)),
+                    block.timestamp.to_rfc3339(),
+                    block.timestamp_ms,
+                    block.gas_limit,
+                    block.gas_used,
+                    format!("0x{}", hex::encode(&block.miner)),
+                    block.extra_data.as_ref().map(|d| format!("0x{}", hex::encode(d))),
+                ])
+                .unwrap();
+            appender.flush().unwrap();
+        }
+
+        let gaps = detect_gaps_duckdb(&duckdb).await.unwrap();
+        assert!(gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_detect_gaps_duckdb_with_gap() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+
+        // Insert blocks 1, 2, 5, 6 (gap at 3-4)
+        for num in [1, 2, 5, 6] {
+            let block = BlockRow {
+                num,
+                hash: vec![num as u8; 32],
+                parent_hash: vec![(num - 1) as u8; 32],
+                timestamp: Utc::now(),
+                timestamp_ms: 1704067200000 + num * 1000,
+                gas_limit: 30_000_000,
+                gas_used: 21000,
+                miner: vec![0xde; 20],
+                extra_data: None,
+            };
+            let conn = duckdb.conn().await;
+            let mut appender = conn.appender("blocks").unwrap();
+            appender
+                .append_row(duckdb::params![
+                    block.num,
+                    format!("0x{}", hex::encode(&block.hash)),
+                    format!("0x{}", hex::encode(&block.parent_hash)),
+                    block.timestamp.to_rfc3339(),
+                    block.timestamp_ms,
+                    block.gas_limit,
+                    block.gas_used,
+                    format!("0x{}", hex::encode(&block.miner)),
+                    block.extra_data.as_ref().map(|d| format!("0x{}", hex::encode(d))),
+                ])
+                .unwrap();
+            appender.flush().unwrap();
+        }
+
+        let gaps = detect_gaps_duckdb(&duckdb).await.unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0], (3, 4));
+    }
+
+    #[tokio::test]
+    async fn test_detect_gaps_duckdb_multiple_gaps() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+
+        // Insert blocks 1, 5, 10 (gaps at 2-4 and 6-9)
+        for num in [1, 5, 10] {
+            let block = BlockRow {
+                num,
+                hash: vec![num as u8; 32],
+                parent_hash: vec![(num - 1) as u8; 32],
+                timestamp: Utc::now(),
+                timestamp_ms: 1704067200000 + num * 1000,
+                gas_limit: 30_000_000,
+                gas_used: 21000,
+                miner: vec![0xde; 20],
+                extra_data: None,
+            };
+            let conn = duckdb.conn().await;
+            let mut appender = conn.appender("blocks").unwrap();
+            appender
+                .append_row(duckdb::params![
+                    block.num,
+                    format!("0x{}", hex::encode(&block.hash)),
+                    format!("0x{}", hex::encode(&block.parent_hash)),
+                    block.timestamp.to_rfc3339(),
+                    block.timestamp_ms,
+                    block.gas_limit,
+                    block.gas_used,
+                    format!("0x{}", hex::encode(&block.miner)),
+                    block.extra_data.as_ref().map(|d| format!("0x{}", hex::encode(d))),
+                ])
+                .unwrap();
+            appender.flush().unwrap();
+        }
+
+        let gaps = detect_gaps_duckdb(&duckdb).await.unwrap();
+        assert_eq!(gaps.len(), 2);
+        // Sorted by end DESC (most recent first)
+        assert_eq!(gaps[0], (6, 9));
+        assert_eq!(gaps[1], (2, 4));
+    }
+
+    #[tokio::test]
+    async fn test_detect_all_gaps_duckdb_includes_genesis() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+
+        // Insert only block 5 (gap from 1-4)
+        let block = BlockRow {
+            num: 5,
+            hash: vec![5; 32],
+            parent_hash: vec![4; 32],
+            timestamp: Utc::now(),
+            timestamp_ms: 1704067200000,
+            gas_limit: 30_000_000,
+            gas_used: 21000,
+            miner: vec![0xde; 20],
+            extra_data: None,
+        };
+        let conn = duckdb.conn().await;
+        let mut appender = conn.appender("blocks").unwrap();
+        appender
+            .append_row(duckdb::params![
+                block.num,
+                format!("0x{}", hex::encode(&block.hash)),
+                format!("0x{}", hex::encode(&block.parent_hash)),
+                block.timestamp.to_rfc3339(),
+                block.timestamp_ms,
+                block.gas_limit,
+                block.gas_used,
+                format!("0x{}", hex::encode(&block.miner)),
+                block.extra_data.as_ref().map(|d| format!("0x{}", hex::encode(d))),
+            ])
+            .unwrap();
+        appender.flush().unwrap();
+
+        let gaps = detect_all_gaps_duckdb(&duckdb, 10).await.unwrap();
+        assert_eq!(gaps.len(), 1);
+        // Gap from genesis to first block
+        assert_eq!(gaps[0], (1, 4));
+    }
+
+    #[tokio::test]
+    async fn test_sync_status_with_gaps() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+
+        // Insert blocks 1, 5 (gap at 2-4)
+        for num in [1, 5] {
+            let conn = duckdb.conn().await;
+            let mut appender = conn.appender("blocks").unwrap();
+            appender
+                .append_row(duckdb::params![
+                    num as i64,
+                    format!("0x{}", hex::encode(vec![num as u8; 32])),
+                    format!("0x{}", hex::encode(vec![(num - 1) as u8; 32])),
+                    Utc::now().to_rfc3339(),
+                    1704067200000i64 + num * 1000,
+                    30_000_000i64,
+                    21000i64,
+                    format!("0x{}", hex::encode(vec![0xde; 20])),
+                    None::<String>,
+                ])
+                .unwrap();
+            appender.flush().unwrap();
+        }
+
+        let status = get_sync_status(&duckdb).await.unwrap();
+        assert_eq!(status.latest_block, 5);
+        assert_eq!(status.gaps.len(), 1);
+        assert_eq!(status.gaps[0], (2, 4));
+        assert_eq!(status.gap_blocks, 3); // blocks 2, 3, 4
     }
 }

@@ -155,6 +155,8 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
             if let Ok(duck_status) = crate::sync::get_sync_status(duckdb_pool).await {
                 chain.duckdb_synced_num = Some(duck_status.latest_block);
                 chain.duckdb_lag = Some(chain.synced_num - duck_status.latest_block);
+                chain.duckdb_gap_blocks = Some(duck_status.gap_blocks);
+                chain.duckdb_gaps = duck_status.gaps;
             }
         }
     }

@@ -28,6 +28,10 @@ pub struct SyncStatus {
     pub duckdb_synced_num: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duckdb_lag: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duckdb_gap_blocks: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub duckdb_gaps: Vec<(i64, i64)>,
 }
 
 pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
@@ -90,6 +94,8 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 updated_at: row.get(6),
                 duckdb_synced_num: None,
                 duckdb_lag: None,
+                duckdb_gap_blocks: None,
+                duckdb_gaps: Vec::new(),
             }
         })
         .collect())
