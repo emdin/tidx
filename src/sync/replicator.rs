@@ -245,7 +245,7 @@ impl Replicator {
                             .collect();
                         
                         let sql = format!(
-                            "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                            "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
                             values.join(", ")
                         );
                         if let Err(e) = conn.execute(&sql, []) {
@@ -477,7 +477,7 @@ pub async fn backfill_from_postgres(
 
                 duck_conn.execute(
                     &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                        "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
                          VALUES (?, ?, ?, ?, ?, ?, ?, {}, ?)",
                         topics_str
                     ),
