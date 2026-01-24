@@ -452,48 +452,58 @@ pub async fn backfill_from_postgres(
 
         if !log_rows.is_empty() {
             let duck_conn = duckdb.conn().await;
-            duck_conn.execute("BEGIN TRANSACTION", [])?;
-            for row in &log_rows {
-                let block_num: i64 = row.get(0);
-                let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
-                let log_idx: i32 = row.get(2);
-                let tx_idx: i32 = row.get(3);
-                let tx_hash: Vec<u8> = row.get(4);
-                let address: Vec<u8> = row.get(5);
-                let selector: Option<Vec<u8>> = row.get(6);
-                let topics: Option<Vec<Vec<u8>>> = row.get(7);
-                let data: Vec<u8> = row.get(8);
+            for chunk in log_rows.chunks(100) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|row| {
+                        let block_num: i64 = row.get(0);
+                        let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                        let log_idx: i32 = row.get(2);
+                        let tx_idx: i32 = row.get(3);
+                        let tx_hash: Vec<u8> = row.get(4);
+                        let address: Vec<u8> = row.get(5);
+                        let selector: Option<Vec<u8>> = row.get(6);
+                        let topics: Option<Vec<Vec<u8>>> = row.get(7);
+                        let data: Vec<u8> = row.get(8);
 
-                let topics_str = format!(
-                    "[{}]",
-                    topics
-                        .as_ref()
-                        .map(|t| t.iter()
-                            .map(|topic| format!("'0x{}'", hex::encode(topic)))
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_default()
+                        let topics_str = format!(
+                            "[{}]",
+                            topics
+                                .as_ref()
+                                .map(|t| t.iter()
+                                    .map(|topic| format!("'0x{}'", hex::encode(topic)))
+                                    .collect::<Vec<_>>()
+                                    .join(", "))
+                                .unwrap_or_default()
+                        );
+                        let selector_str = selector
+                            .as_ref()
+                            .map(|s| format!("'0x{}'", hex::encode(s)))
+                            .unwrap_or_else(|| "NULL".to_string());
+
+                        format!(
+                            "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, '0x{}')",
+                            block_num,
+                            block_timestamp.to_rfc3339(),
+                            log_idx,
+                            tx_idx,
+                            hex::encode(&tx_hash),
+                            hex::encode(&address),
+                            selector_str,
+                            topics_str,
+                            hex::encode(&data),
+                        )
+                    })
+                    .collect();
+
+                let sql = format!(
+                    "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                    values.join(", ")
                 );
-
-                duck_conn.execute(
-                    &format!(
-                        "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, {}, ?)",
-                        topics_str
-                    ),
-                    duckdb::params![
-                        block_num,
-                        block_timestamp.to_rfc3339(),
-                        log_idx,
-                        tx_idx,
-                        format!("0x{}", hex::encode(&tx_hash)),
-                        format!("0x{}", hex::encode(&address)),
-                        selector.as_ref().map(|s| format!("0x{}", hex::encode(s))),
-                        format!("0x{}", hex::encode(&data)),
-                    ],
-                )?;
+                if let Err(e) = duck_conn.execute(&sql, []) {
+                    tracing::warn!(error = %e, "Failed to insert log batch in backfill, skipping");
+                }
             }
-            duck_conn.execute("COMMIT", [])?;
         }
 
         // Backfill receipts
@@ -777,48 +787,58 @@ pub async fn fill_gaps_from_postgres(
 
             if !log_rows.is_empty() {
                 let duck_conn = duckdb.conn().await;
-                duck_conn.execute("BEGIN TRANSACTION", [])?;
-                for row in &log_rows {
-                    let block_num: i64 = row.get(0);
-                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
-                    let log_idx: i32 = row.get(2);
-                    let tx_idx: i32 = row.get(3);
-                    let tx_hash: Vec<u8> = row.get(4);
-                    let address: Vec<u8> = row.get(5);
-                    let selector: Option<Vec<u8>> = row.get(6);
-                    let topics: Option<Vec<Vec<u8>>> = row.get(7);
-                    let data: Vec<u8> = row.get(8);
+                for chunk in log_rows.chunks(100) {
+                    let values: Vec<String> = chunk
+                        .iter()
+                        .map(|row| {
+                            let block_num: i64 = row.get(0);
+                            let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                            let log_idx: i32 = row.get(2);
+                            let tx_idx: i32 = row.get(3);
+                            let tx_hash: Vec<u8> = row.get(4);
+                            let address: Vec<u8> = row.get(5);
+                            let selector: Option<Vec<u8>> = row.get(6);
+                            let topics: Option<Vec<Vec<u8>>> = row.get(7);
+                            let data: Vec<u8> = row.get(8);
 
-                    let topics_str = format!(
-                        "[{}]",
-                        topics
-                            .as_ref()
-                            .map(|t| t.iter()
-                                .map(|topic| format!("'0x{}'", hex::encode(topic)))
-                                .collect::<Vec<_>>()
-                                .join(", "))
-                            .unwrap_or_default()
+                            let topics_str = format!(
+                                "[{}]",
+                                topics
+                                    .as_ref()
+                                    .map(|t| t.iter()
+                                        .map(|topic| format!("'0x{}'", hex::encode(topic)))
+                                        .collect::<Vec<_>>()
+                                        .join(", "))
+                                    .unwrap_or_default()
+                            );
+                            let selector_str = selector
+                                .as_ref()
+                                .map(|s| format!("'0x{}'", hex::encode(s)))
+                                .unwrap_or_else(|| "NULL".to_string());
+
+                            format!(
+                                "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, '0x{}')",
+                                block_num,
+                                block_timestamp.to_rfc3339(),
+                                log_idx,
+                                tx_idx,
+                                hex::encode(&tx_hash),
+                                hex::encode(&address),
+                                selector_str,
+                                topics_str,
+                                hex::encode(&data),
+                            )
+                        })
+                        .collect();
+
+                    let sql = format!(
+                        "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                        values.join(", ")
                     );
-
-                    duck_conn.execute(
-                        &format!(
-                            "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, {}, ?)",
-                            topics_str
-                        ),
-                        duckdb::params![
-                            block_num,
-                            block_timestamp.to_rfc3339(),
-                            log_idx,
-                            tx_idx,
-                            format!("0x{}", hex::encode(&tx_hash)),
-                            format!("0x{}", hex::encode(&address)),
-                            selector.as_ref().map(|s| format!("0x{}", hex::encode(s))),
-                            format!("0x{}", hex::encode(&data)),
-                        ],
-                    )?;
+                    if let Err(e) = duck_conn.execute(&sql, []) {
+                        tracing::warn!(error = %e, "Failed to insert log batch in gap-fill, skipping");
+                    }
                 }
-                duck_conn.execute("COMMIT", [])?;
             }
 
             // Backfill receipts for this range
