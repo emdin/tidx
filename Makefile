@@ -8,7 +8,7 @@
 ifeq ($(LOCALNET),1)
 COMPOSE := docker compose -f docker/local/docker-compose.yml
 else
-COMPOSE := docker compose -f docker/prod/docker-compose.yml
+COMPOSE := docker compose -f docker/prod/docker-compose.override.yml
 endif
 
 # Default seed parameters
