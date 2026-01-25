@@ -849,7 +849,27 @@ async fn tick_gapfill_parallel(
     }
 
     // Process results and spawn new tasks as workers complete
+    let mut last_lag_check = std::time::Instant::now();
     while let Some(join_result) = join_set.join_next().await {
+        // Check lag every 5 seconds during backfill - abort early if realtime is falling behind
+        if last_lag_check.elapsed().as_secs() >= 5 {
+            last_lag_check = std::time::Instant::now();
+            if let Ok(current_head) = rpc.latest_block_number().await {
+                let current_state = load_sync_state(pool, chain_id).await.ok().flatten().unwrap_or_default();
+                let current_lag = current_head.saturating_sub(current_state.tip_num);
+                if current_lag > LAG_THRESHOLD {
+                    info!(
+                        chain_id = chain_id,
+                        lag = current_lag,
+                        completed = completed,
+                        "Gap-fill: aborting round early to let realtime catch up"
+                    );
+                    join_set.abort_all();
+                    break;
+                }
+            }
+        }
+
         let (start, end, result) = join_result?;
         match result {
             Ok(()) => {
