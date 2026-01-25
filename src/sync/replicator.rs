@@ -191,9 +191,34 @@ impl Replicator {
     ) -> Result<()> {
         tracing::info!(chain_id, "DuckDB gap-fill task started");
 
+        let mut total_synced: i64 = 0;
+        let start_time = Instant::now();
+        let mut last_progress_log = Instant::now();
+
         loop {
             match Self::gap_fill_batch(&duckdb, &pg_pool, chain_id).await {
                 Ok(synced) => {
+                    total_synced += synced;
+
+                    // Log progress every 30 seconds during active sync
+                    if synced > 0 && last_progress_log.elapsed() > Duration::from_secs(30) {
+                        let elapsed = start_time.elapsed();
+                        let rate = total_synced as f64 / elapsed.as_secs_f64();
+                        
+                        // Get current ranges for progress log
+                        if let Ok((duck_min, duck_max)) = duckdb.block_range().await {
+                            tracing::info!(
+                                chain_id,
+                                total_synced,
+                                duck_range = format!("{}-{}", duck_min.unwrap_or(0), duck_max.unwrap_or(0)),
+                                elapsed_secs = elapsed.as_secs(),
+                                rate = format!("{:.0} blk/s", rate),
+                                "DuckDB gap-fill progress"
+                            );
+                        }
+                        last_progress_log = Instant::now();
+                    }
+
                     if synced == 0 {
                         // Fully caught up, sleep longer
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -711,37 +736,66 @@ impl Replicator {
 
     /// Emit metrics for DuckDB sync status (lightweight).
     async fn emit_metrics(&self) -> Result<()> {
-        let pg_latest = {
-            let conn = self.pg_pool.get().await?;
-            let row = conn.query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[]).await?;
-            row.get::<_, i64>(0)
+        let pg_conn = self.pg_pool.get().await?;
+        let (pg_min, pg_max): (i64, i64) = {
+            let row = pg_conn
+                .query_one("SELECT COALESCE(MIN(num), 0), COALESCE(MAX(num), 0) FROM blocks", &[])
+                .await?;
+            (row.get(0), row.get(1))
+        };
+        drop(pg_conn);
+
+        let (duck_min, duck_max) = self.duckdb.block_range().await?;
+        let duck_min = duck_min.unwrap_or(0);
+        let duck_max = duck_max.unwrap_or(0);
+
+        let tip_lag = pg_max - duck_max;
+        let backfill_remaining = if duck_min > 0 && pg_min < duck_min {
+            duck_min - pg_min
+        } else {
+            0
         };
 
-        let duck_latest = self.duckdb.latest_block().await?.unwrap_or(0);
-        let lag = pg_latest - duck_latest;
+        metrics::set_duckdb_synced_block(self.chain_id, duck_max);
+        metrics::set_duckdb_lag(self.chain_id, tip_lag);
 
-        metrics::set_duckdb_synced_block(self.chain_id, duck_latest);
-        metrics::set_duckdb_lag(self.chain_id, lag);
+        // Detect internal gaps
+        let gaps = detect_gaps_duckdb(&self.duckdb).await?;
+        let internal_gap_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+        let total_gap_blocks = backfill_remaining + internal_gap_blocks;
 
-        // Only run expensive gap detection when lag is suspicious
-        if lag > 50 {
-            let gaps = detect_gaps_duckdb(&self.duckdb).await?;
-            let gap_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-            metrics::set_duckdb_gap_count(self.chain_id, gaps.len());
-            metrics::set_duckdb_gap_blocks(self.chain_id, gap_blocks);
+        metrics::set_duckdb_gap_count(self.chain_id, gaps.len());
+        metrics::set_duckdb_gap_blocks(self.chain_id, total_gap_blocks);
 
+        // Log sync status
+        if tip_lag > 10 {
+            tracing::warn!(
+                chain_id = self.chain_id,
+                duck_range = format!("{}-{}", duck_min, duck_max),
+                pg_range = format!("{}-{}", pg_min, pg_max),
+                tip_lag,
+                backfill_remaining,
+                internal_gaps = gaps.len(),
+                internal_gap_blocks,
+                "DuckDB falling behind PostgreSQL"
+            );
+        } else if total_gap_blocks > 0 {
             tracing::info!(
                 chain_id = self.chain_id,
-                duck_latest,
-                pg_latest,
-                lag,
-                gap_count = gaps.len(),
-                gap_blocks,
-                "DuckDB sync status"
+                duck_range = format!("{}-{}", duck_min, duck_max),
+                pg_range = format!("{}-{}", pg_min, pg_max),
+                tip_lag,
+                backfill_remaining,
+                internal_gaps = gaps.len(),
+                "DuckDB sync progress"
             );
         } else {
-            metrics::set_duckdb_gap_count(self.chain_id, 0);
-            metrics::set_duckdb_gap_blocks(self.chain_id, 0);
+            tracing::debug!(
+                chain_id = self.chain_id,
+                duck_max,
+                pg_max,
+                "DuckDB fully synced"
+            );
         }
 
         Ok(())
