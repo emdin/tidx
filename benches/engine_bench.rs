@@ -130,7 +130,9 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
         let rows = pg_conn
             .query(
                 "SELECT block_num, block_timestamp, log_idx, tx_idx, encode(tx_hash, 'hex'),
-                        encode(address, 'hex'), encode(selector, 'hex'), topics, encode(data, 'hex')
+                        encode(address, 'hex'), encode(selector, 'hex'), 
+                        encode(topic0, 'hex'), encode(topic1, 'hex'), encode(topic2, 'hex'), encode(topic3, 'hex'),
+                        encode(data, 'hex')
                  FROM logs ORDER BY block_num, log_idx LIMIT 100000",
                 &[],
             )
@@ -145,18 +147,22 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             let tx_hash: String = row.get(4);
             let address: String = row.get(5);
             let selector: Option<String> = row.get(6);
-            let topics: Vec<Vec<u8>> = row.get(7);
-            let data: String = row.get(8);
-
-            let topics_arr: Vec<String> = topics.iter().map(|t| format!("'0x{}'", hex::encode(t))).collect();
-            let topics_sql = format!("[{}]", topics_arr.join(", "));
+            let topic0: Option<String> = row.get(7);
+            let topic1: Option<String> = row.get(8);
+            let topic2: Option<String> = row.get(9);
+            let topic3: Option<String> = row.get(10);
+            let data: String = row.get(11);
 
             duck_conn
                 .execute(
                     &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
-                         VALUES ({block_num}, '{block_timestamp}', {log_idx}, {tx_idx}, '0x{tx_hash}', '0x{address}', {selector}, {topics_sql}, '0x{data}')",
+                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                         VALUES ({block_num}, '{block_timestamp}', {log_idx}, {tx_idx}, '0x{tx_hash}', '0x{address}', {selector}, {topic0}, {topic1}, {topic2}, {topic3}, '0x{data}')",
                         selector = selector.map_or("NULL".to_string(), |s| format!("'0x{s}'")),
+                        topic0 = topic0.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                        topic1 = topic1.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                        topic2 = topic2.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                        topic3 = topic3.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
                     ),
                     [],
                 )
@@ -458,9 +464,9 @@ fn bench_abi_decoding(c: &mut Criterion) {
     group.significance_level(0.05);
     group.sample_size(30);
 
-    // Transfer event selector: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-    let transfer_selector_pg = r"\xddf252ad";
-    let transfer_selector_duck = "0xddf252ad";
+    // Transfer event selector (full 32-byte topic0 hash)
+    let transfer_selector_pg = r"\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let transfer_selector_duck = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
     // PostgreSQL with SQL-based ABI decoding
     group.bench_function("transfer_decode_group_by/postgres", |b| {
@@ -471,8 +477,8 @@ fn bench_abi_decoding(c: &mut Criterion) {
                     &format!(
                         r#"WITH transfer AS (
                             SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                                   abi_address(topics[2]) AS "from",
-                                   abi_address(topics[3]) AS "to",
+                                   abi_address(topic1) AS "from",
+                                   abi_address(topic2) AS "to",
                                    abi_uint(substring(data FROM 1 FOR 32)) AS value
                             FROM logs
                             WHERE selector = '{transfer_selector_pg}'
@@ -497,8 +503,8 @@ fn bench_abi_decoding(c: &mut Criterion) {
                 .query(&format!(
                     r#"WITH transfer AS (
                         SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                               topic_address_native(topics[2]) AS "from",
-                               topic_address_native(topics[3]) AS "to",
+                               topic_address_native(topic1) AS "from",
+                               topic_address_native(topic2) AS "to",
                                abi_uint_native(data, 0) AS value
                         FROM logs
                         WHERE selector = '{transfer_selector_duck}'
@@ -559,8 +565,8 @@ fn bench_abi_decoding(c: &mut Criterion) {
                 .query(
                     &format!(
                         r#"SELECT 
-                               abi_address(topics[2]) AS "from",
-                               abi_address(topics[3]) AS "to",
+                               abi_address(topic1) AS "from",
+                               abi_address(topic2) AS "to",
                                abi_uint(substring(data FROM 1 FOR 32)) AS value
                            FROM logs
                            WHERE selector = '{transfer_selector_pg}'
@@ -578,8 +584,8 @@ fn bench_abi_decoding(c: &mut Criterion) {
             let _result = duck_pool
                 .query(&format!(
                     r#"SELECT 
-                           topic_address_native(topics[2]) AS "from",
-                           topic_address_native(topics[3]) AS "to",
+                           topic_address_native(topic1) AS "from",
+                           topic_address_native(topic2) AS "to",
                            abi_uint_native(data, 0) AS value
                        FROM logs
                        WHERE selector = '{transfer_selector_duck}'

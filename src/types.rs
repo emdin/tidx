@@ -49,7 +49,10 @@ pub struct LogRow {
     pub tx_hash: Vec<u8>,
     pub address: Vec<u8>,
     pub selector: Option<Vec<u8>>,
-    pub topics: Vec<Vec<u8>>,
+    pub topic0: Option<Vec<u8>>,
+    pub topic1: Option<Vec<u8>>,
+    pub topic2: Option<Vec<u8>>,
+    pub topic3: Option<Vec<u8>>,
     pub data: Vec<u8>,
 }
 

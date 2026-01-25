@@ -62,11 +62,6 @@ impl EventSignature {
         hex::encode(self.topic0)
     }
 
-    /// Returns the first 4 bytes of topic0 as hex (the event selector)
-    pub fn selector_hex(&self) -> String {
-        hex::encode(&self.topic0[..4])
-    }
-
     fn canonical_signature(name: &str, params: &[AbiParam]) -> String {
         let param_types: Vec<String> = params.iter().map(|p| p.ty.canonical()).collect();
         format!("{}({})", name, param_types.join(","))
@@ -418,12 +413,14 @@ impl AbiType {
     // PostgreSQL decode functions (bytea-based)
 
     pub fn topic_decode_sql_postgres(&self, topic_idx: usize) -> String {
+        // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
+        let col = format!("topic{}", topic_idx.saturating_sub(1));
         match self {
-            AbiType::Address => format!("abi_address(topics[{topic_idx}])"),
-            AbiType::Uint(_) | AbiType::Int(_) => format!("abi_uint(topics[{topic_idx}])"),
-            AbiType::Bool => format!("abi_bool(topics[{topic_idx}])"),
-            AbiType::Bytes(Some(_) | None) => format!("topics[{topic_idx}]"),
-            _ => format!("topics[{topic_idx}]"),
+            AbiType::Address => format!("abi_address({col})"),
+            AbiType::Uint(_) | AbiType::Int(_) => format!("abi_uint({col})"),
+            AbiType::Bool => format!("abi_bool({col})"),
+            AbiType::Bytes(Some(_) | None) => col,
+            _ => col,
         }
     }
 
@@ -449,12 +446,14 @@ impl AbiType {
     // DuckDB decode functions (use native Rust UDFs for performance)
 
     pub fn topic_decode_sql_duckdb(&self, topic_idx: usize) -> String {
+        // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
+        let col = format!("topic{}", topic_idx.saturating_sub(1));
         match self {
-            AbiType::Address => format!("topic_address_native(topics[{topic_idx}])"),
-            AbiType::Uint(_) | AbiType::Int(_) => format!("topic_uint_native(topics[{topic_idx}])"),
-            AbiType::Bool => format!("topics[{topic_idx}] != '0x0000000000000000000000000000000000000000000000000000000000000000'"),
-            AbiType::Bytes(Some(_) | None) => format!("topics[{topic_idx}]"),
-            _ => format!("topics[{topic_idx}]"),
+            AbiType::Address => format!("topic_address_native({col})"),
+            AbiType::Uint(_) | AbiType::Int(_) => format!("topic_uint_native({col})"),
+            AbiType::Bool => format!("{col} != '0x0000000000000000000000000000000000000000000000000000000000000000'"),
+            AbiType::Bytes(Some(_) | None) => col,
+            _ => col,
         }
     }
 
@@ -474,6 +473,10 @@ impl AbiType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // EventSignature Parsing Tests
+    // ========================================================================
 
     #[test]
     fn test_parse_transfer_signature() {
@@ -525,8 +528,8 @@ mod tests {
         .unwrap();
         let cte = sig.to_cte_sql();
         assert!(cte.contains("transfer AS"));
-        assert!(cte.contains("abi_address(topics[2])"));
-        assert!(cte.contains("abi_address(topics[3])"));
+        assert!(cte.contains("abi_address(topic1)"));
+        assert!(cte.contains("abi_address(topic2)"));
         assert!(cte.contains("abi_uint(substring(data FROM 1 FOR 32))"));
         assert!(cte.contains("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
     }
@@ -561,11 +564,11 @@ mod tests {
         .unwrap();
         let cte = sig.to_cte_sql_duckdb();
         assert!(cte.contains("transfer AS"));
-        assert!(cte.contains("topic_address_native(topics[2])"));
-        assert!(cte.contains("topic_address_native(topics[3])"));
+        assert!(cte.contains("topic_address_native(topic1)"));
+        assert!(cte.contains("topic_address_native(topic2)"));
         assert!(cte.contains("abi_uint_native(data, 0)"));
-        // DuckDB uses '0x...' format instead of '\x...'
-        assert!(cte.contains("selector = '0xddf252ad"));
+        // DuckDB uses '0x...' format and filters by full 32-byte selector (topic0)
+        assert!(cte.contains("selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'"));
     }
 
     #[test]
@@ -598,7 +601,7 @@ mod tests {
         let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
         
         // Should include "to" but not "from" or "value"
-        assert!(cte.contains("topic_address_native(topics[3]) AS \"to\""));
+        assert!(cte.contains("topic_address_native(topic2) AS \"to\""));
         assert!(!cte.contains("\"from\""));
         assert!(!cte.contains("\"value\""));
     }
@@ -614,7 +617,7 @@ mod tests {
         let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
         
         // Should include "from" and "value" but not "to"
-        assert!(cte.contains("topic_address_native(topics[2]) AS \"from\""));
+        assert!(cte.contains("topic_address_native(topic1) AS \"from\""));
         assert!(cte.contains("abi_uint_native(data, 0) AS \"value\""));
         assert!(!cte.contains("\"to\""));
     }
@@ -652,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_cte_filtered_preserves_offsets() {
-        // When skipping "from", "to" should still use topics[3] and "value" should still use data offset 0
+        // When skipping "from", "to" should still use topic2 and "value" should still use data offset 0
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
@@ -661,9 +664,283 @@ mod tests {
         let used_cols: HashSet<String> = ["to", "value"].iter().map(|s| s.to_string()).collect();
         let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
         
-        // "to" is the second indexed param, so it should still be topics[3]
-        assert!(cte.contains("topic_address_native(topics[3]) AS \"to\""));
+        // "to" is the second indexed param, so it should still be topic2
+        assert!(cte.contains("topic_address_native(topic2) AS \"to\""));
         // "value" is the first data param, so it should still be offset 0
         assert!(cte.contains("abi_uint_native(data, 0) AS \"value\""));
+    }
+
+    // ========================================================================
+    // Event CTE Execution Tests (DuckDB)
+    // ========================================================================
+    // These tests verify that generated CTEs work correctly with real data
+
+    mod cte_execution_tests {
+        use super::*;
+        use crate::db::{execute_duckdb_query, DuckDbPool};
+
+        fn insert_transfer_log(
+            conn: &duckdb::Connection,
+            block_num: i64,
+            log_idx: i32,
+            from_addr: &str,
+            to_addr: &str,
+            value: u128,
+        ) {
+            // selector stores full 32-byte topic0 hash
+            let selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+            let topic0 = selector;
+            let topic1 = format!("0x000000000000000000000000{}", from_addr);
+            let topic2 = format!("0x000000000000000000000000{}", to_addr);
+            let data = format!("0x{:064x}", value);
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                     VALUES ({block_num}, '2024-01-01 00:00:00+00', {log_idx}, 0, '0xabc{block_num:03x}', '0xtoken', '{selector}', 
+                             '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                ),
+                [],
+            ).unwrap();
+        }
+
+        fn insert_approval_log(
+            conn: &duckdb::Connection,
+            block_num: i64,
+            log_idx: i32,
+            owner_addr: &str,
+            spender_addr: &str,
+            value: u128,
+        ) {
+            // selector stores full 32-byte topic0 hash
+            let selector = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+            let topic0 = selector;
+            let topic1 = format!("0x000000000000000000000000{}", owner_addr);
+            let topic2 = format!("0x000000000000000000000000{}", spender_addr);
+            let data = format!("0x{:064x}", value);
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                     VALUES ({block_num}, '2024-01-01 00:00:00+00', {log_idx}, 0, '0xabc{block_num:03x}', '0xtoken', '{selector}', 
+                             '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                ),
+                [],
+            ).unwrap();
+        }
+
+        #[test]
+        fn test_transfer_cte_decodes_addresses() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            insert_transfer_log(&conn, 1, 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1_000_000_000_000_000_000);
+
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT \"from\", \"to\", \"value\" FROM transfer");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["from", "to", "value"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], serde_json::json!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            assert_eq!(rows[0][1], serde_json::json!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+            assert_eq!(rows[0][2], serde_json::json!(1_000_000_000_000_000_000_i64));
+        }
+
+        #[test]
+        fn test_transfer_cte_group_by_to() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            // Insert 10 transfers to 2 different addresses
+            for i in 0..10 {
+                let to_addr = if i % 2 == 0 { "1111111111111111111111111111111111111111" } else { "2222222222222222222222222222222222222222" };
+                insert_transfer_log(&conn, i, 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", to_addr, 1_000_000_000_000_000_000);
+            }
+
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT \"to\", COUNT(*) as cnt FROM transfer GROUP BY \"to\" ORDER BY cnt DESC");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["to", "cnt"]);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][1], serde_json::json!(5));
+            assert_eq!(rows[1][1], serde_json::json!(5));
+        }
+
+        #[test]
+        fn test_transfer_cte_sum_value() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            // Insert 5 transfers with values 1-5 Gwei (smaller to avoid i64 overflow in sum)
+            for i in 1..=5 {
+                insert_transfer_log(&conn, i, 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", i as u128 * 1_000_000_000);
+            }
+
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT SUM(\"value\") as total FROM transfer");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["total"]);
+            assert_eq!(rows.len(), 1);
+            // Sum of 1+2+3+4+5 = 15 Gwei = 15_000_000_000
+            assert_eq!(rows[0][0], serde_json::json!(15_000_000_000_i64));
+        }
+
+        #[test]
+        fn test_transfer_cte_filter_by_from() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            // Insert transfers from 2 different addresses
+            for i in 0..10 {
+                let from_addr = if i < 6 { "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } else { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+                insert_transfer_log(&conn, i, 0, from_addr, "cccccccccccccccccccccccccccccccccccccccc", 1_000_000_000);
+            }
+
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT COUNT(*) as cnt FROM transfer WHERE \"from\" = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'");
+
+            let (_, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], serde_json::json!(6));
+        }
+
+        #[test]
+        fn test_approval_cte_decodes_correctly() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            insert_approval_log(&conn, 1, 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", u128::MAX >> 1);
+
+            let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT \"owner\", \"spender\", \"value\" FROM approval");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["owner", "spender", "value"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], serde_json::json!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            assert_eq!(rows[0][1], serde_json::json!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        }
+
+        #[test]
+        fn test_filtered_cte_only_decodes_used_columns() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            insert_transfer_log(&conn, 1, 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1_000_000_000);
+
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let used_cols: HashSet<String> = ["to"].iter().map(|s| s.to_string()).collect();
+            let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
+            let sql = format!("WITH {cte} SELECT \"to\" FROM transfer");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["to"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], serde_json::json!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        }
+
+        #[test]
+        fn test_cte_with_multiple_data_params() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            // Swap event: Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)
+            // selector stores full 32-byte topic0 hash
+            let selector = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+            let topic0 = selector;
+            let topic1 = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // sender
+            let topic2 = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // to
+            // data: 4 uint256 values (amount0In, amount1In, amount0Out, amount1Out)
+            let data = format!(
+                "0x{:064x}{:064x}{:064x}{:064x}",
+                100_u128, 0_u128, 0_u128, 200_u128
+            );
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                     VALUES (1, '2024-01-01 00:00:00+00', 0, 0, '0xabc', '0xpair', '{selector}', 
+                             '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                ),
+                [],
+            ).unwrap();
+
+            let sig = EventSignature::parse("Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT \"sender\", \"amount0In\", \"amount1Out\", \"to\" FROM swap");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["sender", "amount0In", "amount1Out", "to"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], serde_json::json!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            assert_eq!(rows[0][1], serde_json::json!(100));
+            assert_eq!(rows[0][2], serde_json::json!(200));
+            assert_eq!(rows[0][3], serde_json::json!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        }
+
+        #[test]
+        fn test_cte_handles_empty_results() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            // Don't insert any logs
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT \"from\", \"to\", \"value\" FROM transfer");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["from", "to", "value"]);
+            assert_eq!(rows.len(), 0);
+        }
+
+        #[test]
+        fn test_cte_with_null_topics() {
+            let pool = DuckDbPool::in_memory().unwrap();
+            let conn = futures::executor::block_on(pool.conn());
+
+            // Insert a log with fewer topics than expected (simulating edge case)
+            // selector stores full 32-byte topic0 hash
+            let selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+            let topic0 = selector;
+            let topic1 = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let data = "0x0000000000000000000000000000000000000000000000000000000000000064"; // 100
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                     VALUES (1, '2024-01-01 00:00:00+00', 0, 0, '0xabc', '0xtoken', '{selector}', 
+                             '{topic0}', '{topic1}', NULL, NULL, '{data}')"
+                ),
+                [],
+            ).unwrap();
+
+            let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+            let cte = sig.to_cte_sql_duckdb();
+            let sql = format!("WITH {cte} SELECT \"from\", \"to\", \"value\" FROM transfer");
+
+            let (cols, rows) = execute_duckdb_query(&conn, &sql).unwrap();
+
+            assert_eq!(cols, vec!["from", "to", "value"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], serde_json::json!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            assert_eq!(rows[0][1], serde_json::Value::Null); // topic2 is NULL
+            assert_eq!(rows[0][2], serde_json::json!(100));
+        }
     }
 }

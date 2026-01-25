@@ -103,7 +103,7 @@ fn setup_duckdb(log_count: usize) -> Arc<DuckDbPool> {
 
         conn.execute(
             &format!(
-                r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
                    SELECT 
                        i as block_num,
                        make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as block_timestamp,
@@ -114,16 +114,15 @@ fn setup_duckdb(log_count: usize) -> Arc<DuckDbPool> {
                        CASE WHEN i % 5 < 4 THEN '{target_contract}'
                             ELSE '0x' || lpad(printf('%x', i % 1000), 40, '0')
                        END as address,
-                       '0xddf252ad' as selector,
-                       [
-                           '{transfer_topic0}',
-                           -- 1% from hot sender (for filtered query testing)
-                           CASE WHEN i % 100 = 0 
-                                THEN '0x000000000000000000000000' || substr('{hot_sender}', 3)
-                                ELSE '0x' || lpad(printf('%x', i % 10000), 64, '0')
-                           END,
-                           '0x' || lpad(printf('%x', (i + 1) % 10000), 64, '0')
-                       ] as topics,
+                       '{transfer_topic0}' as selector,
+                       '{transfer_topic0}' as topic0,
+                       -- 1% from hot sender (for filtered query testing)
+                       CASE WHEN i % 100 = 0 
+                            THEN '0x000000000000000000000000' || substr('{hot_sender}', 3)
+                            ELSE '0x' || lpad(printf('%x', i % 10000), 64, '0')
+                       END as topic1,
+                       '0x' || lpad(printf('%x', (i + 1) % 10000), 64, '0') as topic2,
+                       NULL as topic3,
                        '0x' || lpad(printf('%x', i % 1000000000000), 64, '0') as data
                    FROM generate_series(1, {log_count}) as t(i)"#
             ),
@@ -159,7 +158,7 @@ mod oltp {
     pub const RECENT_BLOCKS: &str = "SELECT * FROM blocks ORDER BY num DESC LIMIT 10";
 
     pub const LOGS_BY_SELECTOR_LIMIT: &str =
-        "SELECT * FROM logs WHERE selector = '0xddf252ad' LIMIT 100";
+        "SELECT * FROM logs WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' LIMIT 100";
 }
 
 /// OLAP queries - analytics requiring full/partial scans
@@ -193,11 +192,11 @@ mod olap {
             SELECT 
                 tx_hash,
                 address,
-                topic_address_native(topics[2]) AS "from",
-                topic_address_native(topics[3]) AS "to",
+                topic_address_native(topic1) AS "from",
+                topic_address_native(topic2) AS "to",
                 abi_uint_native(data, 0) AS tokens
             FROM logs
-            WHERE selector = '0xddf252ad'
+            WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
         )
         SELECT COUNT(tx_hash) FROM transfer 
         WHERE address = '0x20c0000000000000000000000000000000000001' 
@@ -208,9 +207,9 @@ mod olap {
         WITH transfer AS (
             SELECT 
                 tx_hash,
-                topic_address_native(topics[2]) AS "from"
+                topic_address_native(topic1) AS "from"
             FROM logs
-            WHERE selector = '0xddf252ad'
+            WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
             AND address = '0x20c0000000000000000000000000000000000001'
         )
         SELECT COUNT(tx_hash) FROM transfer 
@@ -218,10 +217,10 @@ mod olap {
 
     pub const TRANSFER_SUM_BY_TO: &str = r#"
         SELECT 
-            topic_address_native(topics[3]) AS "to",
+            topic_address_native(topic2) AS "to",
             SUM(abi_uint_native(data, 0)) AS total
         FROM logs
-        WHERE selector = '0xddf252ad'
+        WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
         GROUP BY 1
         ORDER BY total DESC
         LIMIT 10"#;

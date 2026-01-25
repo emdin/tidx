@@ -177,13 +177,16 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         Type::BYTEA,      // tx_hash
         Type::BYTEA,      // address
         Type::BYTEA,      // selector
-        Type::BYTEA_ARRAY, // topics
+        Type::BYTEA,      // topic0
+        Type::BYTEA,      // topic1
+        Type::BYTEA,      // topic2
+        Type::BYTEA,      // topic3
         Type::BYTEA,      // data
     ];
 
     let sink = conn
         .copy_in(
-            "COPY logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) FROM STDIN BINARY",
+            "COPY logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
         )
         .await?;
 
@@ -201,7 +204,10 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
                 &log.tx_hash,
                 &log.address,
                 &log.selector,
-                &log.topics,
+                &log.topic0,
+                &log.topic1,
+                &log.topic2,
+                &log.topic3,
                 &log.data,
             ])
             .await?;

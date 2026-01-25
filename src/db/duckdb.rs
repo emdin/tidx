@@ -176,7 +176,10 @@ fn run_schema(conn: &Connection) -> Result<()> {
             tx_hash         VARCHAR NOT NULL,
             address         VARCHAR NOT NULL,
             selector        VARCHAR,
-            topics          VARCHAR[] NOT NULL,
+            topic0          VARCHAR,
+            topic1          VARCHAR,
+            topic2          VARCHAR,
+            topic3          VARCHAR,
             data            VARCHAR NOT NULL,
             PRIMARY KEY (block_num, log_idx)
         );
@@ -218,6 +221,10 @@ fn run_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_logs_address ON logs (address);
         CREATE INDEX IF NOT EXISTS idx_logs_selector ON logs (selector);
         CREATE INDEX IF NOT EXISTS idx_logs_tx_hash ON logs (tx_hash);
+        CREATE INDEX IF NOT EXISTS idx_logs_topic0 ON logs (topic0);
+        CREATE INDEX IF NOT EXISTS idx_logs_topic1 ON logs (topic1);
+        CREATE INDEX IF NOT EXISTS idx_logs_topic2 ON logs (topic2);
+        CREATE INDEX IF NOT EXISTS idx_logs_topic3 ON logs (topic3);
 
         -- ABI decoding macros (equivalent to PostgreSQL abi_* functions)
         -- DuckDB stores hex strings, so we work with substrings directly
@@ -1351,7 +1358,7 @@ mod tests {
 
             // Insert mock Transfer event logs
             // Transfer event selector: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-            let transfer_selector = "0xddf252ad";
+            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
             
             // Insert 100 Transfer events with varying from/to addresses and values
             for i in 0..100_u64 {
@@ -1359,15 +1366,16 @@ mod tests {
                 let to_addr = format!("{:040x}", i % 5);    // 5 unique receivers
                 let value = (i + 1) * 1_000_000_000_u64; // smaller values to avoid overflow
                 
+                let topic0 = transfer_selector;
                 let topic1 = format!("0x000000000000000000000000{from_addr}");
                 let topic2 = format!("0x000000000000000000000000{to_addr}");
                 let data = format!("0x{:064x}", value);
                 
                 conn.execute(
                     &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
                          VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
-                                 ['{topic1}', '{topic2}'], '{data}')"
+                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
                     ),
                     [],
                 ).unwrap();
@@ -1377,11 +1385,11 @@ mod tests {
             let sql = r#"
                 WITH transfer AS (
                     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topics[1]) AS "from",
-                           topic_address_native(topics[2]) AS "to",
+                           topic_address_native(topic1) AS "from",
+                           topic_address_native(topic2) AS "to",
                            abi_uint_native(data, 0) AS "value"
                     FROM logs
-                    WHERE selector = '0xddf252ad'
+                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
                 )
                 SELECT "to", COUNT(*) as cnt
                 FROM transfer
@@ -1405,7 +1413,7 @@ mod tests {
             let pool = DuckDbPool::in_memory().unwrap();
             let conn = futures::executor::block_on(pool.conn());
 
-            let transfer_selector = "0xddf252ad";
+            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
             
             // Insert 10 Transfer events with known values (use smaller values to stay in i64 range)
             for i in 0..10_u64 {
@@ -1413,15 +1421,16 @@ mod tests {
                 let to_addr = format!("{:040x}", 2);
                 let value = (i + 1) * 1_000_000_000_u64; // 1-10 Gwei (smaller to avoid overflow)
                 
+                let topic0 = transfer_selector;
                 let topic1 = format!("0x000000000000000000000000{from_addr}");
                 let topic2 = format!("0x000000000000000000000000{to_addr}");
                 let data = format!("0x{:064x}", value);
                 
                 conn.execute(
                     &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
                          VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
-                                 ['{topic1}', '{topic2}'], '{data}')"
+                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
                     ),
                     [],
                 ).unwrap();
@@ -1431,11 +1440,11 @@ mod tests {
             let sql = r#"
                 WITH transfer AS (
                     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topics[1]) AS "from",
-                           topic_address_native(topics[2]) AS "to",
+                           topic_address_native(topic1) AS "from",
+                           topic_address_native(topic2) AS "to",
                            abi_uint_native(data, 0) AS "value"
                     FROM logs
-                    WHERE selector = '0xddf252ad'
+                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
                 )
                 SELECT "to", SUM("value") as total
                 FROM transfer
@@ -1457,7 +1466,7 @@ mod tests {
             let pool = DuckDbPool::in_memory().unwrap();
             let conn = futures::executor::block_on(pool.conn());
 
-            let transfer_selector = "0xddf252ad";
+            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
             
             // Insert transfers from different addresses
             for i in 0..20 {
@@ -1469,15 +1478,16 @@ mod tests {
                 let to_addr = format!("{:040x}", i);
                 let value = 1_000_000_000_000_000_000_u64; // 1 ETH
                 
+                let topic0 = transfer_selector;
                 let topic1 = format!("0x000000000000000000000000{from_addr}");
                 let topic2 = format!("0x000000000000000000000000{to_addr}");
                 let data = format!("0x{:064x}", value);
                 
                 conn.execute(
                     &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
                          VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
-                                 ['{topic1}', '{topic2}'], '{data}')"
+                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
                     ),
                     [],
                 ).unwrap();
@@ -1487,11 +1497,11 @@ mod tests {
             let sql = r#"
                 WITH transfer AS (
                     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topics[1]) AS "from",
-                           topic_address_native(topics[2]) AS "to",
+                           topic_address_native(topic1) AS "from",
+                           topic_address_native(topic2) AS "to",
                            abi_uint_native(data, 0) AS "value"
                     FROM logs
-                    WHERE selector = '0xddf252ad'
+                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
                 )
                 SELECT COUNT(*) as cnt
                 FROM transfer
@@ -1509,7 +1519,7 @@ mod tests {
             let pool = DuckDbPool::in_memory().unwrap();
             let conn = futures::executor::block_on(pool.conn());
 
-            let transfer_selector = "0xddf252ad";
+            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
             
             // Insert 1000 Transfer events (stress test)
             let start = std::time::Instant::now();
@@ -1518,15 +1528,16 @@ mod tests {
                 let to_addr = format!("{:040x}", i % 50);
                 let value = (i + 1) as u64 * 1_000_000_000_u64;
                 
+                let topic0 = transfer_selector;
                 let topic1 = format!("0x000000000000000000000000{from_addr}");
                 let topic2 = format!("0x000000000000000000000000{to_addr}");
                 let data = format!("0x{:064x}", value);
                 
                 conn.execute(
                     &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
                          VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0x{i:064x}', '0xtoken', '{transfer_selector}', 
-                                 ['{topic1}', '{topic2}'], '{data}')"
+                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
                     ),
                     [],
                 ).unwrap();
@@ -1538,11 +1549,11 @@ mod tests {
             let sql = r#"
                 WITH transfer AS (
                     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topics[1]) AS "from",
-                           topic_address_native(topics[2]) AS "to",
+                           topic_address_native(topic1) AS "from",
+                           topic_address_native(topic2) AS "to",
                            abi_uint_native(data, 0) AS "value"
                     FROM logs
-                    WHERE selector = '0xddf252ad'
+                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
                 )
                 SELECT "to", COUNT(*) as cnt, SUM("value") as total
                 FROM transfer

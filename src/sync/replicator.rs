@@ -271,7 +271,7 @@ impl Replicator {
 
         let log_rows = pg_conn
             .query(
-                "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data
+                "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
                  FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
                 &[&start, &end],
             )
@@ -393,13 +393,14 @@ impl Replicator {
                     let tx_hash: Vec<u8> = row.get(4);
                     let address: Vec<u8> = row.get(5);
                     let selector: Option<Vec<u8>> = row.get(6);
-                    let topics: Vec<Vec<u8>> = row.get(7);
-                    let data: Vec<u8> = row.get(8);
-
-                    let topics_arr: Vec<String> = topics.iter().map(|t| format!("'0x{}'", hex::encode(t))).collect();
+                    let topic0: Option<Vec<u8>> = row.get(7);
+                    let topic1: Option<Vec<u8>> = row.get(8);
+                    let topic2: Option<Vec<u8>> = row.get(9);
+                    let topic3: Option<Vec<u8>> = row.get(10);
+                    let data: Vec<u8> = row.get(11);
 
                     format!(
-                        "({}, '{}', {}, {}, '0x{}', '0x{}', {}, [{}], '0x{}')",
+                        "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, '0x{}')",
                         block_num,
                         block_timestamp.to_rfc3339(),
                         log_idx,
@@ -407,13 +408,16 @@ impl Replicator {
                         hex::encode(&tx_hash),
                         hex::encode(&address),
                         selector.as_ref().map(|s| format!("'0x{}'", hex::encode(s))).unwrap_or_else(|| "NULL".to_string()),
-                        topics_arr.join(", "),
+                        topic0.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                        topic1.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                        topic2.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                        topic3.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
                         hex::encode(&data),
                     )
                 }).collect();
 
                 let sql = format!(
-                    "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                    "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES {}",
                     values.join(", ")
                 );
                 if let Err(e) = duck_conn.execute(&sql, []) {
@@ -716,7 +720,7 @@ pub async fn backfill_from_postgres(
         // Backfill logs
         let log_rows = pg_conn
             .query(
-                "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data
+                "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
                  FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
                 &[&current, &end],
             )
@@ -735,41 +739,32 @@ pub async fn backfill_from_postgres(
                         let tx_hash: Vec<u8> = row.get(4);
                         let address: Vec<u8> = row.get(5);
                         let selector: Option<Vec<u8>> = row.get(6);
-                        let topics: Option<Vec<Vec<u8>>> = row.get(7);
-                        let data: Vec<u8> = row.get(8);
-
-                        let topics_str = format!(
-                            "[{}]",
-                            topics
-                                .as_ref()
-                                .map(|t| t.iter()
-                                    .map(|topic| format!("'0x{}'", hex::encode(topic)))
-                                    .collect::<Vec<_>>()
-                                    .join(", "))
-                                .unwrap_or_default()
-                        );
-                        let selector_str = selector
-                            .as_ref()
-                            .map(|s| format!("'0x{}'", hex::encode(s)))
-                            .unwrap_or_else(|| "NULL".to_string());
+                        let topic0: Option<Vec<u8>> = row.get(7);
+                        let topic1: Option<Vec<u8>> = row.get(8);
+                        let topic2: Option<Vec<u8>> = row.get(9);
+                        let topic3: Option<Vec<u8>> = row.get(10);
+                        let data: Vec<u8> = row.get(11);
 
                         format!(
-                            "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, '0x{}')",
+                            "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, '0x{}')",
                             block_num,
                             block_timestamp.to_rfc3339(),
                             log_idx,
                             tx_idx,
                             hex::encode(&tx_hash),
                             hex::encode(&address),
-                            selector_str,
-                            topics_str,
+                            selector.as_ref().map(|s| format!("'0x{}'", hex::encode(s))).unwrap_or_else(|| "NULL".to_string()),
+                            topic0.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                            topic1.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                            topic2.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                            topic3.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
                             hex::encode(&data),
                         )
                     })
                     .collect();
 
                 let sql = format!(
-                    "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                    "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES {}",
                     values.join(", ")
                 );
                 if let Err(e) = duck_conn.execute(&sql, []) {
@@ -1017,17 +1012,17 @@ pub async fn fill_gaps_from_postgres(
                                 let tx_type: i16 = row.get(4);
                                 let from: Vec<u8> = row.get(5);
                                 let to: Option<Vec<u8>> = row.get(6);
-                                let value: String = row.get(7);
+                                let value: rust_decimal::Decimal = row.get(7);
                                 let input: Vec<u8> = row.get(8);
                                 let gas_limit: i64 = row.get(9);
-                                let max_fee_per_gas: String = row.get(10);
-                                let max_priority_fee_per_gas: String = row.get(11);
+                                let max_fee: rust_decimal::Decimal = row.get(10);
+                                let max_priority: rust_decimal::Decimal = row.get(11);
                                 let gas_used: Option<i64> = row.get(12);
                                 let nonce_key: Vec<u8> = row.get(13);
                                 let nonce: i64 = row.get(14);
                                 let fee_token: Option<Vec<u8>> = row.get(15);
                                 let fee_payer: Option<Vec<u8>> = row.get(16);
-                                let calls: Option<serde_json::Value> = row.get(17);
+                                let calls: Option<String> = row.get(17);
                                 let call_count: i16 = row.get(18);
                                 let valid_before: Option<i64> = row.get(19);
                                 let valid_after: Option<i64> = row.get(20);
@@ -1045,14 +1040,14 @@ pub async fn fill_gaps_from_postgres(
                                     value,
                                     hex::encode(&input),
                                     gas_limit,
-                                    max_fee_per_gas,
-                                    max_priority_fee_per_gas,
+                                    max_fee,
+                                    max_priority,
                                     gas_used.map(|g| g.to_string()).unwrap_or_else(|| "NULL".to_string()),
                                     hex::encode(&nonce_key),
                                     nonce,
                                     fee_token.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
                                     fee_payer.as_ref().map(|p| format!("'0x{}'", hex::encode(p))).unwrap_or_else(|| "NULL".to_string()),
-                                    calls.as_ref().map(|c| format!("'{}'", c.to_string().replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
+                                    calls.as_ref().map(|c| format!("'{}'", c.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
                                     call_count,
                                     valid_before.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
                                     valid_after.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
@@ -1080,7 +1075,7 @@ pub async fn fill_gaps_from_postgres(
             // Backfill logs for this range
             let log_rows = pg_conn
                 .query(
-                    "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data
+                    "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
                      FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
                     &[&current, &end],
                 )
@@ -1099,34 +1094,25 @@ pub async fn fill_gaps_from_postgres(
                                 let tx_hash: Vec<u8> = row.get(4);
                                 let address: Vec<u8> = row.get(5);
                                 let selector: Option<Vec<u8>> = row.get(6);
-                                let topics: Option<Vec<Vec<u8>>> = row.get(7);
-                                let data: Vec<u8> = row.get(8);
-
-                                let topics_str = format!(
-                                    "[{}]",
-                                    topics
-                                        .as_ref()
-                                        .map(|t| t.iter()
-                                            .map(|topic| format!("'0x{}'", hex::encode(topic)))
-                                            .collect::<Vec<_>>()
-                                            .join(", "))
-                                        .unwrap_or_default()
-                                );
-                                let selector_str = selector
-                                    .as_ref()
-                                    .map(|s| format!("'0x{}'", hex::encode(s)))
-                                    .unwrap_or_else(|| "NULL".to_string());
+                                let topic0: Option<Vec<u8>> = row.get(7);
+                                let topic1: Option<Vec<u8>> = row.get(8);
+                                let topic2: Option<Vec<u8>> = row.get(9);
+                                let topic3: Option<Vec<u8>> = row.get(10);
+                                let data: Vec<u8> = row.get(11);
 
                                 format!(
-                                    "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, '0x{}')",
+                                    "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, '0x{}')",
                                     block_num,
                                     block_timestamp.to_rfc3339(),
                                     log_idx,
                                     tx_idx,
                                     hex::encode(&tx_hash),
                                     hex::encode(&address),
-                                    selector_str,
-                                    topics_str,
+                                    selector.as_ref().map(|s| format!("'0x{}'", hex::encode(s))).unwrap_or_else(|| "NULL".to_string()),
+                                    topic0.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                                    topic1.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                                    topic2.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                                    topic3.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
                                     hex::encode(&data),
                                 )
                             })
@@ -1138,7 +1124,7 @@ pub async fn fill_gaps_from_postgres(
                 let duck_conn = duckdb.conn().await;
                 for values in log_values {
                     let sql = format!(
-                        "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                        "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES {}",
                         values.join(", ")
                     );
                     if let Err(e) = duck_conn.execute(&sql, []) {
@@ -1172,7 +1158,7 @@ pub async fn fill_gaps_from_postgres(
                                 let contract_address: Option<Vec<u8>> = row.get(6);
                                 let gas_used: i64 = row.get(7);
                                 let cumulative_gas_used: i64 = row.get(8);
-                                let effective_gas_price: Option<String> = row.get(9);
+                                let effective_gas_price: Option<rust_decimal::Decimal> = row.get(9);
                                 let status: Option<i16> = row.get(10);
                                 let fee_payer: Option<Vec<u8>> = row.get(11);
 
@@ -1223,7 +1209,6 @@ pub async fn fill_gaps_from_postgres(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use std::time::Duration;
 
     fn create_test_pg_pool() -> Pool {
         use deadpool_postgres::{Config, Runtime};

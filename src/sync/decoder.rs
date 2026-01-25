@@ -83,8 +83,8 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
 }
 
 pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
-    let selector = log.topics().first().map(|s| s.as_slice().to_vec());
-    let topics: Vec<Vec<u8>> = log.topics().iter().map(|t| t.as_slice().to_vec()).collect();
+    let topics = log.topics();
+    let selector = topics.first().map(|s| s.as_slice().to_vec());
 
     LogRow {
         block_num: log.block_number.unwrap_or(0) as i64,
@@ -97,7 +97,10 @@ pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
             .unwrap_or_default(),
         address: log.address().as_slice().to_vec(),
         selector,
-        topics,
+        topic0: topics.first().map(|t| t.as_slice().to_vec()),
+        topic1: topics.get(1).map(|t| t.as_slice().to_vec()),
+        topic2: topics.get(2).map(|t| t.as_slice().to_vec()),
+        topic3: topics.get(3).map(|t| t.as_slice().to_vec()),
         data: log.data().data.to_vec(),
     }
 }
