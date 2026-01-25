@@ -81,11 +81,54 @@ impl DuckDbPool {
     }
 
     /// Gets the latest synced block number from DuckDB.
+    /// Uses a read-only connection to avoid blocking on writes.
     pub async fn latest_block(&self) -> Result<Option<i64>> {
-        let conn = self.conn().await;
-        let mut stmt = conn.prepare("SELECT MAX(num) FROM blocks")?;
-        let result: Option<i64> = stmt.query_row([], |row| row.get(0)).ok();
-        Ok(result)
+        self.query_scalar("SELECT MAX(num) FROM blocks").await
+    }
+
+    /// Gets the earliest synced block number from DuckDB.
+    /// Uses a read-only connection to avoid blocking on writes.
+    pub async fn earliest_block(&self) -> Result<Option<i64>> {
+        self.query_scalar("SELECT MIN(num) FROM blocks").await
+    }
+
+    /// Gets both min and max block numbers from DuckDB.
+    /// Uses a read-only connection to avoid blocking on writes.
+    pub async fn block_range(&self) -> Result<(Option<i64>, Option<i64>)> {
+        if self.is_in_memory() {
+            let conn = self.conn().await;
+            let min: Option<i64> = conn.prepare("SELECT MIN(num) FROM blocks")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+            let max: Option<i64> = conn.prepare("SELECT MAX(num) FROM blocks")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+            Ok((min, max))
+        } else {
+            let conn = self.open_read_conn()?;
+            let min: Option<i64> = conn.prepare("SELECT MIN(num) FROM blocks")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+            let max: Option<i64> = conn.prepare("SELECT MAX(num) FROM blocks")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+            Ok((min, max))
+        }
+    }
+
+    /// Helper to query a single scalar value.
+    async fn query_scalar(&self, sql: &str) -> Result<Option<i64>> {
+        if self.is_in_memory() {
+            let conn = self.conn().await;
+            let mut stmt = conn.prepare(sql)?;
+            let result: Option<i64> = stmt.query_row([], |row| row.get(0)).ok();
+            Ok(result)
+        } else {
+            let conn = self.open_read_conn()?;
+            let mut stmt = conn.prepare(sql)?;
+            let result: Option<i64> = stmt.query_row([], |row| row.get(0)).ok();
+            Ok(result)
+        }
     }
 
     /// Executes a query and returns results as JSON.

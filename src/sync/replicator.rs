@@ -231,17 +231,9 @@ impl Replicator {
             return Ok(0);
         }
 
-        // Get DuckDB range
+        // Get DuckDB range (uses read connection to avoid blocking tail task)
         let (duck_min, duck_max) = {
-            let conn = duckdb.conn().await;
-            let min: Option<i64> = conn
-                .prepare("SELECT MIN(num) FROM blocks")
-                .ok()
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
-            let max: Option<i64> = conn
-                .prepare("SELECT MAX(num) FROM blocks")
-                .ok()
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+            let (min, max) = duckdb.block_range().await?;
             (min.unwrap_or(0), max.unwrap_or(0))
         };
 
@@ -429,13 +421,21 @@ impl Replicator {
             // Tail sync: copy forward from duck_tip to pg_tip
             let lag = pg_tip - duck_tip;
 
+            tracing::debug!(
+                chain_id = self.chain_id,
+                duck_tip,
+                pg_tip,
+                lag,
+                "DuckDB tail check"
+            );
+
             if lag <= 0 {
                 return Ok(());
             }
 
             let sync_end = duck_tip + lag.min(MAX_BLOCKS_PER_TICK);
 
-            tracing::debug!(
+            tracing::info!(
                 chain_id = self.chain_id,
                 duck_tip,
                 pg_tip,
