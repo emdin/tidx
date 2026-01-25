@@ -1,9 +1,10 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tidx::config::Config;
-use tidx::db;
+use tidx::db::{self, DuckDbPool};
 use tidx::sync::fetcher::RpcClient;
 use tidx::sync::writer::{detect_all_gaps, load_sync_state};
 
@@ -190,6 +191,20 @@ async fn print_status(config: &Config) -> Result<()> {
                 }
             };
             
+            // Get PG min for DuckDB backfill calculation
+            let pg_min: i64 = {
+                let conn = pool.get().await.ok();
+                if let Some(conn) = conn {
+                    conn.query_one("SELECT COALESCE(MIN(num), 0) FROM blocks", &[])
+                        .await
+                        .ok()
+                        .map(|row| row.get::<_, i64>(0))
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+            
             println!("│  Backfill");
             if gaps.is_empty() {
                 println!("│  └─ Status:   ✓ Complete (1 → {})", format_number(state.tip_num));
@@ -232,6 +247,35 @@ async fn print_status(config: &Config) -> Result<()> {
                 println!("│  └─ ETA:      {eta_str}");
             }
 
+            // DuckDB status
+            if let Some(ref duckdb_path) = chain.duckdb_path {
+                println!("│");
+                println!("│  DuckDB (OLAP)");
+                match DuckDbPool::new(duckdb_path) {
+                    Ok(duckdb) => {
+                        let duckdb = Arc::new(duckdb);
+                        if let Ok((duck_min, duck_max)) = duckdb.block_range().await {
+                            let duck_min = duck_min.unwrap_or(0);
+                            let duck_max = duck_max.unwrap_or(0);
+                            let tip_lag = (state.tip_num as i64) - duck_max;
+                            let backfill_remaining = (duck_min - pg_min).max(0);
+                            
+                            println!("│  ├─ Range:    {} → {}", format_number(duck_min as u64), format_number(duck_max as u64));
+                            println!("│  ├─ Tip lag:  {} blocks", tip_lag);
+                            if backfill_remaining > 0 {
+                                println!("│  └─ Backfill: {} blocks remaining", format_number(backfill_remaining as u64));
+                            } else {
+                                println!("│  └─ Backfill: ✓ Complete");
+                            }
+                        } else {
+                            println!("│  └─ Status:   Empty");
+                        }
+                    }
+                    Err(e) => {
+                        println!("│  └─ Error:    {}", e);
+                    }
+                }
+            }
 
         } else {
             println!("│  Status: Not syncing");
