@@ -154,9 +154,8 @@ impl Replicator {
                 }
                 // Polling loop to tail Postgres
                 _ = tail_interval.tick() => {
-                    if self.needs_sync.swap(false, Ordering::Relaxed) {
-                        continue;
-                    }
+                    // Clear the flag (we're about to sync anyway)
+                    self.needs_sync.store(false, Ordering::Relaxed);
                     if let Err(e) = self.tail_postgres().await {
                         tracing::error!(chain_id = self.chain_id, error = %e, "DuckDB tail sync failed");
                         metrics::increment_duckdb_errors("tail_sync");
