@@ -12,7 +12,7 @@ use tracing::{error, info};
 use tidx::api::{self, SharedDuckDbPools, SharedPools};
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
-use tidx::db::{self, DuckDbPool, Pool};
+use tidx::db::{self, DuckDbPool, ThrottledPool};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::{Replicator, ReplicatorHandle};
 
@@ -63,7 +63,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
-        let (pool, replicator_handle) = initialize_chain(
+        let (throttled_pool, replicator_handle) = initialize_chain(
             chain,
             Arc::clone(&duckdb_pools),
         ).await?;
@@ -72,11 +72,12 @@ pub async fn run(args: Args) -> Result<()> {
             default_chain_id = chain.chain_id;
         }
 
-        pools.write().await.insert(chain.chain_id, pool.clone());
+        // API uses the shared pool (backfill is throttled, so API isn't starved)
+        pools.write().await.insert(chain.chain_id, throttled_pool.pool.clone());
 
         spawn_sync_engine(
             chain.clone(),
-            pool,
+            throttled_pool,
             replicator_handle,
             broadcaster.clone(),
             shutdown_tx.subscribe(),
@@ -126,12 +127,12 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
                 match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher)).await {
-                    Ok((pool, replicator_handle)) => {
-                        pools_for_watcher.write().await.insert(event.chain.chain_id, pool.clone());
+                    Ok((throttled_pool, replicator_handle)) => {
+                        pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
                         spawn_sync_engine(
                             event.chain,
-                            pool,
+                            throttled_pool,
                             replicator_handle,
                             broadcaster_for_watcher.clone(),
                             shutdown_tx_for_watcher.subscribe(),
@@ -180,18 +181,19 @@ pub async fn run(args: Args) -> Result<()> {
 async fn initialize_chain(
     chain: &ChainConfig,
     duckdb_pools: SharedDuckDbPools,
-) -> Result<(Pool, Option<ReplicatorHandle>)> {
-    info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database...");
-    let pool = db::create_pool(&chain.pg_url).await?;
+) -> Result<(ThrottledPool, Option<ReplicatorHandle>)> {
+    info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
+    let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
 
     info!(chain = %chain.name, "Running migrations...");
-    db::run_migrations(&pool).await?;
+    db::run_migrations(&throttled_pool.pool).await?;
 
     let replicator_handle = if let Some(ref duckdb_path) = chain.duckdb_path {
         info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB");
         let duckdb_pool = Arc::new(DuckDbPool::new(duckdb_path)?);
 
-        let (replicator, handle) = Replicator::new(duckdb_pool.clone(), pool.clone(), 10_000, chain.chain_id);
+        // Replicator uses the shared pool (its gap-fill is lower priority)
+        let (replicator, handle) = Replicator::new(duckdb_pool.clone(), throttled_pool.pool.clone(), 10_000, chain.chain_id);
         tokio::spawn(replicator.run());
 
         duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool);
@@ -200,12 +202,12 @@ async fn initialize_chain(
         None
     };
 
-    Ok((pool, replicator_handle))
+    Ok((throttled_pool, replicator_handle))
 }
 
 fn spawn_sync_engine(
     chain: ChainConfig,
-    pool: Pool,
+    throttled_pool: ThrottledPool,
     replicator_handle: Option<ReplicatorHandle>,
     broadcaster: Arc<Broadcaster>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -215,14 +217,15 @@ fn spawn_sync_engine(
         chain_id = chain.chain_id,
         rpc = %chain.rpc_url,
         duckdb = replicator_handle.is_some(),
-        "Starting sync for chain"
+        backfill_limit = throttled_pool.backfill_semaphore.available_permits(),
+        "Starting sync for chain (throttled pool: 16 connections, backfill limited)"
     );
 
     let backfill_first = chain.backfill_first;
 
     tokio::spawn(async move {
-        // Create sync engine with broadcaster and config
-        let mut engine = match SyncEngine::new(pool, &chain.rpc_url).await {
+        // Create sync engine with throttled pool
+        let mut engine = match SyncEngine::new(throttled_pool, &chain.rpc_url).await {
             Ok(e) => e
                 .with_broadcaster(broadcaster)
                 .with_batch_size(chain.batch_size)

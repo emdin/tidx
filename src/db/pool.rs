@@ -3,12 +3,13 @@ use deadpool_postgres::{Config, Pool, Runtime};
 use tokio_postgres::NoTls;
 use url::Url;
 
+/// Default pool for general use (16 connections)
 pub async fn create_pool(database_url: &str) -> Result<Pool> {
     create_pool_with_size(database_url, 16).await
 }
 
+/// Creates a pool with custom max connections
 pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Result<Pool> {
-    // Try to create the database if it doesn't exist
     ensure_database_exists(database_url).await?;
 
     let mut config = Config::new();
@@ -19,10 +20,85 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
     });
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls)?;
-
     let _ = pool.get().await?;
 
     Ok(pool)
+}
+
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// Shared pool with backfill throttling.
+/// 
+/// Single pool shared by all (realtime, backfill, API), but backfill
+/// must acquire a semaphore permit before getting a connection.
+/// This ensures backfill can't starve realtime/API, and when backfill
+/// completes, all connections are available for other workloads.
+#[derive(Clone)]
+pub struct ThrottledPool {
+    /// Shared connection pool (16 connections)
+    pub pool: Pool,
+    /// Semaphore limiting concurrent backfill operations (default: 6)
+    /// Leaves headroom for realtime (2) and API (8)
+    pub backfill_semaphore: Arc<Semaphore>,
+}
+
+impl ThrottledPool {
+    pub async fn new(database_url: &str) -> Result<Self> {
+        Self::with_limits(database_url, 16, 6).await
+    }
+
+    /// Create with custom pool size and backfill limit.
+    /// - pool_size: total connections in the pool
+    /// - backfill_limit: max concurrent backfill operations
+    pub async fn with_limits(database_url: &str, pool_size: usize, backfill_limit: usize) -> Result<Self> {
+        ensure_database_exists(database_url).await?;
+        let pool = create_pool_with_size(database_url, pool_size).await?;
+        
+        Ok(Self {
+            pool,
+            backfill_semaphore: Arc::new(Semaphore::new(backfill_limit)),
+        })
+    }
+
+    /// Get a connection for realtime or API (no throttling).
+    pub async fn get(&self) -> Result<deadpool_postgres::Object> {
+        Ok(self.pool.get().await?)
+    }
+
+    /// Get a connection for backfill (throttled by semaphore).
+    /// Blocks if backfill_limit concurrent operations are already running.
+    pub async fn get_backfill(&self) -> Result<BackfillConnection> {
+        let permit = self.backfill_semaphore.clone().acquire_owned().await
+            .map_err(|_| anyhow::anyhow!("Backfill semaphore closed"))?;
+        let conn = self.pool.get().await?;
+        Ok(BackfillConnection { conn, _permit: permit })
+    }
+
+    /// Returns the underlying pool (for compatibility).
+    pub fn inner(&self) -> &Pool {
+        &self.pool
+    }
+}
+
+/// Connection wrapper that holds a semaphore permit.
+/// Permit is released when this is dropped.
+pub struct BackfillConnection {
+    conn: deadpool_postgres::Object,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for BackfillConnection {
+    type Target = deadpool_postgres::Object;
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for BackfillConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
 }
 
 /// Ensure the database exists, creating it if necessary.

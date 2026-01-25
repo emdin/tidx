@@ -2,17 +2,24 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 
 use crate::metrics;
 use crate::tempo::{Block, Log, Receipt};
+
+/// Default max concurrent RPC requests (prevents overwhelming RPC endpoints)
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
 #[derive(Clone)]
 pub struct RpcClient {
     client: reqwest::Client,
     url: String,
     /// Adaptive chunk size for eth_getLogs (learned from RPC errors)
-    log_chunk_size: std::sync::Arc<AtomicU64>,
+    log_chunk_size: Arc<AtomicU64>,
+    /// Semaphore to limit concurrent RPC requests
+    concurrency_limiter: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -38,6 +45,11 @@ struct RpcError {
 
 impl RpcClient {
     pub fn new(url: &str) -> Self {
+        Self::with_concurrency(url, DEFAULT_MAX_CONCURRENT_REQUESTS)
+    }
+
+    /// Creates an RPC client with a custom concurrency limit.
+    pub fn with_concurrency(url: &str, max_concurrent: usize) -> Self {
         let client = reqwest::Client::builder()
             .gzip(true)
             .timeout(std::time::Duration::from_secs(30))
@@ -49,8 +61,14 @@ impl RpcClient {
         Self {
             client,
             url: url.to_string(),
-            log_chunk_size: std::sync::Arc::new(AtomicU64::new(1000)),
+            log_chunk_size: Arc::new(AtomicU64::new(1000)),
+            concurrency_limiter: Arc::new(Semaphore::new(max_concurrent)),
         }
+    }
+
+    /// Returns the number of available permits (for monitoring)
+    pub fn available_permits(&self) -> usize {
+        self.concurrency_limiter.available_permits()
     }
 
     pub async fn chain_id(&self) -> Result<u64> {
@@ -83,6 +101,10 @@ impl RpcClient {
     }
 
     pub async fn get_blocks_batch(&self, range: RangeInclusive<u64>) -> Result<Vec<Block>> {
+        // Acquire permit (batch counts as one request for concurrency limiting)
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| anyhow!("RPC semaphore closed"))?;
+
         let batch: Vec<_> = range
             .clone()
             .enumerate()
@@ -157,6 +179,10 @@ impl RpcClient {
 
     /// Fetch receipts for multiple blocks in a batch
     pub async fn get_receipts_batch(&self, range: RangeInclusive<u64>) -> Result<Vec<Vec<Receipt>>> {
+        // Acquire permit (batch counts as one request for concurrency limiting)
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| anyhow!("RPC semaphore closed"))?;
+
         let batch: Vec<_> = range
             .clone()
             .enumerate()
@@ -308,6 +334,10 @@ impl RpcClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcResponse<T>> {
+        // Acquire permit before making request (limits concurrent RPC calls)
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| anyhow!("RPC semaphore closed"))?;
+
         let req = RpcRequest {
             jsonrpc: "2.0",
             id: 1,

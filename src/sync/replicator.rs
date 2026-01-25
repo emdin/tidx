@@ -178,15 +178,41 @@ impl Replicator {
     }
 
     /// Detect and fill any gaps in DuckDB from PostgreSQL.
+    /// Skips gap-fill when PostgreSQL is lagging behind RPC to avoid competing for resources.
     async fn run_gap_fill(&self) -> Result<()> {
-        let pg_latest = {
-            let conn = self.pg_pool.get().await?;
-            let row = conn.query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[]).await?;
-            row.get::<_, i64>(0)
-        };
+        let pg_conn = self.pg_pool.get().await?;
+        
+        let pg_latest: i64 = pg_conn
+            .query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[])
+            .await?
+            .get(0);
 
         if pg_latest == 0 {
             return Ok(());
+        }
+
+        // Check if PG sync itself is lagging (realtime needs priority)
+        // We check the sync_state to see if tip_num is far behind head_num
+        let sync_row = pg_conn
+            .query_opt("SELECT tip_num, head_num FROM sync_state LIMIT 1", &[])
+            .await?;
+        drop(pg_conn);
+
+        if let Some(row) = sync_row {
+            let tip_num: i64 = row.get(0);
+            let head_num: i64 = row.get(1);
+            let pg_lag = head_num - tip_num;
+            
+            const PG_LAG_THRESHOLD: i64 = 20;
+            if pg_lag > PG_LAG_THRESHOLD {
+                tracing::debug!(
+                    chain_id = self.chain_id,
+                    pg_lag,
+                    threshold = PG_LAG_THRESHOLD,
+                    "DuckDB gap-fill: skipping to let PostgreSQL sync catch up"
+                );
+                return Ok(());
+            }
         }
 
         let gaps = detect_all_gaps_duckdb(&self.duckdb, pg_latest).await?;
