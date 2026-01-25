@@ -1056,7 +1056,7 @@ mod tests {
     async fn test_replicator_blocks() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100, 1);
 
         let replicator_task = tokio::spawn(replicator.run());
 
@@ -1088,7 +1088,7 @@ mod tests {
     async fn test_replicator_txs() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100, 1);
         let replicator_task = tokio::spawn(replicator.run());
 
         let tx = TxRow {
@@ -1134,7 +1134,7 @@ mod tests {
     async fn test_replicator_logs() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100, 1);
         let replicator_task = tokio::spawn(replicator.run());
 
         let log = LogRow {
@@ -1167,7 +1167,7 @@ mod tests {
     async fn test_replicator_logs_batched() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100, 1);
         let replicator_task = tokio::spawn(replicator.run());
 
         // Send 250 logs to test batching (should be 3 batches of 100, 100, 50)
@@ -1201,7 +1201,7 @@ mod tests {
     async fn test_replicator_receipts() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100, 1);
         let replicator_task = tokio::spawn(replicator.run());
 
         let receipt = ReceiptRow {
@@ -1240,7 +1240,7 @@ mod tests {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
         // Create a tiny buffer of 2
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2, 1);
 
         // Don't start the replicator - channel will fill up
         let _replicator = replicator;
