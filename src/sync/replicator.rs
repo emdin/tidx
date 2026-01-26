@@ -302,9 +302,10 @@ impl Replicator {
         // Sort by start descending (most recent first)
         gaps.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Take up to 100k blocks per gap-fill tick, in 5k block batches
-        const MAX_BLOCKS: i64 = 100_000;
-        const BATCH_SIZE: i64 = 5000;
+        // Take up to 50k blocks per gap-fill tick, in 2k block batches
+        // (2k is safer for memory when blocks have many txs/logs)
+        const MAX_BLOCKS: i64 = 50_000;
+        const BATCH_SIZE: i64 = 2000;
         let mut remaining = MAX_BLOCKS;
         let mut synced = 0i64;
 
