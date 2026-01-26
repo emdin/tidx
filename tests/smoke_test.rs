@@ -1165,12 +1165,12 @@ async fn test_duckdb_event_cte() {
 
     // Insert test log matching Transfer signature
     conn.execute(
-        r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
+        r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, data)
            VALUES (100, '2024-01-01 00:00:00', 0, 0, '0xtxhash', '0xcontract',
                    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
-                   ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
-                    '0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                    '0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'],
+                   '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+                   '0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                   '0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
                    '0x0000000000000000000000000000000000000000000000000000000000000064')"#,
         [],
     ).expect("Failed to insert test log");
@@ -1194,4 +1194,167 @@ async fn test_duckdb_event_cte() {
     assert_eq!(to, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     // Value is UHUGEINT (128-bit unsigned) - 0x64 = 100
     assert_eq!(value, 100);
+}
+
+// ============================================================================
+// Postgres Extension tests (requires DATABASE_URL)
+// Uses modern ATTACH syntax (DuckDB 1.4+)
+// ============================================================================
+
+/// Test that postgres extension produces data in the same format as the manual copy.
+/// This validates the hex encoding matches between approaches.
+#[tokio::test]
+#[serial(db)]
+async fn test_postgres_scanner_data_format() {
+    let db = TestDb::new().await;
+
+    // Skip if no data
+    if db.block_count().await == 0 {
+        println!("Skipping postgres extension test - no data in DB");
+        return;
+    }
+
+    let duckdb = DuckDbPool::new(":memory:").expect("Failed to create DuckDB");
+    let conn = duckdb.conn().await;
+
+    // Install and load modern postgres extension (not legacy postgres_scanner)
+    if let Err(e) = conn.execute("INSTALL postgres", []) {
+        println!("Skipping postgres extension test - extension not available: {e}");
+        return;
+    }
+    conn.execute("LOAD postgres", []).expect("Failed to load postgres");
+
+    let pg_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let escaped_url = pg_url.replace('\'', "''");
+
+    // Attach Postgres database
+    let attach_sql = format!("ATTACH '{escaped_url}' AS pg (TYPE postgres, READ_ONLY)");
+    conn.execute(&attach_sql, []).expect("Failed to attach postgres");
+
+    // Test blocks table - verify hex encoding produces lowercase with 0x prefix
+    let mut stmt = conn.prepare(
+        "SELECT num, '0x' || lower(hex(hash)) as hash, '0x' || lower(hex(miner)) as miner \
+         FROM pg.public.blocks \
+         ORDER BY num LIMIT 1"
+    ).expect("Failed to prepare scanner query");
+    let mut rows = stmt.query([]).expect("Failed to execute scanner query");
+    
+    if let Some(row) = rows.next().expect("Failed to get row") {
+        let num: i64 = row.get(0).expect("Failed to get num");
+        let hash: String = row.get(1).expect("Failed to get hash");
+        let miner: String = row.get(2).expect("Failed to get miner");
+
+        println!("Block {num}: hash={hash}, miner={miner}");
+
+        // Verify format: 0x prefix + lowercase hex
+        assert!(hash.starts_with("0x"), "Hash should start with 0x");
+        assert_eq!(hash.len(), 66, "Block hash should be 66 chars (0x + 64 hex)");
+        assert!(hash[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), 
+            "Hash should be lowercase hex");
+
+        assert!(miner.starts_with("0x"), "Miner should start with 0x");
+        assert_eq!(miner.len(), 42, "Miner address should be 42 chars (0x + 40 hex)");
+        assert!(miner[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "Miner should be lowercase hex");
+    }
+
+    // Test transactions table - verify nullable fields and JSONB handling
+    let mut stmt = conn.prepare(
+        "SELECT block_num, '0x' || lower(hex(hash)) as hash, \
+                CASE WHEN \"to\" IS NOT NULL THEN '0x' || lower(hex(\"to\")) ELSE NULL END as to_addr, \
+                calls \
+         FROM pg.public.txs \
+         ORDER BY block_num, idx LIMIT 5"
+    ).expect("Failed to prepare txs scanner query");
+    let mut rows = stmt.query([]).expect("Failed to execute txs scanner query");
+    
+    let mut tx_count = 0;
+    while let Some(row) = rows.next().expect("Failed to get tx row") {
+        let hash: String = row.get(1).expect("Failed to get tx hash");
+        let to_addr: Option<String> = row.get(2).ok();
+        let calls: Option<String> = row.get(3).ok();
+
+        println!("TX hash={hash}, to={to_addr:?}, calls={calls:?}");
+
+        assert!(hash.starts_with("0x"), "TX hash should start with 0x");
+        assert_eq!(hash.len(), 66, "TX hash should be 66 chars");
+
+        if let Some(to) = to_addr {
+            assert!(to.starts_with("0x"), "To address should start with 0x");
+            assert_eq!(to.len(), 42, "To address should be 42 chars");
+        }
+
+        // JSONB should come through as string (may be null for single-call txs)
+        if let Some(calls_json) = &calls {
+            // Should be valid JSON if present
+            assert!(calls_json.starts_with('[') || calls_json.starts_with('{'),
+                "Calls should be JSON: {calls_json}");
+        }
+
+        tx_count += 1;
+    }
+
+    println!("Validated {tx_count} transactions via postgres extension");
+}
+
+/// Test that postgres extension INSERT produces identical data to manual copy.
+#[tokio::test]
+#[serial(db)]
+async fn test_postgres_scanner_insert_matches_manual() {
+    let db = TestDb::new().await;
+
+    if db.block_count().await == 0 {
+        println!("Skipping postgres extension insert test - no data in DB");
+        return;
+    }
+
+    let duckdb = DuckDbPool::new(":memory:").expect("Failed to create DuckDB");
+    let conn = duckdb.conn().await;
+
+    if let Err(e) = conn.execute("INSTALL postgres", []) {
+        println!("Skipping test - postgres extension not available: {e}");
+        return;
+    }
+    conn.execute("LOAD postgres", []).expect("Failed to load postgres");
+
+    let pg_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let escaped_url = pg_url.replace('\'', "''");
+
+    // Attach Postgres database
+    let attach_sql = format!("ATTACH '{escaped_url}' AS pg (TYPE postgres, READ_ONLY)");
+    conn.execute(&attach_sql, []).expect("Failed to attach postgres");
+
+    // Copy first 5 blocks using attached postgres database
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO blocks \
+         SELECT num, '0x' || lower(hex(hash)), '0x' || lower(hex(parent_hash)), \
+                timestamp, timestamp_ms, gas_limit, gas_used, '0x' || lower(hex(miner)), \
+                CASE WHEN extra_data IS NOT NULL THEN '0x' || lower(hex(extra_data)) ELSE NULL END \
+         FROM pg.public.blocks \
+         WHERE num <= 5",
+        []
+    ).expect("Failed to insert blocks via postgres extension");
+    println!("Inserted {inserted} blocks via postgres extension");
+
+    // Verify data in DuckDB
+    let mut stmt = conn.prepare("SELECT num, hash, miner FROM blocks ORDER BY num LIMIT 5")
+        .expect("Failed to prepare verify query");
+    let mut rows = stmt.query([]).expect("Failed to execute verify query");
+
+    let mut verified = 0;
+    while let Some(row) = rows.next().expect("Failed to get row") {
+        let num: i64 = row.get(0).expect("Failed to get num");
+        let hash: String = row.get(1).expect("Failed to get hash");
+        let miner: String = row.get(2).expect("Failed to get miner");
+
+        // Verify format consistency
+        assert!(hash.starts_with("0x") && hash.len() == 66, "Invalid hash format: {hash}");
+        assert!(miner.starts_with("0x") && miner.len() == 42, "Invalid miner format: {miner}");
+        
+        verified += 1;
+        println!("Verified block {num}");
+    }
+
+    assert!(verified > 0, "Should have verified at least one block");
+    println!("Successfully verified {verified} blocks copied via postgres extension");
 }

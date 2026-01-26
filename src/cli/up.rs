@@ -193,7 +193,7 @@ async fn initialize_chain(
         let duckdb_pool = Arc::new(DuckDbPool::new(duckdb_path)?);
 
         // Replicator uses the shared pool (its gap-fill is lower priority)
-        let (replicator, handle) = Replicator::new(duckdb_pool.clone(), throttled_pool.pool.clone(), 10_000, chain.chain_id);
+        let (replicator, handle) = Replicator::new(duckdb_pool.clone(), throttled_pool.pool.clone(), chain.pg_url.clone(), 10_000, chain.chain_id);
         tokio::spawn(replicator.run());
 
         duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool);
