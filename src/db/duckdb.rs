@@ -7,7 +7,16 @@ use duckdb::types::DuckString;
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
+use std::sync::RwLock;
 use tokio::sync::Mutex;
+
+/// Cached sync status for fast status endpoint queries.
+#[derive(Debug, Clone, Default)]
+pub struct CachedSyncStatus {
+    pub latest_block: i64,
+    pub gaps: Vec<(i64, i64)>,
+    pub gap_blocks: i64,
+}
 
 /// DuckDB connection pool for analytical queries.
 ///
@@ -18,6 +27,8 @@ pub struct DuckDbPool {
     path: String,
     /// Write connection protected by mutex
     write_conn: Mutex<Connection>,
+    /// Cached sync status (updated by background task)
+    cached_status: RwLock<CachedSyncStatus>,
 }
 
 impl DuckDbPool {
@@ -46,6 +57,7 @@ impl DuckDbPool {
         Ok(Self {
             path: path.to_string(),
             write_conn: Mutex::new(conn),
+            cached_status: RwLock::new(CachedSyncStatus::default()),
         })
     }
 
@@ -62,7 +74,22 @@ impl DuckDbPool {
         Ok(Self {
             path: path.to_string(),
             write_conn: Mutex::new(conn),
+            cached_status: RwLock::new(CachedSyncStatus::default()),
         })
+    }
+
+    /// Updates the cached sync status (called by background replicator task).
+    pub fn update_cached_status(&self, latest_block: i64, gaps: Vec<(i64, i64)>, gap_blocks: i64) {
+        if let Ok(mut status) = self.cached_status.write() {
+            status.latest_block = latest_block;
+            status.gaps = gaps;
+            status.gap_blocks = gap_blocks;
+        }
+    }
+
+    /// Gets the cached sync status (fast, no DB query).
+    pub fn get_cached_status(&self) -> CachedSyncStatus {
+        self.cached_status.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Gets the write connection (mutex-protected, blocks other writers).

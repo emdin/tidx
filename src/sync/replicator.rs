@@ -518,6 +518,9 @@ impl Replicator {
         metrics::set_duckdb_gap_count(self.chain_id, gaps.len());
         metrics::set_duckdb_gap_blocks(self.chain_id, total_gap_blocks);
 
+        // Update cached status for fast status endpoint queries
+        self.duckdb.update_cached_status(duck_max, gaps.clone(), internal_gap_blocks);
+
         // Log sync status
         if tip_lag > 10 {
             tracing::warn!(
@@ -1055,14 +1058,13 @@ pub async fn backfill_from_postgres(
 
 /// Gets the current DuckDB sync status including any gaps.
 pub async fn get_sync_status(duckdb: &Arc<DuckDbPool>) -> Result<DuckDbSyncStatus> {
-    let latest_block = duckdb.latest_block().await?.unwrap_or(0);
-    let gaps = detect_gaps_duckdb(duckdb).await?;
-    let gap_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-
+    // Use cached status for fast response (updated by background replicator task)
+    let cached = duckdb.get_cached_status();
+    
     Ok(DuckDbSyncStatus {
-        latest_block,
-        gaps,
-        gap_blocks,
+        latest_block: cached.latest_block,
+        gaps: cached.gaps,
+        gap_blocks: cached.gap_blocks,
         updated_at: String::new(),
     })
 }
@@ -1685,6 +1687,12 @@ mod tests {
                 .unwrap();
             appender.flush().unwrap();
         }
+
+        // Detect gaps and update cache (simulates what background task does)
+        let latest_block = duckdb.latest_block().await.unwrap().unwrap_or(0);
+        let gaps = detect_gaps_duckdb(&duckdb).await.unwrap();
+        let gap_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+        duckdb.update_cached_status(latest_block, gaps, gap_blocks);
 
         let status = get_sync_status(&duckdb).await.unwrap();
         assert_eq!(status.latest_block, 5);
