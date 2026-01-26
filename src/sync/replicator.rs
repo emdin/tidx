@@ -649,21 +649,21 @@ async fn copy_range_to_duckdb(
                 let value: String = row.get(7);
                 let input: Vec<u8> = row.get(8);
                 let gas_limit: i64 = row.get(9);
-                let max_fee_per_gas: Option<String> = row.get(10);
-                let max_priority_fee_per_gas: Option<String> = row.get(11);
+                let max_fee_per_gas: String = row.get(10);
+                let max_priority_fee_per_gas: String = row.get(11);
                 let gas_used: Option<i64> = row.get(12);
-                let nonce_key: Option<Vec<u8>> = row.get(13);
+                let nonce_key: Vec<u8> = row.get(13);
                 let nonce: i64 = row.get(14);
                 let fee_token: Option<Vec<u8>> = row.get(15);
                 let fee_payer: Option<Vec<u8>> = row.get(16);
                 let calls: Option<String> = row.get(17);
-                let call_count: Option<i32> = row.get(18);
+                let call_count: i16 = row.get(18);
                 let valid_before: Option<i64> = row.get(19);
                 let valid_after: Option<i64> = row.get(20);
                 let signature_type: Option<i16> = row.get(21);
 
                 format!(
-                    "({}, '{}', {}, '0x{}', {}, '0x{}', {}, '{}', '0x{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    "({}, '{}', {}, '0x{}', {}, '0x{}', {}, '{}', '0x{}', {}, '{}', '{}', {}, '0x{}', {}, {}, {}, {}, {}, {}, {}, {})",
                     block_num,
                     block_timestamp.to_rfc3339(),
                     idx,
@@ -674,15 +674,15 @@ async fn copy_range_to_duckdb(
                     value,
                     hex::encode(&input),
                     gas_limit,
-                    max_fee_per_gas.as_ref().map(|f| format!("'{}'", f)).unwrap_or_else(|| "NULL".to_string()),
-                    max_priority_fee_per_gas.as_ref().map(|f| format!("'{}'", f)).unwrap_or_else(|| "NULL".to_string()),
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
                     gas_used.map(|g| g.to_string()).unwrap_or_else(|| "NULL".to_string()),
-                    nonce_key.as_ref().map(|k| format!("'0x{}'", hex::encode(k))).unwrap_or_else(|| "NULL".to_string()),
+                    hex::encode(&nonce_key),
                     nonce,
                     fee_token.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
                     fee_payer.as_ref().map(|p| format!("'0x{}'", hex::encode(p))).unwrap_or_else(|| "NULL".to_string()),
                     calls.as_ref().map(|c| format!("'{}'", c.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
-                    call_count.map(|c| c.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                    call_count,
                     valid_before.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
                     valid_after.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
                     signature_type.map(|s| s.to_string()).unwrap_or_else(|| "NULL".to_string()),
