@@ -5,6 +5,8 @@ on:
     inputs:
       version:
         description: "Version bump type"
+        required: true
+        default: patch
         type: choice
         options:
           - patch
