@@ -340,14 +340,12 @@ pub async fn execute_query_pg_duckdb(
             0
         });
 
-    // Load tidx_abi extension for ABI decoding functions (abi_address, abi_uint, etc.)
-    // This is needed when querying Parquet files that contain raw encoded event data
-    if let Err(e) = conn.execute(
-        "SELECT duckdb.raw_query($$ LOAD '/usr/share/duckdb/extensions/tidx_abi.duckdb_extension' $$)",
-        &[],
-    ).await {
-        tracing::debug!(error = %e, "Failed to load tidx_abi extension (may not be installed)");
-    }
+    // Prepend LOAD tidx_abi extension to query for ABI decoding functions
+    // The extension must be loaded in the same DuckDB context as the query execution
+    let sql = format!(
+        "LOAD '/usr/share/duckdb/extensions/tidx_abi.duckdb_extension'; {}",
+        sql
+    );
 
     // Set statement timeout
     conn.execute(
