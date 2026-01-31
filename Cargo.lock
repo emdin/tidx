@@ -6054,6 +6054,7 @@ dependencies = [
  "serial_test",
  "sha3",
  "sqlparser",
+ "tempfile",
  "tempo-alloy",
  "thiserror 2.0.18",
  "tokio",
