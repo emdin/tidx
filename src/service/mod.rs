@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::db::Pool;
 use crate::duckdb::DuckDbEngine;
 use crate::metrics;
-use crate::query::{extract_column_references, route_query, validate_query, EventSignature, QueryEngine};
+use crate::query::{extract_column_references, validate_query, EventSignature};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
@@ -115,14 +115,7 @@ impl Default for QueryOptions {
     }
 }
 
-/// pg_duckdb configuration for query execution.
-#[derive(Clone, Debug, Default)]
-pub struct PgDuckdbConfig {
-    pub memory_limit: Option<String>,
-    pub threads: Option<u32>,
-}
-
-/// Parquet configuration for hybrid queries (PG heap + Parquet files)
+/// Parquet configuration for native DuckDB queries
 #[derive(Clone, Debug, Default)]
 pub struct ParquetConfig {
     /// Whether Parquet querying is enabled
@@ -136,7 +129,7 @@ pub struct ParquetConfig {
 }
 
 /// Execute a query using the native in-process DuckDB engine.
-/// This bypasses pg_duckdb entirely and reads Parquet files directly.
+/// Reads Parquet files directly for analytical queries.
 pub fn execute_query_native_duckdb(
     engine: &DuckDbEngine,
     sql: &str,
@@ -166,63 +159,20 @@ pub fn execute_query_native_duckdb(
         columns: result.columns,
         rows: result.rows,
         row_count: result.row_count,
-        engine: Some("duckdb-native".to_string()),
+        engine: Some("duckdb".to_string()),
         query_time_ms: Some(elapsed_ms),
     })
 }
 
-/// Execute a query with pg_duckdb support.
-/// Routes OLAP queries to pg_duckdb, OLTP queries to Postgres.
-/// If parquet_config is provided and the query touches the logs table,
-/// automatically combines Parquet files with PostgreSQL data.
-pub async fn execute_query(
-    pg_pool: &Pool,
+/// Execute a query on PostgreSQL.
+pub async fn execute_query_postgres(
+    pool: &Pool,
     sql: &str,
     signature: Option<&str>,
     options: &QueryOptions,
-    pg_duckdb_config: &PgDuckdbConfig,
-    force_engine: Option<&str>,
-) -> Result<QueryResult> {
-    execute_query_with_parquet(
-        pg_pool,
-        sql,
-        signature,
-        options,
-        pg_duckdb_config,
-        force_engine,
-        None, // No Parquet config by default
-    )
-    .await
-}
-
-/// Execute a query with optional Parquet source integration.
-/// When parquet_config is provided and the query references the logs table,
-/// the query is rewritten to combine Parquet files with PostgreSQL data.
-pub async fn execute_query_with_parquet(
-    pg_pool: &Pool,
-    sql: &str,
-    signature: Option<&str>,
-    options: &QueryOptions,
-    pg_duckdb_config: &PgDuckdbConfig,
-    force_engine: Option<&str>,
-    parquet_config: Option<&ParquetConfig>,
 ) -> Result<QueryResult> {
     // Validate query
     validate_query(sql)?;
-
-    // Determine which engine to use (forced or auto-detected)
-    let use_pg_duckdb = match force_engine {
-        Some("postgres") | Some("pg") => false,
-        Some("duckdb") | Some("duck") | Some("pg_duckdb") => true,
-        _ => route_query(sql) == QueryEngine::DuckDb,
-    };
-
-    // Check if we should use Parquet sources
-    // Only use parquet with DuckDB engine (read_parquet is a DuckDB function)
-    let use_parquet = use_pg_duckdb
-        && parquet_config
-            .map(|c| c.enabled && c.max_parquet_block.is_some())
-            .unwrap_or(false);
 
     // Generate CTE SQL if a signature is provided
     let sql = if let Some(sig_str) = signature {
@@ -239,13 +189,6 @@ pub async fn execute_query_with_parquet(
         sql.to_string()
     };
 
-    // Rewrite query to use Parquet sources if enabled and query touches logs
-    let sql = if use_parquet && query_references_logs(&sql) {
-        rewrite_query_for_parquet(&sql, parquet_config.unwrap())?
-    } else {
-        sql
-    };
-
     // Add LIMIT if not present
     let sql_upper = sql.to_uppercase();
     let sql = if !sql_upper.contains("LIMIT") {
@@ -254,377 +197,6 @@ pub async fn execute_query_with_parquet(
         sql
     };
 
-    // Execute with appropriate backend, with fallback on error
-    let (primary_result, primary_engine, fallback_engine) = if use_pg_duckdb {
-        (
-            execute_query_pg_duckdb(
-                pg_pool,
-                &sql,
-                options,
-                pg_duckdb_config.memory_limit.as_deref(),
-                pg_duckdb_config.threads,
-            )
-            .await,
-            "duckdb",
-            "postgres",
-        )
-    } else {
-        (
-            execute_query_postgres(pg_pool, &sql, options).await,
-            "postgres",
-            "duckdb",
-        )
-    };
-
-    // If primary engine failed, try fallback (unless engine was explicitly forced)
-    match primary_result {
-        Ok(result) => Ok(result),
-        Err(primary_err) if force_engine.is_none() => {
-            tracing::warn!(
-                primary_engine = primary_engine,
-                fallback_engine = fallback_engine,
-                error = %primary_err,
-                "Query failed, trying fallback engine"
-            );
-
-            let fallback_result = if fallback_engine == "duckdb" {
-                execute_query_pg_duckdb(
-                    pg_pool,
-                    &sql,
-                    options,
-                    pg_duckdb_config.memory_limit.as_deref(),
-                    pg_duckdb_config.threads,
-                )
-                .await
-            } else {
-                execute_query_postgres(pg_pool, &sql, options).await
-            };
-
-            match fallback_result {
-                Ok(mut result) => {
-                    // Mark that we used the fallback engine
-                    result.engine = Some(format!("{} (fallback)", fallback_engine));
-                    Ok(result)
-                }
-                Err(fallback_err) => {
-                    // Both failed, return the primary error
-                    tracing::error!(
-                        primary_engine = primary_engine,
-                        fallback_engine = fallback_engine,
-                        primary_error = %primary_err,
-                        fallback_error = %fallback_err,
-                        "Both engines failed"
-                    );
-                    Err(primary_err)
-                }
-            }
-        }
-        Err(err) => Err(err), // Engine was forced, don't fallback
-    }
-}
-
-/// Check if a query references the logs table
-fn query_references_logs(sql: &str) -> bool {
-    let sql_upper = sql.to_uppercase();
-    // Check for FROM logs or JOIN logs patterns
-    sql_upper.contains("FROM LOGS") || sql_upper.contains("JOIN LOGS")
-}
-
-/// Rewrite a query to use Parquet files via duckdb.query().
-/// 
-/// pg_duckdb's read_parquet() requires special column access syntax (r['col']).
-/// To work around this, we:
-/// 1. Replace 'FROM logs' with 'FROM read_parquet(...)'  
-/// 2. Wrap the query in duckdb.query() which runs entirely in DuckDB
-/// 3. Use 'SELECT r.* FROM duckdb.query(...) AS r' to get normal column names
-///
-/// This allows user queries to work unchanged against parquet files.
-fn rewrite_query_for_parquet(sql: &str, config: &ParquetConfig) -> Result<String> {
-    let chain_id = config.chain_id.unwrap_or(0);
-    let data_dir = config.data_dir.as_deref().unwrap_or("/data");
-
-    // Replace table references with read_parquet() and add 'r' alias
-    // Column references must use r['column'] syntax for pg_duckdb compatibility
-    let rewritten = replace_tables_with_parquet(sql, data_dir, chain_id);
-
-    Ok(rewritten)
-}
-
-/// Replace references to tables with read_parquet() calls and r['col'] column syntax.
-/// 
-/// pg_duckdb requires special syntax for parquet queries:
-/// - Tables must be replaced with: read_parquet('path') r
-/// - Column references must use: r['column_name']
-fn replace_tables_with_parquet(sql: &str, data_dir: &str, chain_id: u64) -> String {
-    use regex_lite::Regex;
-    use std::collections::HashSet;
-    
-    // Tables that have parquet exports, with their column names
-    let table_columns: &[(&str, &[&str])] = &[
-        ("logs", &["block_num", "block_timestamp", "log_idx", "tx_idx", "tx_hash", 
-                   "address", "selector", "topic0", "topic1", "topic2", "topic3", "data"]),
-        ("blocks", &["num", "hash", "parent_hash", "timestamp", "timestamp_ms", 
-                     "gas_limit", "gas_used", "miner", "extra_data"]),
-        ("txs", &["block_num", "block_timestamp", "idx", "hash", "type", "from", "to", 
-                  "value", "input", "gas_limit", "max_fee_per_gas", "max_priority_fee_per_gas",
-                  "gas_used", "nonce_key", "nonce", "fee_token", "fee_payer", "calls", 
-                  "call_count", "valid_before", "valid_after", "signature_type"]),
-        ("receipts", &["block_num", "block_timestamp", "tx_idx", "tx_hash", "from", "to",
-                       "contract_address", "gas_used", "cumulative_gas_used", 
-                       "effective_gas_price", "status", "fee_payer"]),
-    ];
-    
-    let mut result = sql.to_string();
-    let mut replaced_columns: HashSet<&str> = HashSet::new();
-    
-    for (table, columns) in table_columns {
-        let parquet_glob = format!("{}/{}/{}_*.parquet", data_dir, chain_id, table);
-        
-        // Check if this table is referenced in the query
-        let from_pattern = format!(r"(?i)\bFROM\s+{}\b", table);
-        let join_pattern = format!(r"(?i)\bJOIN\s+{}\b", table);
-        
-        let table_referenced = Regex::new(&from_pattern).map(|re| re.is_match(&result)).unwrap_or(false)
-            || Regex::new(&join_pattern).map(|re| re.is_match(&result)).unwrap_or(false);
-        
-        if !table_referenced {
-            continue;
-        }
-        
-        // First, replace qualified column references BEFORE replacing table names
-        // This prevents issues with paths containing column names like "data"
-        for col in *columns {
-            replaced_columns.insert(*col);
-            
-            // Replace table.column -> r['column'] (e.g., logs.address -> r['address'])
-            let qualified_pattern = format!(r"(?i)\b{}\s*\.\s*{}\b", table, col);
-            if let Ok(re) = Regex::new(&qualified_pattern) {
-                let replacement = format!("r['{}']", col);
-                result = re.replace_all(&result, replacement.as_str()).to_string();
-            }
-            
-            // Replace l.column -> r['column'] for common aliases
-            let alias = match *table {
-                "logs" => "l",
-                "blocks" => "b",
-                "txs" => "t",
-                "receipts" => "rec",
-                _ => "",
-            };
-            if !alias.is_empty() {
-                let alias_pattern = format!(r"(?i)\b{}\s*\.\s*{}\b", alias, col);
-                if let Ok(re) = Regex::new(&alias_pattern) {
-                    let replacement = format!("r['{}']", col);
-                    result = re.replace_all(&result, replacement.as_str()).to_string();
-                }
-            }
-        }
-        
-        // Now replace FROM table and JOIN table with read_parquet() r
-        // Do this AFTER column replacement to avoid replacing "data" in "/data/..."
-        if let Ok(re) = Regex::new(&from_pattern) {
-            let replacement = format!("FROM read_parquet('{}') r", parquet_glob);
-            result = re.replace_all(&result, replacement.as_str()).to_string();
-        }
-        if let Ok(re) = Regex::new(&join_pattern) {
-            let replacement = format!("JOIN read_parquet('{}') r", parquet_glob);
-            result = re.replace_all(&result, replacement.as_str()).to_string();
-        }
-    }
-    
-    // Now replace unqualified column references with r['column'] syntax
-    // Only do this for columns from tables we replaced above
-    // Be careful: only replace columns that appear as standalone identifiers in SQL contexts
-    for col in replaced_columns {
-        // Match column name that's:
-        // - At word boundary
-        // - NOT inside single quotes (string literals or paths)
-        // - NOT already part of r['...']
-        // 
-        // We use a simple heuristic: split by single quotes to find non-string parts,
-        // then replace only in those parts
-        let parts: Vec<&str> = result.split('\'').collect();
-        let mut new_parts = Vec::new();
-        
-        for (i, part) in parts.iter().enumerate() {
-            if i % 2 == 0 {
-                // Outside quotes - safe to replace column names
-                let pattern = format!(r"(?i)\b{}\b", col);
-                if let Ok(re) = Regex::new(&pattern) {
-                    let replacement = format!("r['{}']", col);
-                    new_parts.push(re.replace_all(part, replacement.as_str()).to_string());
-                } else {
-                    new_parts.push(part.to_string());
-                }
-            } else {
-                // Inside quotes - don't modify
-                new_parts.push(part.to_string());
-            }
-        }
-        result = new_parts.join("'");
-    }
-    
-    // Fix any double-replacements like r['r['col']'] -> r['col']
-    while result.contains("r['r['") {
-        result = result.replace("r['r['", "r['");
-    }
-    while result.contains("']']") {
-        result = result.replace("']']", "']");
-    }
-    
-    // Fix AS r['col'] -> AS col (alias definitions should use plain names)
-    if let Ok(re) = Regex::new(r"(?i)\bAS\s+r\['([^']+)'\]") {
-        result = re.replace_all(&result, "AS $1").to_string();
-    }
-    
-    result
-}
-
-/// Execute a query on PostgreSQL.
-async fn execute_query_postgres(
-    pool: &Pool,
-    sql: &str,
-    options: &QueryOptions,
-) -> Result<QueryResult> {
-    execute_query_postgres_inner(pool, sql, options, "postgres").await
-}
-
-/// Execute a query on PostgreSQL with pg_duckdb extension.
-/// This enables DuckDB's analytical engine for OLAP queries directly in PostgreSQL.
-pub async fn execute_query_pg_duckdb(
-    pool: &Pool,
-    sql: &str,
-    options: &QueryOptions,
-    memory_limit: Option<&str>,
-    threads: Option<u32>,
-) -> Result<QueryResult> {
-    // Convert '0x...' hex strings to '\x...' bytea literals for PostgreSQL
-    let sql = sql.replace("'0x", "'\\x");
-
-    let conn = pool.get().await?;
-
-    // Configure pg_duckdb for this session
-    // Force DuckDB execution for analytical queries
-    conn.execute("SET duckdb.force_execution = true", &[]).await?;
-    
-    // Set memory limit (default 16GB for 64GB server)
-    let mem_limit = memory_limit.unwrap_or("16GB");
-    conn.execute(&format!("SET duckdb.max_memory = '{}'", mem_limit), &[]).await
-        .unwrap_or_else(|e| {
-            tracing::debug!(error = %e, "Failed to set duckdb.max_memory (pg_duckdb may not be installed)");
-            0
-        });
-    
-    // Set thread count (default 8)
-    let thread_count = threads.unwrap_or(8);
-    conn.execute(&format!("SET duckdb.threads = {}", thread_count), &[]).await
-        .unwrap_or_else(|e| {
-            tracing::debug!(error = %e, "Failed to set duckdb.threads");
-            0
-        });
-
-    // Set scan parallelism for reading from PostgreSQL tables
-    // These control how many PostgreSQL workers scan the table in parallel
-    conn.execute(&format!("SET duckdb.max_workers_per_postgres_scan = {}", thread_count), &[]).await
-        .unwrap_or_else(|e| {
-            tracing::debug!(error = %e, "Failed to set duckdb.max_workers_per_postgres_scan");
-            0
-        });
-    conn.execute(&format!("SET duckdb.threads_for_postgres_scan = {}", thread_count), &[]).await
-        .unwrap_or_else(|e| {
-            tracing::debug!(error = %e, "Failed to set duckdb.threads_for_postgres_scan");
-            0
-        });
-
-    // Load tidx_abi extension for ABI decoding functions
-    // This must be done via raw_query since LOAD is a DuckDB-specific command
-    conn.execute(
-        "SELECT duckdb.raw_query($1)",
-        &[&"LOAD '/usr/share/duckdb/extensions/tidx_abi.duckdb_extension'"],
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::debug!(error = %e, "Failed to load tidx_abi extension");
-        0
-    });
-
-    // Set statement timeout
-    conn.execute(
-        &format!("SET statement_timeout = {}", options.timeout_ms),
-        &[],
-    )
-    .await?;
-
-    let start = Instant::now();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(options.timeout_ms + 100),
-        conn.query(&sql, &[]),
-    )
-    .await;
-
-    // Always reset force_execution to prevent polluting pooled connections
-    // This ensures other queries (like gap detection with generate_series) run on Postgres
-    conn.execute("SET duckdb.force_execution = false", &[]).await.ok();
-
-    let rows = match result {
-        Ok(Ok(rows)) => {
-            metrics::record_query_duration(start.elapsed());
-            rows
-        }
-        Ok(Err(e)) => return Err(anyhow!("Query error: {}", sanitize_db_error(&e.to_string()))),
-        Err(_) => return Err(anyhow!("Query timeout")),
-    };
-
-    // Get columns from result
-    let columns: Vec<String> = if rows.is_empty() {
-        conn.prepare(&sql)
-            .await
-            .ok()
-            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default()
-    } else {
-        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
-    };
-
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    if rows.is_empty() {
-        return Ok(QueryResult {
-            columns,
-            rows: vec![],
-            row_count: 0,
-            engine: Some("pg_duckdb".to_string()),
-            query_time_ms: Some(elapsed_ms),
-        });
-    }
-    let row_count = rows.len();
-    metrics::record_query_rows(row_count as u64);
-
-    let result_rows: Vec<Vec<serde_json::Value>> = rows
-        .iter()
-        .map(|row| {
-            (0..columns.len())
-                .map(|i| format_column_json(row, i))
-                .collect()
-        })
-        .collect();
-
-    Ok(QueryResult {
-        columns,
-        rows: result_rows,
-        row_count,
-        engine: Some("pg_duckdb".to_string()),
-        query_time_ms: Some(elapsed_ms),
-    })
-}
-
-/// Internal PostgreSQL query executor with configurable engine name.
-async fn execute_query_postgres_inner(
-    pool: &Pool,
-    sql: &str,
-    options: &QueryOptions,
-    engine_name: &str,
-) -> Result<QueryResult> {
     // Convert '0x...' hex strings to '\x...' bytea literals for PostgreSQL
     let sql = sql.replace("'0x", "'\\x");
 
@@ -672,7 +244,7 @@ async fn execute_query_postgres_inner(
             columns,
             rows: vec![],
             row_count: 0,
-            engine: Some(engine_name.to_string()),
+            engine: Some("postgres".to_string()),
             query_time_ms: Some(elapsed_ms),
         });
     }
@@ -692,7 +264,7 @@ async fn execute_query_postgres_inner(
         columns,
         rows: result_rows,
         row_count,
-        engine: Some(engine_name.to_string()),
+        engine: Some("postgres".to_string()),
         query_time_ms: Some(elapsed_ms),
     })
 }
@@ -785,28 +357,7 @@ fn sanitize_db_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::EventSignature;
-
-    // ========================================================================
-    // PgDuckdbConfig Tests
-    // ========================================================================
-
-    #[test]
-    fn test_pg_duckdb_config_default() {
-        let config = PgDuckdbConfig::default();
-        assert!(config.memory_limit.is_none());
-        assert!(config.threads.is_none());
-    }
-
-    #[test]
-    fn test_pg_duckdb_config_with_limits() {
-        let config = PgDuckdbConfig {
-            memory_limit: Some("16GB".to_string()),
-            threads: Some(8),
-        };
-        assert_eq!(config.memory_limit, Some("16GB".to_string()));
-        assert_eq!(config.threads, Some(8));
-    }
+    use crate::query::{route_query, EventSignature, QueryEngine};
 
     // ========================================================================
     // Event CTE SQL Generation Tests (Both Engines)
@@ -951,7 +502,7 @@ mod tests {
         // The system generates the CTE with decode functions
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
         
-        // For pg_duckdb mode (uses Postgres functions)
+        // For PostgreSQL mode (uses Postgres functions)
         let pg_cte = sig.to_cte_sql_postgres();
         let full_pg_query = format!("WITH {} {}", pg_cte, user_query);
         
@@ -1120,227 +671,8 @@ mod tests {
     }
 
     // ========================================================================
-    // Parquet Query Rewriting Tests
+    // ParquetConfig Tests
     // ========================================================================
-
-    #[test]
-    fn test_query_references_logs_positive() {
-        assert!(query_references_logs("SELECT * FROM logs WHERE block_num > 100"));
-        assert!(query_references_logs("SELECT * from logs"));
-        assert!(query_references_logs("SELECT * FROM LOGS"));
-        assert!(query_references_logs("SELECT * FROM blocks JOIN logs ON blocks.num = logs.block_num"));
-    }
-
-    #[test]
-    fn test_query_references_logs_negative() {
-        assert!(!query_references_logs("SELECT * FROM blocks WHERE num > 100"));
-        assert!(!query_references_logs("SELECT * FROM transactions"));
-        assert!(!query_references_logs("SELECT 'logs' as table_name"));
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_simple() {
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(42431),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT * FROM logs WHERE block_num > 500000";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // Should replace table with read_parquet() r
-        assert!(rewritten.contains("read_parquet('/data/42431/logs_*.parquet') r"), 
-            "Missing parquet path with alias: {}", rewritten);
-        // Column references should use r['col'] syntax
-        assert!(rewritten.contains("r['block_num']"), "Missing r['block_num']: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_groupby() {
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(4217),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT address, COUNT(*) as cnt FROM logs GROUP BY address";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // Should replace table with read_parquet() r
-        assert!(rewritten.contains("FROM read_parquet('/data/4217/logs_*.parquet') r"), 
-            "Missing FROM read_parquet: {}", rewritten);
-        // Column references should use r['col'] syntax
-        assert!(rewritten.contains("r['address']"), "Missing r['address']: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_with_event_cte() {
-        // Event signature CTEs query FROM logs, which should be replaced
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(1),
-            max_parquet_block: Some(5000000),
-        };
-
-        let sql = "WITH transfer AS (SELECT * FROM logs WHERE selector = '\\x1234') SELECT * FROM transfer";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // The CTE's FROM logs should be replaced with read_parquet() r
-        assert!(rewritten.contains("FROM read_parquet('/data/1/logs_*.parquet') r"), 
-            "CTE's FROM logs not replaced: {}", rewritten);
-        // Original CTE name preserved
-        assert!(rewritten.contains("transfer AS"), "Missing transfer CTE: {}", rewritten);
-        // Column references use r['col'] syntax
-        assert!(rewritten.contains("r['selector']"), "Missing r['selector']: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_all_tables() {
-        // Should replace all table types: logs, blocks, txs, receipts
-        // Note: When multiple tables are replaced, they all get 'r' alias which may cause conflicts
-        // In practice, users should use table aliases for multi-table queries
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(42431),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT num FROM blocks WHERE num > 100";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        assert!(rewritten.contains("read_parquet('/data/42431/blocks_*.parquet') r"), 
-            "blocks not replaced: {}", rewritten);
-        assert!(rewritten.contains("r['num']"), "num not replaced: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_table_alias() {
-        // User-provided table aliases should work - column refs still get r['col'] treatment
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(1),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT l.address, l.block_num FROM logs l WHERE l.block_num > 100";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // Table gets 'r' alias (overwrites user's 'l' alias)
-        assert!(rewritten.contains("read_parquet('/data/1/logs_*.parquet') r"), 
-            "Table alias not correct: {}", rewritten);
-        // l.column references get converted to r['column']
-        assert!(rewritten.contains("r['address']"), "l.address not replaced: {}", rewritten);
-        assert!(rewritten.contains("r['block_num']"), "l.block_num not replaced: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_subquery() {
-        // Subqueries should work - inner FROM logs gets replaced
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(42431),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT * FROM (SELECT address, COUNT(*) as cnt FROM logs GROUP BY address) sub WHERE cnt > 10";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        assert!(rewritten.contains("FROM read_parquet('/data/42431/logs_*.parquet') r"), 
-            "Subquery FROM logs not replaced: {}", rewritten);
-        assert!(rewritten.contains("r['address']"), "address not replaced: {}", rewritten);
-        assert!(rewritten.contains("sub WHERE cnt"), "Outer query structure preserved: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_single_table() {
-        // Single table queries work well with r['col'] syntax
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(4217),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT address, block_num, data FROM logs WHERE block_num > 1000";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        assert!(rewritten.contains("read_parquet('/data/4217/logs_*.parquet') r"), 
-            "logs not replaced: {}", rewritten);
-        assert!(rewritten.contains("r['address']"), "address not replaced: {}", rewritten);
-        assert!(rewritten.contains("r['block_num']"), "block_num not replaced: {}", rewritten);
-        assert!(rewritten.contains("r['data']"), "data not replaced: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_left_join() {
-        // LEFT JOIN should be replaced
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(1),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT num FROM blocks LEFT JOIN txs ON num = block_num";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // LEFT JOIN contains "JOIN" so it should match
-        assert!(rewritten.contains("LEFT JOIN read_parquet('/data/1/txs_*.parquet') r"), 
-            "LEFT JOIN not replaced: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_nested_cte() {
-        // Nested CTEs should work
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(42431),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "WITH transfers AS (SELECT * FROM logs WHERE selector = '\\xddf252ad'), \
-                   large_transfers AS (SELECT * FROM transfers WHERE block_num > 1000000) \
-                   SELECT address, COUNT(*) FROM large_transfers GROUP BY address";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // The FROM logs in first CTE should be replaced
-        assert!(rewritten.contains("FROM read_parquet('/data/42431/logs_*.parquet') r"), 
-            "CTE FROM logs not replaced: {}", rewritten);
-        // The second CTE references 'transfers', not a table, so it stays
-        assert!(rewritten.contains("FROM transfers"), "CTE reference should remain: {}", rewritten);
-        // selector should be replaced with r['selector']
-        assert!(rewritten.contains("r['selector']"), "selector not replaced: {}", rewritten);
-    }
-
-    #[test]
-    fn test_rewrite_query_for_parquet_union() {
-        // UNION queries should have both sides replaced
-        let config = ParquetConfig {
-            enabled: true,
-            data_dir: Some("/data".to_string()),
-            chain_id: Some(1),
-            max_parquet_block: Some(1000000),
-        };
-
-        let sql = "SELECT address FROM logs WHERE block_num < 1000 \
-                   UNION ALL \
-                   SELECT address FROM logs WHERE block_num >= 1000";
-        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
-
-        // Count occurrences of read_parquet - should be 2
-        let count = rewritten.matches("read_parquet('/data/1/logs_*.parquet') r").count();
-        assert_eq!(count, 2, "Both UNION sides should be replaced: {}", rewritten);
-        // Address columns should be replaced with r['address']
-        assert!(rewritten.contains("r['address']"), "address not replaced: {}", rewritten);
-    }
 
     #[test]
     fn test_parquet_config_default() {

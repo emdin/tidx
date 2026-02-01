@@ -1,14 +1,17 @@
 //! Tests for Parquet export functionality
+//!
+//! These tests verify that pg_parquet COPY TO PARQUET works for exporting data.
+//! OLAP queries are handled by tidx's native in-process DuckDB engine.
 
 mod common;
 
 use common::testdb::TestDb;
 use tempfile::TempDir;
 
-/// Test that COPY TO PARQUET works via pg_duckdb
-/// pg_duckdb intercepts COPY commands with FORMAT 'parquet' and routes them through DuckDB
+/// Test that COPY TO PARQUET works via pg_parquet
+/// pg_parquet intercepts COPY commands with FORMAT 'parquet'
 #[tokio::test]
-async fn test_parquet_export_via_pg_duckdb() {
+async fn test_parquet_export_via_pg_parquet() {
     let db = TestDb::new().await;
     
     // Skip if no logs
@@ -24,8 +27,7 @@ async fn test_parquet_export_via_pg_duckdb() {
 
     let conn = db.pool.get().await.expect("Failed to get connection");
 
-    // Try pg_duckdb's COPY TO syntax with parquet format
-    // This uses PostgreSQL's COPY syntax which pg_duckdb intercepts for parquet
+    // Use pg_parquet's COPY TO syntax with parquet format
     let copy_sql = format!(
         "COPY (SELECT block_num, tx_idx, log_idx, tx_hash, address, \
          topic0, topic1, topic2, topic3, data FROM logs \
@@ -34,21 +36,6 @@ async fn test_parquet_export_via_pg_duckdb() {
     );
 
     let result = conn.execute(&copy_sql, &[]).await;
-
-    // If standard COPY fails, try raw_query fallback
-    let result: Result<(), _> = match result {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            println!("Standard COPY failed: {}, trying raw_query fallback", e);
-            let duckdb_query = format!(
-                "COPY (SELECT block_num, tx_idx, log_idx, tx_hash, address, \
-                 topic0, topic1, topic2, topic3, data FROM logs \
-                 ORDER BY block_num, log_idx LIMIT 100) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                escaped_path
-            );
-            conn.execute("SELECT duckdb.raw_query($1)", &[&duckdb_query]).await.map(|_| ())
-        }
-    };
 
     match result {
         Ok(_) => {
@@ -65,24 +52,10 @@ async fn test_parquet_export_via_pg_duckdb() {
             let row_count = read_parquet_row_count(&parquet_path);
             println!("Exported {} rows to Parquet", row_count);
             assert!(row_count > 0, "Should export at least one row");
-
-            // Verify we can read it back via read_parquet
-            let read_query = format!(
-                "SELECT COUNT(*)::bigint FROM read_parquet('{}')",
-                path_str
-            );
-            let read_result = conn
-                .execute("SELECT duckdb.raw_query($1)", &[&read_query])
-                .await;
-
-            match read_result {
-                Ok(_) => println!("Successfully read parquet file via DuckDB"),
-                Err(e) => println!("Warning: read_parquet failed: {}", e),
-            }
         }
         Err(e) => {
             println!("Parquet export failed: {}", e);
-            println!("This test requires pg_duckdb extension to be installed");
+            println!("This test requires pg_parquet extension to be installed");
         }
     }
 }
@@ -129,12 +102,12 @@ async fn test_compress_tick() {
     let chain_dir = temp_dir.path().join("1");
     std::fs::create_dir_all(&chain_dir).expect("Failed to create chain dir");
 
-    // Test COPY syntax with parquet format (tick_compress is private)
+    // Test COPY syntax with parquet format
     let parquet_path = chain_dir.join("logs_1_10.parquet");
     let path_str = parquet_path.to_string_lossy();
     let escaped_path = path_str.replace('\'', "''");
 
-    // Try pg_duckdb's COPY TO syntax first
+    // Use pg_parquet's COPY TO syntax
     let copy_sql = format!(
         "COPY (SELECT block_num, tx_idx, log_idx, tx_hash, address, \
          topic0, topic1, topic2, topic3, data FROM logs \
@@ -145,21 +118,6 @@ async fn test_compress_tick() {
 
     let result = conn.execute(&copy_sql, &[]).await;
 
-    // Fallback to raw_query if standard COPY fails
-    let result: Result<(), _> = match result {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let duckdb_query = format!(
-                "COPY (SELECT block_num, tx_idx, log_idx, tx_hash, address, \
-                 topic0, topic1, topic2, topic3, data FROM logs \
-                 WHERE block_num >= 1 AND block_num <= 10 \
-                 ORDER BY block_num, log_idx) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                escaped_path
-            );
-            conn.execute("SELECT duckdb.raw_query($1)", &[&duckdb_query]).await.map(|_| ())
-        }
-    };
-
     match result {
         Ok(_) => {
             assert!(parquet_path.exists(), "File should be created");
@@ -167,15 +125,16 @@ async fn test_compress_tick() {
             println!("Exported {} rows", row_count);
         }
         Err(e) => {
-            println!("Export failed (expected if pg_duckdb not configured): {}", e);
+            println!("Export failed (expected if pg_parquet not configured): {}", e);
         }
     }
 }
 
-/// Test that duckdb.query() wrapper enables normal column access from parquet.
-/// This is the integration test for the query rewriting approach.
+/// Test that native DuckDB engine can query exported Parquet files
 #[tokio::test]
-async fn test_duckdb_query_wrapper_for_parquet() {
+async fn test_native_duckdb_reads_parquet() {
+    use tidx::duckdb::DuckDbEngine;
+    
     let db = TestDb::new().await;
     
     // Skip if no logs
@@ -185,15 +144,18 @@ async fn test_duckdb_query_wrapper_for_parquet() {
     }
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let parquet_path = temp_dir.path().join("logs_test.parquet");
+    let chain_dir = temp_dir.path().join("1");
+    std::fs::create_dir_all(&chain_dir).expect("Failed to create chain dir");
+    
+    let parquet_path = chain_dir.join("logs_1_1000.parquet");
     let path_str = parquet_path.to_string_lossy();
 
     let conn = db.pool.get().await.expect("Failed to get connection");
 
-    // First, export some logs to parquet using pg_parquet
+    // Export logs to parquet via pg_parquet
     let copy_sql = format!(
-        "COPY (SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, \
-         selector, topic0, topic1, topic2, topic3, data FROM logs \
+        "COPY (SELECT block_num, tx_idx, log_idx, tx_hash, address, \
+         topic0, topic1, topic2, topic3, data FROM logs \
          ORDER BY block_num, log_idx LIMIT 100) TO '{}' WITH (FORMAT 'parquet', COMPRESSION 'zstd')",
         path_str
     );
@@ -206,37 +168,22 @@ async fn test_duckdb_query_wrapper_for_parquet() {
 
     assert!(parquet_path.exists(), "Parquet file should exist after export");
 
-    // Test the duckdb.query() wrapper approach - this is what rewrite_query_for_parquet generates
-    // Using SELECT * FROM duckdb.query(...) auto-expands the columns
-    let wrapper_query = format!(
-        "SELECT * FROM duckdb.query($duckdb$
-            SELECT address, COUNT(*) as cnt 
-            FROM read_parquet('{}') 
-            GROUP BY address 
-            ORDER BY cnt DESC 
-            LIMIT 5
-        $duckdb$)",
-        path_str
-    );
+    // Create native DuckDB engine and query the parquet file
+    let engine = DuckDbEngine::new(temp_dir.path().to_path_buf(), 1)
+        .expect("Failed to create DuckDB engine");
 
-    let result = conn.query(&wrapper_query, &[]).await;
-
+    // Query using the logs view (which points to parquet files)
+    let result = engine.query("SELECT COUNT(*) as cnt FROM logs", None);
+    
     match result {
-        Ok(rows) => {
-            println!("Query returned {} rows", rows.len());
-            assert!(!rows.is_empty(), "Should return at least one row");
-            
-            // Verify we can access columns normally
-            for row in &rows {
-                let _address: Vec<u8> = row.get(0);
-                let count: i64 = row.get(1);
-                assert!(count > 0, "Count should be positive");
-            }
-            println!("SUCCESS: duckdb.query() wrapper enables normal column access from parquet");
+        Ok(r) => {
+            println!("Native DuckDB query returned {} rows", r.row_count);
+            assert_eq!(r.row_count, 1, "Should return one row for COUNT(*)");
+            assert!(r.rows[0][0].as_i64().unwrap_or(0) > 0, "Count should be positive");
+            println!("SUCCESS: Native DuckDB engine can query Parquet files");
         }
         Err(e) => {
-            // pg_duckdb not installed is acceptable
-            println!("Query failed (may need pg_duckdb): {}", e);
+            println!("Query failed: {}", e);
         }
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tidx::config::Config;
 use tidx::db;
-use tidx::service::{self, execute_query, PgDuckdbConfig, QueryOptions};
+use tidx::service::{self, execute_query_postgres, QueryOptions};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -72,17 +72,17 @@ pub async fn run(args: Args) -> Result<()> {
         limit: args.limit,
     };
 
-    let pg_duckdb_config = PgDuckdbConfig {
-        memory_limit: chain.pg_duckdb_memory_limit.clone(),
-        threads: chain.pg_duckdb_threads,
-    };
-    let result = execute_query(
+    // CLI currently only supports PostgreSQL engine
+    // For DuckDB queries on parquet, use the HTTP API with engine=duckdb
+    if args.engine.as_deref() == Some("duckdb") {
+        anyhow::bail!("DuckDB engine not available in CLI. Use HTTP API with engine=duckdb for parquet queries.");
+    }
+
+    let result = execute_query_postgres(
         &pool,
         &args.sql,
         args.signature.as_deref(),
         &options,
-        &pg_duckdb_config,
-        args.engine.as_deref(),
     )
     .await?;
 

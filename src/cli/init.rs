@@ -58,7 +58,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let pg_url: String = Input::new()
-        .with_prompt("PostgreSQL URL (requires pg_duckdb extension)")
+        .with_prompt("PostgreSQL URL")
         .default("postgres://localhost:5432/tidx".to_string())
         .interact_text()?;
 
@@ -73,7 +73,7 @@ pub fn run(args: Args) -> Result<()> {
 
     println!("\n✅ Config written to {}", args.output.display());
     println!("\nNext steps:");
-    println!("  1. Start PostgreSQL (with pg_duckdb extension if enabled)");
+    println!("  1. Start PostgreSQL");
     println!("  2. Run: tidx up");
     println!("  3. Query: curl \"http://localhost:{http_port}/query?chainId={chain_id}&sql=SELECT * FROM blocks LIMIT 5\"");
 

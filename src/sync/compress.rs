@@ -5,8 +5,8 @@
 //!
 //! 1. PostgreSQL heap tables store recent data for fast writes
 //! 2. This job exports old, contiguous ranges to Parquet files
-//! 3. pg_duckdb + read_parquet() queries the archived data
-//! 4. Query layer combines PG heap + Parquet sources via UNION ALL
+//! 3. Native in-process DuckDB queries the archived Parquet data
+//! 4. Query layer routes to Postgres (realtime) or DuckDB (analytics)
 
 use anyhow::Result;
 use std::path::PathBuf;

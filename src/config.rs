@@ -171,14 +171,6 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
-    /// pg_duckdb memory limit (e.g., "16GB")
-    #[serde(default)]
-    pub pg_duckdb_memory_limit: Option<String>,
-
-    /// pg_duckdb thread count
-    #[serde(default)]
-    pub pg_duckdb_threads: Option<u32>,
-
     /// Parquet export settings (for archiving old logs to columnar format)
     #[serde(default, alias = "compress")]
     pub parquet: Option<ParquetExportConfig>,
@@ -251,23 +243,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chain_config_with_pg_duckdb_settings() {
-        let toml_str = r#"
-            name = "test"
-            chain_id = 1
-            rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
-            pg_duckdb_memory_limit = "16GB"
-            pg_duckdb_threads = 8
-        "#;
-        
-        let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        
-        assert_eq!(config.pg_duckdb_memory_limit, Some("16GB".to_string()));
-        assert_eq!(config.pg_duckdb_threads, Some(8));
-    }
-
-    #[test]
     fn test_chain_config_defaults() {
         let toml_str = r#"
             name = "test"
@@ -299,7 +274,6 @@ mod tests {
             chain_id = 1
             rpc_url = "http://localhost:8545"
             pg_url = "postgres://localhost/chain1"
-            pg_duckdb_memory_limit = "8GB"
             
             [[chains]]
             name = "chain2"
@@ -311,8 +285,6 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         
         assert_eq!(config.chains.len(), 2);
-        assert_eq!(config.chains[0].pg_duckdb_memory_limit, Some("8GB".to_string()));
-        assert_eq!(config.chains[1].pg_duckdb_memory_limit, None);
     }
 
     #[test]

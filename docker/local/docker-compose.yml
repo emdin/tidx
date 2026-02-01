@@ -1,9 +1,9 @@
 services:
   postgres:
     build:
-      context: ../postgres-pgduckdb
+      context: ../postgres-parquet
       dockerfile: Dockerfile
-    image: ghcr.io/tempoxyz/postgres-pgduckdb-tidx:latest
+    image: ghcr.io/tempoxyz/postgres-parquet:latest
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: tidx
@@ -16,8 +16,6 @@ services:
       - parquet_data:/data  # Parquet files for archived logs
     command:
       - postgres
-      - -c
-      - shared_preload_libraries=pg_duckdb
       - -c
       - max_wal_size=4GB
       - -c
@@ -68,7 +66,7 @@ services:
       - "9090:9090"   # Prometheus metrics
     volumes:
       - ./config.toml:/config.toml:ro
-      - parquet_data:/data  # Shared Parquet storage (tidx writes, pg_duckdb reads)
+      - parquet_data:/data  # Shared Parquet storage (tidx writes, native DuckDB reads)
     depends_on:
       postgres:
         condition: service_healthy
@@ -108,4 +106,4 @@ services:
 
 volumes:
   postgres_data:
-  parquet_data:  # Shared volume for Parquet files (tidx compress → pg_duckdb query)
+  parquet_data:  # Shared volume for Parquet files (tidx compress → DuckDB query)

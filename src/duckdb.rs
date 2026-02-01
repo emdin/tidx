@@ -1,7 +1,7 @@
 //! Native DuckDB engine for Parquet queries
 //!
-//! Provides a clean DuckDB query interface for parquet files without the quirks
-//! of pg_duckdb's r['col'] syntax. Uses the same abi_* UDFs as the DuckDB extension.
+//! Provides a clean DuckDB query interface for parquet files with native Rust
+//! ABI decoding UDFs for optimal performance.
 
 use alloy::primitives::{Address, FixedBytes, U256};
 use anyhow::{anyhow, Result};

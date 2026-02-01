@@ -857,14 +857,10 @@ async fn test_seeded_receipt_stats() {
 // Query service integration tests - routes through service layer
 // ============================================================================
 
-use tidx::service::{execute_query, PgDuckdbConfig, QueryOptions};
+use tidx::service::{execute_query_postgres, QueryOptions};
 
 fn default_options() -> QueryOptions {
     QueryOptions { timeout_ms: 5000, limit: 1000 }
-}
-
-fn default_pg_duckdb_config() -> PgDuckdbConfig {
-    PgDuckdbConfig::default()
 }
 
 #[tokio::test]
@@ -872,15 +868,12 @@ fn default_pg_duckdb_config() -> PgDuckdbConfig {
 async fn test_query_blocks_postgres() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    let result = execute_query(
+    let result = execute_query_postgres(
         &db.pool,
         "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 5",
         None,
         &opts,
-        &analytics,
-        Some("postgres"),
     )
     .await
     .expect("Query failed");
@@ -896,15 +889,12 @@ async fn test_query_blocks_postgres() {
 async fn test_query_txs_point_lookup() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    let result = execute_query(
+    let result = execute_query_postgres(
         &db.pool,
         "SELECT block_num, hash, \"from\" FROM txs WHERE block_num = 1 LIMIT 10",
         None,
         &opts,
-        &analytics,
-        None, // Auto-route: point lookup -> postgres
     )
     .await
     .expect("Query failed");
@@ -917,15 +907,12 @@ async fn test_query_txs_point_lookup() {
 async fn test_query_logs_with_event_signature() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    let result = execute_query(
+    let result = execute_query_postgres(
         &db.pool,
         "SELECT * FROM transfer LIMIT 10",
         Some("Transfer(address indexed from, address indexed to, uint256 value)"),
         &opts,
-        &analytics,
-        Some("postgres"),
     )
     .await
     .expect("Query with signature CTE failed");
@@ -942,15 +929,12 @@ async fn test_query_logs_with_event_signature() {
 async fn test_query_receipts() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    let result = execute_query(
+    let result = execute_query_postgres(
         &db.pool,
         "SELECT block_num, tx_idx, status, gas_used FROM receipts LIMIT 10",
         None,
         &opts,
-        &analytics,
-        Some("postgres"),
     )
     .await
     .expect("Query failed");
@@ -964,15 +948,12 @@ async fn test_query_receipts() {
 async fn test_query_rejects_non_select() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    let result = execute_query(
+    let result = execute_query_postgres(
         &db.pool,
         "DELETE FROM blocks",
         None,
         &opts,
-        &analytics,
-        None,
     )
     .await;
 
@@ -985,15 +966,12 @@ async fn test_query_rejects_non_select() {
 async fn test_query_rejects_forbidden_keywords() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    let result = execute_query(
+    let result = execute_query_postgres(
         &db.pool,
         "SELECT * FROM blocks; DROP TABLE blocks;",
         None,
         &opts,
-        &analytics,
-        None,
     )
     .await;
 
@@ -1007,16 +985,13 @@ async fn test_query_rejects_forbidden_keywords() {
 async fn test_query_explicit_engine_hint() {
     let db = TestDb::new().await;
     let opts = default_options();
-    let analytics = default_pg_duckdb_config();
 
-    // Force postgres even for OLAP query
-    let result = execute_query(
+    // PostgreSQL is now the only engine for postgres queries
+    let result = execute_query_postgres(
         &db.pool,
-        "/* engine=postgres */ SELECT COUNT(*) FROM blocks GROUP BY miner",
+        "SELECT COUNT(*) FROM blocks GROUP BY miner",
         None,
         &opts,
-        &analytics,
-        None,
     )
     .await
     .expect("Query failed");

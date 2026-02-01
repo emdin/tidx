@@ -18,10 +18,6 @@ backfill = true
 batch_size = 500
 concurrency = 8
 
-# pg_duckdb settings for OLAP queries
-pg_duckdb_memory_limit = "16GB"
-pg_duckdb_threads = 8
-
 [[chains]]
 name = "mainnet"
 chain_id = 4217
@@ -30,5 +26,3 @@ pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 backfill = true
 batch_size = 500
 concurrency = 8
-pg_duckdb_memory_limit = "16GB"
-pg_duckdb_threads = 8
