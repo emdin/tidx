@@ -228,20 +228,17 @@ fn spawn_sync_engine(
     let pool_for_parquet = throttled_pool.pool.clone();
     let parquet_shutdown = shutdown_rx.resubscribe();
     let block_updates = broadcaster.subscribe();
-    let pg_url_for_parquet = chain.pg_url.clone();
 
     tokio::spawn(async move {
         // Spawn Parquet export task if enabled
         if let Some(ref config) = parquet_export_config {
             if config.enabled {
                 let config = config.clone();
-                let pg_url = pg_url_for_parquet.clone();
                 tokio::spawn(async move {
                     if let Err(e) = tidx::sync::compress::run_compress_loop(
                         pool_for_parquet,
                         chain_id,
                         config,
-                        pg_url,
                         parquet_shutdown,
                         block_updates,
                     )

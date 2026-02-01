@@ -35,7 +35,6 @@ pub async fn run_compress_loop(
     pool: Pool,
     chain_id: u64,
     config: ParquetExportConfig,
-    pg_url: String,
     mut shutdown: broadcast::Receiver<()>,
     mut block_updates: broadcast::Receiver<BlockUpdate>,
 ) -> Result<()> {
@@ -65,7 +64,7 @@ pub async fn run_compress_loop(
 
     // Export any existing backlog immediately on startup
     loop {
-        match tick_compress(&pool, chain_id, &config, &chain_dir, &pg_url).await {
+        match tick_compress(&pool, chain_id, &config, &chain_dir).await {
             Ok(true) => {
                 tokio::task::yield_now().await;
             }
@@ -91,13 +90,13 @@ pub async fn run_compress_loop(
                 match result {
                     Ok(update) if update.chain_id == chain_id => {
                         // Update staging file with latest data
-                        if let Err(e) = update_staging(&pool, chain_id, &chain_dir, &pg_url).await {
+                        if let Err(e) = update_staging(&pool, chain_id, &chain_dir).await {
                             debug!(error = %e, chain_id = chain_id, "Staging update failed");
                         }
 
                         // Check if we can finalize any ranges
                         loop {
-                            match tick_compress(&pool, chain_id, &config, &chain_dir, &pg_url).await {
+                            match tick_compress(&pool, chain_id, &config, &chain_dir).await {
                                 Ok(true) => {
                                     tokio::task::yield_now().await;
                                 }
@@ -130,7 +129,6 @@ async fn update_staging(
     pool: &Pool,
     chain_id: u64,
     data_dir: &PathBuf,
-    pg_url: &str,
 ) -> Result<()> {
     let conn = pool.get().await?;
 
@@ -165,7 +163,7 @@ async fn update_staging(
     let staging_path = data_dir.join(format!("{}_staging.parquet", table_type.as_str()));
     
     // Export staging file (overwrites previous)
-    match export_table_to_parquet(pool, table_type, start_block, tip_num, &staging_path, pg_url).await {
+    match export_table_to_parquet(pool, table_type, start_block, tip_num, &staging_path).await {
         Ok((row_count, _)) => {
             debug!(
                 chain_id = chain_id,
@@ -250,7 +248,6 @@ async fn tick_compress(
     chain_id: u64,
     config: &ParquetExportConfig,
     data_dir: &PathBuf,
-    pg_url: &str,
 ) -> Result<bool> {
     let conn = pool.get().await?;
 
@@ -317,7 +314,7 @@ async fn tick_compress(
         // Export to Parquet
         let file_path = data_dir.join(format!("{}_{}_{}.parquet", table_type.as_str(), start_block, end_block));
         let (row_count, file_size) =
-            export_table_to_parquet(pool, *table_type, start_block, end_block, &file_path, pg_url).await?;
+            export_table_to_parquet(pool, *table_type, start_block, end_block, &file_path).await?;
 
         // Record the exported range
         record_parquet_range(
@@ -438,86 +435,43 @@ async fn find_contiguous_range(
     Ok(Some((start, end_block)))
 }
 
-/// Get the SELECT query for a table type
-fn get_table_select_query(table_type: TableType, start_block: u64, end_block: u64) -> String {
-    match table_type {
-        TableType::Blocks => format!(
-            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data \
-             FROM pg.public.blocks WHERE num >= {} AND num <= {} ORDER BY num",
-            start_block, end_block
-        ),
-        TableType::Txs => format!(
-            "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input, \
-             gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce, \
-             fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type \
-             FROM pg.public.txs WHERE block_num >= {} AND block_num <= {} ORDER BY block_num, idx",
-            start_block, end_block
-        ),
-        TableType::Receipts => format!(
-            "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address, \
-             gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer \
-             FROM pg.public.receipts WHERE block_num >= {} AND block_num <= {} ORDER BY block_num, tx_idx",
-            start_block, end_block
-        ),
-        TableType::Logs => format!(
-            "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, \
-             topic0, topic1, topic2, topic3, data \
-             FROM pg.public.logs WHERE block_num >= {} AND block_num <= {} ORDER BY block_num, log_idx",
-            start_block, end_block
-        ),
-    }
-}
-
-/// Export a table from PostgreSQL to Parquet using DuckDB's postgres extension
+/// Export a table from PostgreSQL to Parquet using pg_parquet extension
 ///
-/// Since pg_duckdb's raw_query runs in an isolated DuckDB context without direct
-/// access to PostgreSQL tables, we use DuckDB's postgres extension to ATTACH back
-/// to the PostgreSQL database and export from there.
+/// pg_parquet uses PostgreSQL's native query planner, which means:
+/// - It uses indexes (e.g., idx_logs_block_num) for efficient filtering
+/// - Only matching rows are scanned, not the entire table
+/// - Much faster than DuckDB's postgres extension for filtered exports
 async fn export_table_to_parquet(
     pool: &Pool,
     table_type: TableType,
     start_block: u64,
     end_block: u64,
     file_path: &PathBuf,
-    pg_url: &str,
 ) -> Result<(u64, u64)> {
     let conn = pool.get().await?;
     let path_str = file_path.to_string_lossy();
 
-    // Escape single quotes in path and connection string for DuckDB SQL
-    let escaped_path = path_str.replace('\'', "''");
+    // Escape single quotes in path for SQL safety
+    let path_escaped = path_str.replace('\'', "''");
 
-    // Convert postgres:// URL to DuckDB's expected format
-    // postgres://user:pass@host:port/db -> host=host port=port dbname=db user=user password=pass
-    let duckdb_conn_str = convert_pg_url_to_duckdb(pg_url);
-    let escaped_conn_str = duckdb_conn_str.replace('\'', "''");
+    // Build the SELECT query for this table type
+    let select_query = get_table_select_query_native(table_type, start_block, end_block);
 
-    // Get the SELECT query for this table type
-    let select_query = get_table_select_query(table_type, start_block, end_block);
-
-    // Use DuckDB's postgres extension to connect back to PostgreSQL and export
-    // This works because raw_query can use the postgres extension to access PG tables
-    // Note: We use ATTACH IF NOT EXISTS because pg_duckdb may reuse DuckDB contexts
-    let duckdb_query = format!(
-        "INSTALL postgres; \
-         LOAD postgres; \
-         ATTACH IF NOT EXISTS '{}' AS pg (TYPE postgres, READ_ONLY); \
-         COPY ({}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD);",
-        escaped_conn_str, select_query, escaped_path
+    // Use pg_parquet's native COPY TO command
+    // This uses PostgreSQL's query planner with indexes for efficient filtering
+    let copy_query = format!(
+        "COPY ({}) TO '{}' WITH (FORMAT parquet, COMPRESSION 'zstd')",
+        select_query, path_escaped
     );
 
-    conn.execute("SELECT duckdb.raw_query($1)", &[&duckdb_query])
+    conn.execute(&copy_query, &[])
         .await
         .map_err(|e| {
-            error!(error = %e, table = table_type.as_str(), "Parquet export via postgres extension failed");
+            error!(error = %e, table = table_type.as_str(), "Parquet export via pg_parquet failed");
             e
         })?;
 
     // Get file size and row count from parquet metadata
-    // Note: file is written by postgres container, but shared via volume mount
-    // We need to wait a moment for the file to be visible
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     let file_size = std::fs::metadata(file_path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -528,7 +482,40 @@ async fn export_table_to_parquet(
     Ok((row_count, file_size))
 }
 
+/// Get SELECT query for native PostgreSQL COPY (no pg. prefix)
+fn get_table_select_query_native(table_type: TableType, start_block: u64, end_block: u64) -> String {
+    match table_type {
+        TableType::Blocks => format!(
+            "SELECT num, hash, parent_hash, timestamp, gas_limit, gas_used, base_fee_per_gas, \
+             withdrawals_root, blob_gas_used, excess_blob_gas \
+             FROM blocks WHERE num >= {} AND num <= {} ORDER BY num",
+            start_block, end_block
+        ),
+        TableType::Txs => format!(
+            "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input, \
+             gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce, \
+             fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type \
+             FROM txs WHERE block_num >= {} AND block_num <= {} ORDER BY block_num, idx",
+            start_block, end_block
+        ),
+        TableType::Receipts => format!(
+            "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address, \
+             gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer \
+             FROM receipts WHERE block_num >= {} AND block_num <= {} ORDER BY block_num, tx_idx",
+            start_block, end_block
+        ),
+        TableType::Logs => format!(
+            "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, \
+             topic0, topic1, topic2, topic3, data \
+             FROM logs WHERE block_num >= {} AND block_num <= {} ORDER BY block_num, log_idx",
+            start_block, end_block
+        ),
+    }
+}
+
 /// Convert a PostgreSQL URL to DuckDB's libpq connection string format
+/// Note: Currently unused since switching to pg_parquet, but kept for potential future use
+#[allow(dead_code)]
 fn convert_pg_url_to_duckdb(pg_url: &str) -> String {
     // Parse postgres://user:password@host:port/database
     // Return: host=host port=port dbname=database user=user password=password
@@ -681,68 +668,40 @@ mod tests {
     }
 
     #[test]
-    fn test_get_table_select_query_blocks() {
-        let query = get_table_select_query(TableType::Blocks, 100, 200);
-        assert!(query.contains("FROM pg.public.blocks"));
+    fn test_get_table_select_query_native_blocks() {
+        let query = get_table_select_query_native(TableType::Blocks, 100, 200);
+        assert!(query.contains("FROM blocks"));
         assert!(query.contains("num >= 100"));
         assert!(query.contains("num <= 200"));
         assert!(query.contains("ORDER BY num"));
     }
 
     #[test]
-    fn test_get_table_select_query_txs() {
-        let query = get_table_select_query(TableType::Txs, 100, 200);
-        assert!(query.contains("FROM pg.public.txs"));
+    fn test_get_table_select_query_native_txs() {
+        let query = get_table_select_query_native(TableType::Txs, 100, 200);
+        assert!(query.contains("FROM txs"));
         assert!(query.contains("block_num >= 100"));
         assert!(query.contains("block_num <= 200"));
         assert!(query.contains("ORDER BY block_num, idx"));
     }
 
     #[test]
-    fn test_get_table_select_query_receipts() {
-        let query = get_table_select_query(TableType::Receipts, 100, 200);
-        assert!(query.contains("FROM pg.public.receipts"));
+    fn test_get_table_select_query_native_receipts() {
+        let query = get_table_select_query_native(TableType::Receipts, 100, 200);
+        assert!(query.contains("FROM receipts"));
         assert!(query.contains("block_num >= 100"));
         assert!(query.contains("block_num <= 200"));
         assert!(query.contains("ORDER BY block_num, tx_idx"));
     }
 
     #[test]
-    fn test_get_table_select_query_logs() {
-        let query = get_table_select_query(TableType::Logs, 100, 200);
-        assert!(query.contains("FROM pg.public.logs"));
+    fn test_get_table_select_query_native_logs() {
+        let query = get_table_select_query_native(TableType::Logs, 100, 200);
+        assert!(query.contains("FROM logs"));
         assert!(query.contains("block_num >= 100"));
         assert!(query.contains("block_num <= 200"));
         assert!(query.contains("ORDER BY block_num, log_idx"));
         assert!(query.contains("block_timestamp"));
         assert!(query.contains("selector"));
-    }
-
-    #[test]
-    fn test_convert_pg_url_to_duckdb() {
-        let url = "postgres://user:pass@localhost:5432/mydb";
-        let result = convert_pg_url_to_duckdb(url);
-        assert!(result.contains("user=user"));
-        assert!(result.contains("password=pass"));
-        assert!(result.contains("host=localhost"));
-        assert!(result.contains("port=5432"));
-        assert!(result.contains("dbname=mydb"));
-    }
-
-    #[test]
-    fn test_convert_pg_url_to_duckdb_no_port() {
-        let url = "postgres://user:pass@localhost/mydb";
-        let result = convert_pg_url_to_duckdb(url);
-        assert!(result.contains("user=user"));
-        assert!(result.contains("host=localhost"));
-        assert!(result.contains("dbname=mydb"));
-    }
-
-    #[test]
-    fn test_convert_pg_url_postgresql_scheme() {
-        let url = "postgresql://user:pass@localhost:5432/mydb";
-        let result = convert_pg_url_to_duckdb(url);
-        assert!(result.contains("user=user"));
-        assert!(result.contains("host=localhost"));
     }
 }

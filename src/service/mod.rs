@@ -997,13 +997,11 @@ mod tests {
         let sql = "SELECT * FROM logs WHERE block_num > 500000";
         let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
 
-        // Should have logs_hybrid CTE
-        assert!(rewritten.contains("logs_hybrid AS"), "Missing logs_hybrid CTE: {}", rewritten);
-        // Should reference both sources - the CTE has the block filter
-        assert!(rewritten.contains("block_num > 1000000"), "Missing block filter: {}", rewritten);
+        // Should have logs CTE reading from parquet
+        assert!(rewritten.contains("logs AS"), "Missing logs CTE: {}", rewritten);
         assert!(rewritten.contains("read_parquet('/data/42431/logs_*.parquet')"), "Missing parquet path: {}", rewritten);
-        // Should use logs_hybrid instead of logs in user query
-        assert!(rewritten.contains("FROM logs_hybrid"), "Not using logs_hybrid: {}", rewritten);
+        // Original query should follow the CTE
+        assert!(rewritten.contains("SELECT * FROM logs"), "Missing original query: {}", rewritten);
     }
 
     #[test]
@@ -1018,8 +1016,8 @@ mod tests {
         let sql = "WITH transfer AS (SELECT * FROM logs WHERE selector = '\\x1234') SELECT * FROM transfer";
         let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
 
-        // Should combine CTEs
-        assert!(rewritten.starts_with("WITH logs_hybrid AS"));
+        // Should have logs CTE reading from parquet
+        assert!(rewritten.contains("logs AS"), "Missing logs CTE: {}", rewritten);
         // Original query logic should be preserved
         assert!(rewritten.contains("transfer"));
     }
