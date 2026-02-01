@@ -311,9 +311,9 @@ fn rewrite_query_for_parquet(sql: &str, config: &ParquetConfig) -> Result<String
     let sql_with_parquet = replace_tables_with_parquet(sql, data_dir, chain_id);
 
     // Wrap in duckdb.query() to run entirely in DuckDB context
-    // The outer 'SELECT r.*' exposes columns with normal names
+    // Using SELECT * FROM duckdb.query(...) without alias auto-expands columns
     let wrapped = format!(
-        "SELECT r.* FROM duckdb.query($duckdb${}$duckdb$) AS r",
+        "SELECT * FROM duckdb.query($duckdb${}$duckdb$)",
         sql_with_parquet
     );
 
@@ -1020,9 +1020,8 @@ mod tests {
         // Should wrap in duckdb.query() with read_parquet
         assert!(rewritten.contains("duckdb.query("), "Missing duckdb.query wrapper: {}", rewritten);
         assert!(rewritten.contains("read_parquet('/data/42431/logs_*.parquet')"), "Missing parquet path: {}", rewritten);
-        // Outer wrapper for column access
-        assert!(rewritten.contains("SELECT r.* FROM"), "Missing outer SELECT r.*: {}", rewritten);
-        assert!(rewritten.contains("AS r"), "Missing AS r alias: {}", rewritten);
+        // Outer wrapper auto-expands columns
+        assert!(rewritten.contains("SELECT * FROM duckdb.query"), "Missing outer SELECT *: {}", rewritten);
     }
 
     #[test]
@@ -1043,8 +1042,8 @@ mod tests {
         // Inner query should have read_parquet
         assert!(rewritten.contains("FROM read_parquet('/data/4217/logs_*.parquet')"), 
             "Missing FROM read_parquet: {}", rewritten);
-        // Outer wrapper
-        assert!(rewritten.contains("SELECT r.* FROM"), "Missing outer wrapper: {}", rewritten);
+        // Outer wrapper auto-expands columns
+        assert!(rewritten.contains("SELECT * FROM duckdb.query"), "Missing outer wrapper: {}", rewritten);
     }
 
     #[test]

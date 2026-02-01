@@ -207,15 +207,15 @@ async fn test_duckdb_query_wrapper_for_parquet() {
     assert!(parquet_path.exists(), "Parquet file should exist after export");
 
     // Test the duckdb.query() wrapper approach - this is what rewrite_query_for_parquet generates
-    // The inner query uses read_parquet, outer wrapper uses SELECT r.* for column access
+    // Using SELECT * FROM duckdb.query(...) auto-expands the columns
     let wrapper_query = format!(
-        "SELECT r.* FROM duckdb.query($duckdb$
+        "SELECT * FROM duckdb.query($duckdb$
             SELECT address, COUNT(*) as cnt 
             FROM read_parquet('{}') 
             GROUP BY address 
             ORDER BY cnt DESC 
             LIMIT 5
-        $duckdb$) AS r",
+        $duckdb$)",
         path_str
     );
 
