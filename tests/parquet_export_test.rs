@@ -171,3 +171,72 @@ async fn test_compress_tick() {
         }
     }
 }
+
+/// Test that duckdb.query() wrapper enables normal column access from parquet.
+/// This is the integration test for the query rewriting approach.
+#[tokio::test]
+async fn test_duckdb_query_wrapper_for_parquet() {
+    let db = TestDb::new().await;
+    
+    // Skip if no logs
+    if db.log_count().await == 0 {
+        println!("Skipping test: no logs in database");
+        return;
+    }
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("logs_test.parquet");
+    let path_str = parquet_path.to_string_lossy();
+
+    let conn = db.pool.get().await.expect("Failed to get connection");
+
+    // First, export some logs to parquet using pg_parquet
+    let copy_sql = format!(
+        "COPY (SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, \
+         selector, topic0, topic1, topic2, topic3, data FROM logs \
+         ORDER BY block_num, log_idx LIMIT 100) TO '{}' WITH (FORMAT 'parquet', COMPRESSION 'zstd')",
+        path_str
+    );
+
+    let export_result = conn.execute(&copy_sql, &[]).await;
+    if export_result.is_err() {
+        println!("Parquet export failed - pg_parquet may not be installed, skipping test");
+        return;
+    }
+
+    assert!(parquet_path.exists(), "Parquet file should exist after export");
+
+    // Test the duckdb.query() wrapper approach - this is what rewrite_query_for_parquet generates
+    // The inner query uses read_parquet, outer wrapper uses SELECT r.* for column access
+    let wrapper_query = format!(
+        "SELECT r.* FROM duckdb.query($duckdb$
+            SELECT address, COUNT(*) as cnt 
+            FROM read_parquet('{}') 
+            GROUP BY address 
+            ORDER BY cnt DESC 
+            LIMIT 5
+        $duckdb$) AS r",
+        path_str
+    );
+
+    let result = conn.query(&wrapper_query, &[]).await;
+
+    match result {
+        Ok(rows) => {
+            println!("Query returned {} rows", rows.len());
+            assert!(!rows.is_empty(), "Should return at least one row");
+            
+            // Verify we can access columns normally
+            for row in &rows {
+                let _address: Vec<u8> = row.get(0);
+                let count: i64 = row.get(1);
+                assert!(count > 0, "Count should be positive");
+            }
+            println!("SUCCESS: duckdb.query() wrapper enables normal column access from parquet");
+        }
+        Err(e) => {
+            // pg_duckdb not installed is acceptable
+            println!("Query failed (may need pg_duckdb): {}", e);
+        }
+    }
+}

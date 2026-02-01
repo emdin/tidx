@@ -293,43 +293,58 @@ fn query_references_logs(sql: &str) -> bool {
     sql_upper.contains("FROM LOGS") || sql_upper.contains("JOIN LOGS")
 }
 
-/// Rewrite a query to use Parquet files instead of PostgreSQL logs table.
-/// Since pg_duckdb's raw_query runs in an isolated DuckDB context that cannot
-/// access PostgreSQL tables directly, we replace 'logs' with read_parquet().
-/// This means DuckDB queries only see historical data in parquet files.
+/// Rewrite a query to use Parquet files via duckdb.query().
+/// 
+/// pg_duckdb's read_parquet() requires special column access syntax (r['col']).
+/// To work around this, we:
+/// 1. Replace 'FROM logs' with 'FROM read_parquet(...)'  
+/// 2. Wrap the query in duckdb.query() which runs entirely in DuckDB
+/// 3. Use 'SELECT r.* FROM duckdb.query(...) AS r' to get normal column names
+///
+/// This allows user queries to work unchanged against parquet files.
 fn rewrite_query_for_parquet(sql: &str, config: &ParquetConfig) -> Result<String> {
     let chain_id = config.chain_id.unwrap_or(0);
     let data_dir = config.data_dir.as_deref().unwrap_or("/data");
 
-    // Build the Parquet file glob pattern
-    let parquet_glob = format!("{}/{}/logs_*.parquet", data_dir, chain_id);
+    // Replace table references (logs, blocks, txs, receipts) with read_parquet()
+    // This handles both direct queries and CTEs (e.g., event signature CTEs)
+    let sql_with_parquet = replace_tables_with_parquet(sql, data_dir, chain_id);
 
-    // Create a CTE that reads from Parquet files
-    // The 'AS r' alias is required by pg_duckdb to access columns normally
-    let parquet_cte = format!(
-        r#"logs AS (
-    SELECT r.* FROM read_parquet('{}') AS r
-)"#,
-        parquet_glob
+    // Wrap in duckdb.query() to run entirely in DuckDB context
+    // The outer 'SELECT r.*' exposes columns with normal names
+    let wrapped = format!(
+        "SELECT r.* FROM duckdb.query($duckdb${}$duckdb$) AS r",
+        sql_with_parquet
     );
 
-    // Check if query already has WITH clause
-    let sql_upper = sql.to_uppercase();
-    let modified_sql = if sql_upper.starts_with("WITH ") {
-        // Append to existing WITH clause
-        let with_end = sql.find(|c: char| !c.is_whitespace() && c != 'W' && c != 'I' && c != 'T' && c != 'H')
-            .unwrap_or(4);
-        format!(
-            "WITH {}, {}",
-            parquet_cte,
-            &sql[with_end..]
-        )
-    } else {
-        // Add new WITH clause
-        format!("WITH {} {}", parquet_cte, sql)
-    };
+    Ok(wrapped)
+}
 
-    Ok(modified_sql)
+/// Replace references to tables with read_parquet() calls
+fn replace_tables_with_parquet(sql: &str, data_dir: &str, chain_id: u64) -> String {
+    use regex_lite::Regex;
+    
+    // Tables that have parquet exports
+    let tables = ["logs", "blocks", "txs", "receipts"];
+    
+    let mut result = sql.to_string();
+    for table in tables {
+        let parquet_glob = format!("{}/{}/{}_*.parquet", data_dir, chain_id, table);
+        
+        // Handle FROM table and JOIN table patterns (case-insensitive)
+        let from_pattern = format!(r"(?i)\bFROM\s+{}\b", table);
+        let join_pattern = format!(r"(?i)\bJOIN\s+{}\b", table);
+        
+        if let Ok(re) = Regex::new(&from_pattern) {
+            let replacement = format!("FROM read_parquet('{}')", parquet_glob);
+            result = re.replace_all(&result, replacement.as_str()).to_string();
+        }
+        if let Ok(re) = Regex::new(&join_pattern) {
+            let replacement = format!("JOIN read_parquet('{}')", parquet_glob);
+            result = re.replace_all(&result, replacement.as_str()).to_string();
+        }
+    }
+    result
 }
 
 /// Execute a query on PostgreSQL.
@@ -1002,17 +1017,17 @@ mod tests {
         let sql = "SELECT * FROM logs WHERE block_num > 500000";
         let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
 
-        // Should have logs CTE reading from parquet
-        assert!(rewritten.contains("logs AS"), "Missing logs CTE: {}", rewritten);
+        // Should wrap in duckdb.query() with read_parquet
+        assert!(rewritten.contains("duckdb.query("), "Missing duckdb.query wrapper: {}", rewritten);
         assert!(rewritten.contains("read_parquet('/data/42431/logs_*.parquet')"), "Missing parquet path: {}", rewritten);
-        // Original query should follow the CTE
-        assert!(rewritten.contains("SELECT * FROM logs"), "Missing original query: {}", rewritten);
+        // Outer wrapper for column access
+        assert!(rewritten.contains("SELECT r.* FROM"), "Missing outer SELECT r.*: {}", rewritten);
+        assert!(rewritten.contains("AS r"), "Missing AS r alias: {}", rewritten);
     }
 
     #[test]
-    fn test_rewrite_query_for_parquet_has_alias() {
-        // pg_duckdb requires an alias on read_parquet() to access columns normally
-        // Without it, you get: "column X does not exist, use r['column'] syntax"
+    fn test_rewrite_query_for_parquet_groupby() {
+        // Test that aggregation queries work with the duckdb.query() wrapper
         let config = ParquetConfig {
             enabled: true,
             data_dir: Some("/data".to_string()),
@@ -1023,22 +1038,18 @@ mod tests {
         let sql = "SELECT address, COUNT(*) as cnt FROM logs GROUP BY address";
         let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
 
-        // Must have "AS r" alias for pg_duckdb compatibility
-        assert!(
-            rewritten.contains("read_parquet('/data/4217/logs_*.parquet') AS r"),
-            "Missing 'AS r' alias - pg_duckdb requires this for column access: {}",
-            rewritten
-        );
-        // Must select from the aliased table
-        assert!(
-            rewritten.contains("SELECT r.*"),
-            "Must use 'SELECT r.*' to expose columns: {}",
-            rewritten
-        );
+        // Must wrap in duckdb.query() for proper column access
+        assert!(rewritten.contains("duckdb.query($duckdb$"), "Missing duckdb.query: {}", rewritten);
+        // Inner query should have read_parquet
+        assert!(rewritten.contains("FROM read_parquet('/data/4217/logs_*.parquet')"), 
+            "Missing FROM read_parquet: {}", rewritten);
+        // Outer wrapper
+        assert!(rewritten.contains("SELECT r.* FROM"), "Missing outer wrapper: {}", rewritten);
     }
 
     #[test]
-    fn test_rewrite_query_for_parquet_with_existing_cte() {
+    fn test_rewrite_query_for_parquet_with_event_cte() {
+        // Event signature CTEs query FROM logs, which should be replaced
         let config = ParquetConfig {
             enabled: true,
             data_dir: Some("/data".to_string()),
@@ -1049,10 +1060,30 @@ mod tests {
         let sql = "WITH transfer AS (SELECT * FROM logs WHERE selector = '\\x1234') SELECT * FROM transfer";
         let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
 
-        // Should have logs CTE reading from parquet
-        assert!(rewritten.contains("logs AS"), "Missing logs CTE: {}", rewritten);
-        // Original query logic should be preserved
-        assert!(rewritten.contains("transfer"));
+        // The CTE's FROM logs should be replaced with read_parquet
+        assert!(rewritten.contains("FROM read_parquet('/data/1/logs_*.parquet')"), 
+            "CTE's FROM logs not replaced: {}", rewritten);
+        // Original CTE name preserved
+        assert!(rewritten.contains("transfer AS"), "Missing transfer CTE: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_all_tables() {
+        // Should replace all table types: logs, blocks, txs, receipts
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(42431),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT b.num, t.hash FROM blocks b JOIN txs t ON b.num = t.block_num";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        assert!(rewritten.contains("read_parquet('/data/42431/blocks_*.parquet')"), 
+            "blocks not replaced: {}", rewritten);
+        assert!(rewritten.contains("read_parquet('/data/42431/txs_*.parquet')"), 
+            "txs not replaced: {}", rewritten);
     }
 
     #[test]
