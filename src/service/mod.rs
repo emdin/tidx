@@ -387,12 +387,17 @@ pub async fn execute_query_pg_duckdb(
             0
         });
 
-    // Prepend LOAD tidx_abi extension to query for ABI decoding functions
-    // The extension must be loaded in the same DuckDB context as the query execution
-    let sql = format!(
-        "LOAD '/usr/share/duckdb/extensions/tidx_abi.duckdb_extension'; {}",
-        sql
-    );
+    // Load tidx_abi extension for ABI decoding functions
+    // This must be done via raw_query since LOAD is a DuckDB-specific command
+    conn.execute(
+        "SELECT duckdb.raw_query($1)",
+        &[&"LOAD '/usr/share/duckdb/extensions/tidx_abi.duckdb_extension'"],
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "Failed to load tidx_abi extension");
+        0
+    });
 
     // Set statement timeout
     conn.execute(
