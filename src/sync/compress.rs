@@ -120,6 +120,10 @@ pub async fn run_compress_loop(
     Ok(())
 }
 
+/// Maximum blocks to include in a staging file to prevent OOM.
+/// Staging covers only recent data; older data should be in finalized exports.
+const MAX_STAGING_BLOCKS: u64 = 100_000;
+
 /// Update staging parquet files with data since last finalized export.
 /// These staging files are rewritten on each block for near-realtime queries.
 async fn update_staging(
@@ -148,9 +152,14 @@ async fn update_staging(
     let last_finalized = get_last_exported_block(pool, chain_id, table_type).await?;
     
     // Only create staging if there's data after the last finalized block
-    let start_block = if last_finalized == 0 { 1 } else { last_finalized + 1 };
+    let mut start_block = if last_finalized == 0 { 1 } else { last_finalized + 1 };
     if start_block > tip_num {
         return Ok(());
+    }
+
+    // Limit staging size to prevent OOM - only export recent blocks
+    if tip_num - start_block + 1 > MAX_STAGING_BLOCKS {
+        start_block = tip_num.saturating_sub(MAX_STAGING_BLOCKS - 1);
     }
 
     let staging_path = data_dir.join(format!("{}_staging.parquet", table_type.as_str()));
@@ -270,7 +279,7 @@ async fn tick_compress(
         // Find contiguous range from last_exported to tip
         let range = find_contiguous_range(pool, chain_id, last_exported, tip_num as u64).await?;
 
-        let (start_block, end_block) = match range {
+        let (start_block, mut end_block) = match range {
             Some((s, e)) if e - s + 1 >= config.threshold_blocks => (s, e),
             Some((s, e)) => {
                 debug!(
@@ -289,6 +298,12 @@ async fn tick_compress(
                 continue;
             }
         };
+
+        // Limit batch size to prevent OOM in DuckDB
+        // Export in chunks of threshold_blocks at a time
+        if end_block - start_block + 1 > config.threshold_blocks {
+            end_block = start_block + config.threshold_blocks - 1;
+        }
 
         info!(
             chain_id = chain_id,
