@@ -293,25 +293,23 @@ fn query_references_logs(sql: &str) -> bool {
     sql_upper.contains("FROM LOGS") || sql_upper.contains("JOIN LOGS")
 }
 
-/// Rewrite a query to use UNION ALL with Parquet and PostgreSQL sources
+/// Rewrite a query to use Parquet files instead of PostgreSQL logs table.
+/// Since pg_duckdb's raw_query runs in an isolated DuckDB context that cannot
+/// access PostgreSQL tables directly, we replace 'logs' with read_parquet().
+/// This means DuckDB queries only see historical data in parquet files.
 fn rewrite_query_for_parquet(sql: &str, config: &ParquetConfig) -> Result<String> {
-    let max_block = config.max_parquet_block.unwrap_or(0);
     let chain_id = config.chain_id.unwrap_or(0);
     let data_dir = config.data_dir.as_deref().unwrap_or("/data");
 
     // Build the Parquet file glob pattern
     let parquet_glob = format!("{}/{}/logs_*.parquet", data_dir, chain_id);
 
-    // Create a CTE that combines both sources
-    let hybrid_cte = format!(
-        r#"logs_hybrid AS (
-    -- Recent logs from PostgreSQL heap
-    SELECT * FROM logs WHERE block_num > {}
-    UNION ALL
-    -- Historical logs from Parquet files
+    // Create a CTE that reads from Parquet files
+    let parquet_cte = format!(
+        r#"logs AS (
     SELECT * FROM read_parquet('{}')
 )"#,
-        max_block, parquet_glob
+        parquet_glob
     );
 
     // Check if query already has WITH clause
@@ -322,20 +320,13 @@ fn rewrite_query_for_parquet(sql: &str, config: &ParquetConfig) -> Result<String
             .unwrap_or(4);
         format!(
             "WITH {}, {}",
-            hybrid_cte,
+            parquet_cte,
             &sql[with_end..]
         )
     } else {
         // Add new WITH clause
-        format!("WITH {} {}", hybrid_cte, sql)
+        format!("WITH {} {}", parquet_cte, sql)
     };
-
-    // Replace references to 'logs' table with 'logs_hybrid'
-    // This is a simple replacement - for production, use SQL parser
-    let modified_sql = modified_sql
-        .replace("FROM logs", "FROM logs_hybrid")
-        .replace("FROM LOGS", "FROM logs_hybrid")
-        .replace("from logs", "FROM logs_hybrid");
 
     Ok(modified_sql)
 }
