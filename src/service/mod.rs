@@ -4,7 +4,6 @@ use serde::Serialize;
 use std::time::Instant;
 
 use crate::db::Pool;
-use crate::duckdb::DuckDbEngine;
 use crate::metrics;
 use crate::query::{extract_column_references, validate_query, EventSignature};
 
@@ -113,55 +112,6 @@ impl Default for QueryOptions {
             limit: 10000,
         }
     }
-}
-
-/// Parquet configuration for native DuckDB queries
-#[derive(Clone, Debug, Default)]
-pub struct ParquetConfig {
-    /// Whether Parquet querying is enabled
-    pub enabled: bool,
-    /// Directory containing Parquet files for this chain
-    pub data_dir: Option<String>,
-    /// Chain ID (for file path construction)
-    pub chain_id: Option<u64>,
-    /// Maximum block number in Parquet files (blocks > this are in PG)
-    pub max_parquet_block: Option<u64>,
-}
-
-/// Execute a query using the native in-process DuckDB engine.
-/// Reads Parquet files directly for analytical queries.
-pub fn execute_query_native_duckdb(
-    engine: &DuckDbEngine,
-    sql: &str,
-    signature: Option<&str>,
-    options: &QueryOptions,
-) -> Result<QueryResult> {
-    // Validate query
-    validate_query(sql)?;
-    
-    // Add LIMIT if not present
-    let sql_upper = sql.to_uppercase();
-    let sql = if !sql_upper.contains("LIMIT") {
-        format!("{sql} LIMIT {}", options.limit)
-    } else {
-        sql.to_string()
-    };
-    
-    let start = Instant::now();
-    let result = engine.query(&sql, signature)?;
-    let elapsed = start.elapsed();
-    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    
-    metrics::record_query_duration(elapsed);
-    metrics::record_query_rows(result.row_count as u64);
-    
-    Ok(QueryResult {
-        columns: result.columns,
-        rows: result.rows,
-        row_count: result.row_count,
-        engine: Some("duckdb".to_string()),
-        query_time_ms: Some(elapsed_ms),
-    })
 }
 
 /// Execute a query on PostgreSQL.
@@ -387,16 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_cte_duckdb_format() {
+    fn test_transfer_cte_clickhouse_format() {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        let cte = sig.to_cte_sql_duckdb();
+        let cte = sig.to_cte_sql_clickhouse();
         
-        // DuckDB CTE uses unhex() for BLOB selector comparison
-        assert!(cte.contains("WHERE selector = unhex('"));
-        // Uses native abi UDFs
-        assert!(cte.contains("abi_address(topic1)"));
-        assert!(cte.contains("abi_address(topic2)"));
-        assert!(cte.contains("abi_uint(data, 0)"));
+        // ClickHouse CTE uses string comparison for selector (MaterializedPostgreSQL format)
+        assert!(cte.contains(r"WHERE selector = '\\x"));
+        // Uses substring to extract address from hex string (last 40 chars)
+        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
+        // Uses unhex + reinterpret for uint decoding
+        assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
     }
 
     #[test]
@@ -404,15 +355,15 @@ mod tests {
         let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
         
         let pg_cte = sig.to_cte_sql_postgres();
-        let duck_cte = sig.to_cte_sql_duckdb();
+        let ch_cte = sig.to_cte_sql_clickhouse();
         
         // Both should have the same structure but different function calls
         assert!(pg_cte.contains("AS \"owner\""));
-        assert!(duck_cte.contains("AS \"owner\""));
+        assert!(ch_cte.contains("AS \"owner\""));
         
-        // Both use abi_address, Postgres uses it on bytea, DuckDB on BLOB
+        // Postgres uses abi_address UDFs, ClickHouse uses substring on hex strings
         assert!(pg_cte.contains("abi_address(topic1)"));
-        assert!(duck_cte.contains("abi_address(topic1)"));
+        assert!(ch_cte.contains("substring(topic1, 27)"));
     }
 
     #[test]
@@ -423,7 +374,7 @@ mod tests {
         ).unwrap();
         
         let pg_cte = sig.to_cte_sql_postgres();
-        let duck_cte = sig.to_cte_sql_duckdb();
+        let ch_cte = sig.to_cte_sql_clickhouse();
         
         // Check indexed params use topics
         assert!(pg_cte.contains("abi_address(topic1)"));
@@ -435,11 +386,11 @@ mod tests {
         assert!(pg_cte.contains("substring(data FROM 65 FOR 32)"));  // offset 64
         assert!(pg_cte.contains("substring(data FROM 97 FOR 32)"));  // offset 96
         
-        // DuckDB uses tidx_abi extension functions with byte offsets
-        assert!(duck_cte.contains("abi_uint(data, 0)"));
-        assert!(duck_cte.contains("abi_uint(data, 32)"));
-        assert!(duck_cte.contains("abi_uint(data, 64)"));
-        assert!(duck_cte.contains("abi_uint(data, 96)"));
+        // ClickHouse uses hex-based offsets: hex_start = 3 + offset*2, and 64 chars for 32 bytes
+        assert!(ch_cte.contains("substring(data, 3, 64)"));    // offset 0: 3 + 0*2 = 3
+        assert!(ch_cte.contains("substring(data, 67, 64)"));   // offset 32: 3 + 32*2 = 67
+        assert!(ch_cte.contains("substring(data, 131, 64)"));  // offset 64: 3 + 64*2 = 131
+        assert!(ch_cte.contains("substring(data, 195, 64)"));  // offset 96: 3 + 96*2 = 195
     }
 
     #[test]
@@ -451,17 +402,17 @@ mod tests {
         used_columns.insert("value".to_string());
         
         let pg_cte = sig.to_cte_sql_postgres_filtered(Some(&used_columns));
-        let duck_cte = sig.to_cte_sql_duckdb_filtered(Some(&used_columns));
+        let ch_cte = sig.to_cte_sql_clickhouse_filtered(Some(&used_columns));
         
         // Should include "to" and "value"
         assert!(pg_cte.contains("AS \"to\""));
         assert!(pg_cte.contains("AS \"value\""));
-        assert!(duck_cte.contains("AS \"to\""));
-        assert!(duck_cte.contains("AS \"value\""));
+        assert!(ch_cte.contains("AS \"to\""));
+        assert!(ch_cte.contains("AS \"value\""));
         
         // Should NOT include "from"
         assert!(!pg_cte.contains("AS \"from\""));
-        assert!(!duck_cte.contains("AS \"from\""));
+        assert!(!ch_cte.contains("AS \"from\""));
     }
 
     #[test]
@@ -469,10 +420,12 @@ mod tests {
         let sig = EventSignature::parse("Paused(bool paused)").unwrap();
         
         let pg_cte = sig.to_cte_sql_postgres();
-        let duck_cte = sig.to_cte_sql_duckdb();
+        let ch_cte = sig.to_cte_sql_clickhouse();
         
+        // Postgres uses abi_bool UDF
         assert!(pg_cte.contains("abi_bool("));
-        assert!(duck_cte.contains("abi_bool("));
+        // ClickHouse uses unhex comparison on hex string
+        assert!(ch_cte.contains("unhex(") && ch_cte.contains("!= unhex('00')"));
     }
 
     #[test]
@@ -480,11 +433,11 @@ mod tests {
         let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
         
         let pg_cte = sig.to_cte_sql_postgres();
-        let duck_cte = sig.to_cte_sql_duckdb();
+        let ch_cte = sig.to_cte_sql_clickhouse();
         
-        // bytes32 indexed just returns the topic directly
-        assert!(pg_cte.contains("topic1 AS \"role\"") || pg_cte.contains("topic1"));
-        assert!(duck_cte.contains("topic1 AS \"role\"") || duck_cte.contains("topic1"));
+        // bytes32 indexed returns the topic as hex
+        assert!(pg_cte.contains("topic1"));
+        assert!(ch_cte.contains("topic1"));
     }
 
     // ========================================================================
@@ -506,13 +459,13 @@ mod tests {
         let pg_cte = sig.to_cte_sql_postgres();
         let full_pg_query = format!("WITH {} {}", pg_cte, user_query);
         
-        // For native DuckDB mode (uses DuckDB UDFs)
-        let duck_cte = sig.to_cte_sql_duckdb();
-        let full_duck_query = format!("WITH {} {}", duck_cte, user_query);
+        // For ClickHouse mode (uses native ClickHouse functions)
+        let ch_cte = sig.to_cte_sql_clickhouse();
+        let full_ch_query = format!("WITH {} {}", ch_cte, user_query);
         
         // Both produce valid SQL that users can run
         assert!(full_pg_query.contains("SELECT \"from\", \"to\", \"value\""));
-        assert!(full_duck_query.contains("SELECT \"from\", \"to\", \"value\""));
+        assert!(full_ch_query.contains("SELECT \"from\", \"to\", \"value\""));
         
         // The decode functions are hidden in the CTE, not in user's query
         assert!(!user_query.contains("abi_"));
@@ -569,27 +522,27 @@ mod tests {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
         
         let pg_cte = sig.to_cte_sql_postgres();
-        let duck_cte = sig.to_cte_sql_duckdb();
+        let ch_cte = sig.to_cte_sql_clickhouse();
         
         // Both engines expose the same column names to users
         assert!(pg_cte.contains("AS \"from\""));
-        assert!(duck_cte.contains("AS \"from\""));
+        assert!(ch_cte.contains("AS \"from\""));
         
         assert!(pg_cte.contains("AS \"to\""));
-        assert!(duck_cte.contains("AS \"to\""));
+        assert!(ch_cte.contains("AS \"to\""));
         
         assert!(pg_cte.contains("AS \"value\""));
-        assert!(duck_cte.contains("AS \"value\""));
+        assert!(ch_cte.contains("AS \"value\""));
         
         // Users can write the same query regardless of engine
         let user_query = r#"SELECT "from", "to", "value" FROM transfer"#;
         
         // Both work with the same user query
         let pg_full = format!("WITH {} {}", pg_cte, user_query);
-        let duck_full = format!("WITH {} {}", duck_cte, user_query);
+        let ch_full = format!("WITH {} {}", ch_cte, user_query);
         
         assert!(pg_full.contains(user_query));
-        assert!(duck_full.contains(user_query));
+        assert!(ch_full.contains(user_query));
     }
 
     // ========================================================================
@@ -597,12 +550,12 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_route_olap_query_to_duckdb() {
-        // OLAP patterns should route to DuckDB
-        assert_eq!(route_query("SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::DuckDb);
-        assert_eq!(route_query("SELECT SUM(gas_used) FROM blocks"), QueryEngine::DuckDb);
-        assert_eq!(route_query("SELECT AVG(gas_limit) FROM txs"), QueryEngine::DuckDb);
-        assert_eq!(route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM logs"), QueryEngine::DuckDb);
+    fn test_route_olap_query_to_clickhouse() {
+        // OLAP patterns should route to ClickHouse
+        assert_eq!(route_query("SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::ClickHouse);
+        assert_eq!(route_query("SELECT SUM(gas_used) FROM blocks"), QueryEngine::ClickHouse);
+        assert_eq!(route_query("SELECT AVG(gas_limit) FROM txs"), QueryEngine::ClickHouse);
+        assert_eq!(route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM logs"), QueryEngine::ClickHouse);
     }
 
     #[test]
@@ -615,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_explicit_engine_hints() {
-        assert_eq!(route_query("/* engine=duckdb */ SELECT * FROM blocks"), QueryEngine::DuckDb);
+        assert_eq!(route_query("/* engine=clickhouse */ SELECT * FROM blocks"), QueryEngine::ClickHouse);
         assert_eq!(route_query("/* engine=postgres */ SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::Postgres);
     }
 
@@ -670,17 +623,5 @@ mod tests {
         assert!(sanitized.ends_with("..."));
     }
 
-    // ========================================================================
-    // ParquetConfig Tests
-    // ========================================================================
-
-    #[test]
-    fn test_parquet_config_default() {
-        let config = ParquetConfig::default();
-        assert!(!config.enabled);
-        assert!(config.data_dir.is_none());
-        assert!(config.chain_id.is_none());
-        assert!(config.max_parquet_block.is_none());
-    }
 }
 

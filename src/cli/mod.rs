@@ -1,7 +1,9 @@
+pub mod api_key;
 pub mod init;
 pub mod query;
 pub mod status;
 pub mod up;
+pub mod views;
 
 use clap::{Parser, Subcommand};
 
@@ -23,4 +25,8 @@ pub enum Commands {
     Status(status::Args),
     /// Run a SQL query (use --signature to decode event logs)
     Query(query::Args),
+    /// Manage ClickHouse materialized views
+    Views(views::Args),
+    /// Generate a new API key and add it to config
+    ApiKey(api_key::Args),
 }

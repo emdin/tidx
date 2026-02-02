@@ -1,4 +1,5 @@
 mod rate_limit;
+mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -24,23 +25,24 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
+use crate::clickhouse::ClickHouseEngine;
 use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::Pool;
-use crate::duckdb::DuckDbEngineRegistry;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
+pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
 
-/// Per-chain Parquet configuration (static parts from config).
+/// Per-chain ClickHouse configuration.
 #[derive(Clone, Debug, Default)]
-pub struct ChainParquetConfig {
+pub struct ChainClickHouseConfig {
     pub enabled: bool,
-    pub data_dir: String,
+    pub url: String,
 }
 
-pub type SharedParquetConfigs = Arc<RwLock<HashMap<u64, ChainParquetConfig>>>;
+pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,18 +51,23 @@ pub struct AppState {
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain Parquet configuration (hot-reloadable)
-    pub parquet_configs: SharedParquetConfigs,
+    /// Per-chain ClickHouse configuration (hot-reloadable)
+    pub clickhouse_configs: SharedClickHouseConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
-    /// Native DuckDB engine registry for parquet queries
-    pub duckdb_registry: Option<Arc<DuckDbEngineRegistry>>,
+    /// ClickHouse engines for OLAP queries (per chain)
+    pub clickhouse_engines: SharedClickHouseEngines,
 }
 
 impl AppState {
     async fn get_pool(&self, chain_id: Option<u64>) -> Option<Pool> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.pools.read().await.get(&id).cloned()
+    }
+    
+    async fn get_clickhouse(&self, chain_id: Option<u64>) -> Option<Arc<ClickHouseEngine>> {
+        let id = chain_id.unwrap_or(self.default_chain_id);
+        self.clickhouse_engines.read().await.get(&id).cloned()
     }
 }
 
@@ -72,7 +79,7 @@ pub fn router_with_options(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    parquet_configs: HashMap<u64, ChainParquetConfig>,
+    clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new(
@@ -82,21 +89,13 @@ pub fn router_with_options(
 
     rate_limit::spawn_cleanup_task(rate_limiter.clone());
 
-    // Create DuckDB registry from parquet configs if any chain has parquet enabled
-    let duckdb_registry = parquet_configs.values()
-        .find(|c| c.enabled)
-        .map(|c| {
-            let data_dir = std::path::PathBuf::from(&c.data_dir);
-            Arc::new(DuckDbEngineRegistry::new(data_dir))
-        });
-
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
         default_chain_id,
         broadcaster,
-        parquet_configs: Arc::new(RwLock::new(parquet_configs)),
+        clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         rate_limiter: rate_limiter.clone(),
-        duckdb_registry,
+        clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
     };
 
     build_router(state, rate_limiter)
@@ -106,9 +105,9 @@ pub fn router_shared(
     pools: SharedPools,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    parquet_configs: SharedParquetConfigs,
+    clickhouse_configs: SharedClickHouseConfigs,
     http_config: SharedHttpConfig,
-    duckdb_registry: Option<Arc<DuckDbEngineRegistry>>,
+    clickhouse_engines: SharedClickHouseEngines,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
 
@@ -118,9 +117,9 @@ pub fn router_shared(
         pools,
         default_chain_id,
         broadcaster,
-        parquet_configs,
+        clickhouse_configs,
         rate_limiter: rate_limiter.clone(),
-        duckdb_registry,
+        clickhouse_engines,
     };
 
     build_router(state, rate_limiter)
@@ -128,7 +127,7 @@ pub fn router_shared(
 
 fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
@@ -136,6 +135,8 @@ fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
+        .route("/views", get(views::list_views).post(views::create_view))
+        .route("/views/{name}", get(views::get_view).delete(views::delete_view))
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             rate_limit::rate_limit_middleware,
@@ -190,7 +191,7 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "duckdb"
+    /// Force a specific engine: "postgres" or "clickhouse"
     #[serde(default)]
     engine: Option<String>,
 }
@@ -216,6 +217,11 @@ async fn handle_query(
     Query(params): Query<QueryParams>,
 ) -> Response {
     if params.live {
+        if params.engine.as_deref() == Some("clickhouse") {
+            return ApiError::BadRequest(
+                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
+            ).into_response();
+        }
         handle_query_live(state, params, addr, headers).await.into_response()
     } else {
         handle_query_once(state, params).await.into_response()
@@ -240,52 +246,43 @@ async fn handle_query_once(
     };
 
     // Route to appropriate engine
-    let use_duckdb = matches!(
+    let use_clickhouse = matches!(
         params.engine.as_deref(),
-        Some("duckdb") | Some("duckdb-native")
+        Some("clickhouse")
     );
 
-    let result = if use_duckdb {
-        // Use native DuckDB engine for parquet queries
-        let registry = state.duckdb_registry.as_ref()
-            .ok_or_else(|| ApiError::BadRequest("DuckDB engine not configured (no parquet enabled)".to_string()))?;
-        
-        let engine = registry.get_or_create(params.chain_id)
-            .map_err(|e| ApiError::QueryError(e.to_string()))?;
-        
-        crate::service::execute_query_native_duckdb(
-            &engine,
-            &params.sql,
-            params.signature.as_deref(),
-            &options,
-        )
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("forbidden") || msg.contains("Only SELECT") {
-                ApiError::BadRequest(msg)
-            } else {
-                ApiError::QueryError(msg)
-            }
-        })?
+    let result = if use_clickhouse {
+        // Use ClickHouse engine for OLAP queries
+        let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
+            .ok_or_else(|| ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            )))?;
+
+        // Rewrite analytics table references to include chain-specific database
+        let sql = rewrite_analytics_tables(&params.sql, params.chain_id);
+
+        clickhouse.query(&sql, params.signature.as_deref())
+            .await
+            .map(|r| QueryResult {
+                columns: r.columns,
+                rows: r.rows,
+                row_count: r.row_count,
+                engine: r.engine,
+                query_time_ms: r.query_time_ms,
+            })
+            .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
-        // Use PostgreSQL for all other queries
-        crate::service::execute_query_postgres(
-            &pool,
-            &params.sql,
-            params.signature.as_deref(),
-            &options,
-        )
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("timeout") {
-                ApiError::Timeout
-            } else if msg.contains("forbidden") || msg.contains("Only SELECT") {
-                ApiError::BadRequest(msg)
-            } else {
-                ApiError::QueryError(msg)
-            }
-        })?
+        // Use PostgreSQL
+        crate::service::execute_query_postgres(&pool, &params.sql, params.signature.as_deref(), &options)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("timeout") {
+                    ApiError::Timeout
+                } else {
+                    ApiError::QueryError(e.to_string())
+                }
+            })?
     };
 
     Ok(Json(QueryResponse { result, ok: true }))
@@ -347,7 +344,7 @@ async fn handle_query_live(
     };
 
     // Detect if this is an OLAP query (aggregations, etc.)
-    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::DuckDb;
+    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::ClickHouse;
 
     let stream = async_stream::stream! {
         // Keep guard alive for the lifetime of the stream
@@ -508,6 +505,32 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> String {
     }
 }
 
+/// Rewrite analytics table references to include chain-specific database prefix.
+/// Transforms `FROM token_holders` to `FROM analytics_42431.token_holders`.
+/// Only rewrites known analytics tables, leaves other table references unchanged.
+fn rewrite_analytics_tables(sql: &str, chain_id: u64) -> String {
+    // Known analytics tables that should be prefixed
+    let analytics_tables = ["token_holders", "token_balances"];
+    
+    let mut result = sql.to_string();
+    for table in analytics_tables {
+        // Simple case-insensitive replacement for FROM/JOIN table_name
+        // Handles: FROM token_holders, JOIN token_holders
+        for keyword in ["FROM ", "JOIN "] {
+            let search_lower = format!("{keyword}{table}");
+            let search_upper = format!("{}{}", keyword.to_uppercase(), table);
+            let replacement = format!("{keyword}analytics_{chain_id}.{table}");
+            
+            // Replace lowercase
+            result = result.replace(&search_lower, &replacement);
+            // Replace uppercase keyword
+            result = result.replace(&search_upper, &replacement);
+        }
+    }
+    
+    result
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
@@ -515,6 +538,8 @@ pub enum ApiError {
     QueryError(String),
     #[allow(dead_code)]
     Internal(String),
+    Forbidden(String),
+    NotFound(String),
 }
 
 impl IntoResponse for ApiError {
@@ -524,6 +549,8 @@ impl IntoResponse for ApiError {
             ApiError::Timeout => (StatusCode::REQUEST_TIMEOUT, "Query timeout".to_string()),
             ApiError::QueryError(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
         };
 
         let body = serde_json::json!({
@@ -532,5 +559,43 @@ impl IntoResponse for ApiError {
         });
 
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_analytics_tables() {
+        // Basic FROM rewrite
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM token_holders", 42431),
+            "SELECT * FROM analytics_42431.token_holders"
+        );
+
+        // WITH uppercase FROM
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM token_balances WHERE token = '0x123'", 4217),
+            "SELECT * FROM analytics_4217.token_balances WHERE token = '0x123'"
+        );
+
+        // Already prefixed - should not double-prefix
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM analytics_42431.token_holders", 42431),
+            "SELECT * FROM analytics_42431.token_holders"
+        );
+
+        // Non-analytics table - should not rewrite
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM logs", 42431),
+            "SELECT * FROM logs"
+        );
+
+        // JOIN rewrite
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM logs JOIN token_holders ON 1=1", 42431),
+            "SELECT * FROM logs JOIN analytics_42431.token_holders ON 1=1"
+        );
     }
 }

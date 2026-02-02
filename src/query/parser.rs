@@ -13,16 +13,6 @@ pub struct EventSignature {
     pub topic0: [u8; 32],
 }
 
-/// Mapping from a decoded column to its raw column and decode expression.
-#[derive(Debug, Clone)]
-pub struct ColumnMapping {
-    pub decoded_name: String,
-    pub raw_column: String,
-    pub decode_expr: String,
-    pub is_indexed: bool,
-    pub data_offset: Option<usize>,
-}
-
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -90,7 +80,7 @@ impl EventSignature {
     /// Generate PostgreSQL-compatible CTE SQL, only including columns used in the query.
     /// If `used_columns` is None, includes all decoded columns.
     pub fn to_cte_sql_postgres_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
-        let selects = self.build_select_expressions(used_columns, false);
+        let selects = self.build_select_expressions_postgres(used_columns);
 
         let select_clause = if selects.is_empty() {
             String::new()
@@ -110,69 +100,17 @@ impl EventSignature {
         )
     }
 
-    /// Generate DuckDB-compatible CTE SQL (includes all decoded columns)
-    pub fn to_cte_sql_duckdb(&self) -> String {
-        self.to_cte_sql_duckdb_filtered(None)
+    /// Generate ClickHouse-compatible CTE SQL (includes all decoded columns)
+    pub fn to_cte_sql_clickhouse(&self) -> String {
+        self.to_cte_sql_clickhouse_filtered(None)
     }
 
-    /// Generate DuckDB-compatible CTE SQL, only including columns used in the query.
-    /// If `used_columns` is None, includes all decoded columns.
-    pub fn to_cte_sql_duckdb_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
-        self.to_cte_sql_duckdb_with_pushdown(used_columns, None)
-    }
-
-    /// Generate a raw CTE (no decoding) for late-decode optimization.
-    /// Returns the CTE SQL and a mapping of decoded column names to raw column expressions.
-    pub fn to_raw_cte_sql_duckdb(
-        &self,
-        pushdown_filters: Option<&HashMap<String, String>>,
-    ) -> String {
-        // Build pushdown WHERE clauses
-        let pushdown_clauses = pushdown_filters
-            .map(|filters| self.build_pushdown_filters_duckdb(filters))
-            .unwrap_or_default();
-        
-        let pushdown_sql = if pushdown_clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" AND {}", pushdown_clauses.join(" AND "))
-        };
-
-        // Select raw columns needed for potential late decode
-        format!(
-            r#"{name}_raw AS (
-    SELECT block_num, block_timestamp, log_idx, tx_idx, 
-           tx_hash, address, topic1, topic2, topic3, data
-    FROM logs
-    WHERE selector = unhex('{topic0}'){pushdown_sql}
-)"#,
-            name = self.name.to_lowercase(),
-            topic0 = self.topic0_hex(),
-            pushdown_sql = pushdown_sql,
-        )
-    }
-
-    /// Generate the decode expressions for wrapping a raw query result.
-    /// Returns pairs of (decoded_col_name, decode_expression).
-    pub fn get_decode_wrappers(&self) -> Vec<(String, String)> {
-        let mut wrappers = Vec::new();
-        let mappings = self.get_column_mappings();
-        
-        for mapping in mappings {
-            wrappers.push((mapping.decoded_name, mapping.decode_expr));
-        }
-        
-        wrappers
-    }
-
-    /// Generate DuckDB-compatible CTE SQL with filter pushdown.
-    /// `pushdown_filters` maps decoded column names to their filter values.
-    pub fn to_cte_sql_duckdb_with_pushdown(
-        &self,
-        used_columns: Option<&HashSet<String>>,
-        pushdown_filters: Option<&HashMap<String, String>>,
-    ) -> String {
-        let selects = self.build_select_expressions(used_columns, true);
+    /// Generate ClickHouse-compatible CTE SQL, only including columns used in the query.
+    /// 
+    /// Note: MaterializedPostgreSQL stores PostgreSQL bytea as '\x'-prefixed hex strings.
+    /// We use substring(..., 3) to strip the '\x' prefix before unhex().
+    pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
+        let selects = self.build_select_expressions_clickhouse(used_columns);
 
         let select_clause = if selects.is_empty() {
             String::new()
@@ -180,8 +118,7 @@ impl EventSignature {
             format!(", {}", selects.join(", "))
         };
 
-        // Only convert tx_hash/address to hex strings when actually referenced
-        // This avoids expensive per-row string formatting for unused columns
+        // Convert tx_hash/address from '\x...' format to '0x...' format
         let include_tx_hash = used_columns
             .map(|cols| cols.contains("tx_hash"))
             .unwrap_or(true);
@@ -189,50 +126,39 @@ impl EventSignature {
             .map(|cols| cols.contains("address"))
             .unwrap_or(true);
 
+        // tx_hash/address are stored as '\xABCD...' - replace '\x' with '0x'
         let tx_hash_col = if include_tx_hash {
-            "'0x' || lower(hex(tx_hash)) AS tx_hash"
+            "concat('0x', lower(substring(tx_hash, 3))) AS tx_hash"
         } else {
             "tx_hash"
         };
         let address_col = if include_address {
-            "'0x' || lower(hex(address)) AS address"
+            "concat('0x', lower(substring(address, 3))) AS address"
         } else {
             "address"
         };
 
-        // Build pushdown WHERE clauses
-        let pushdown_clauses = pushdown_filters
-            .map(|filters| self.build_pushdown_filters_duckdb(filters))
-            .unwrap_or_default();
-        
-        let pushdown_sql = if pushdown_clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" AND {}", pushdown_clauses.join(" AND "))
-        };
-
+        // selector is stored as '\xABCD...' string, compare directly
         format!(
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
            {address_col}{select_clause}
     FROM logs
-    WHERE selector = unhex('{topic0}'){pushdown_sql}
+    WHERE selector = '\\x{topic0}'
 )"#,
             name = self.name.to_lowercase(),
             tx_hash_col = tx_hash_col,
             address_col = address_col,
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
-            pushdown_sql = pushdown_sql,
         )
     }
 
-    /// Build SELECT expressions for decoded columns, optionally filtering by used columns.
-    fn build_select_expressions(
+    /// Build SELECT expressions for ClickHouse decoded columns.
+    fn build_select_expressions_clickhouse(
         &self,
         used_columns: Option<&HashSet<String>>,
-        is_duckdb: bool,
     ) -> Vec<String> {
         let mut selects = Vec::new();
         let mut topic_idx = 2;
@@ -244,27 +170,56 @@ impl EventSignature {
                 .as_deref()
                 .map_or_else(|| format!("arg{i}"), |n| n.to_string());
 
-            // Calculate offsets even for skipped columns to maintain correct positions
             let (decode_expr, new_topic_idx, new_data_offset) = if param.indexed {
-                let expr = if is_duckdb {
-                    param.ty.topic_decode_sql_duckdb(topic_idx)
-                } else {
-                    param.ty.topic_decode_sql_postgres(topic_idx)
-                };
+                let expr = param.ty.topic_decode_sql_clickhouse(topic_idx);
                 (expr, topic_idx + 1, data_offset)
             } else {
-                let expr = if is_duckdb {
-                    param.ty.data_decode_sql_duckdb(data_offset)
-                } else {
-                    param.ty.data_decode_sql_postgres(data_offset)
-                };
+                let expr = param.ty.data_decode_sql_clickhouse(data_offset);
                 (expr, topic_idx, data_offset + 32)
             };
 
             topic_idx = new_topic_idx;
             data_offset = new_data_offset;
 
-            // Only include column if it's used (or if no filter is specified)
+            let include = match used_columns {
+                None => true,
+                Some(cols) => cols.contains(&col_name) || cols.contains(&col_name.to_lowercase()),
+            };
+
+            if include {
+                selects.push(format!("{decode_expr} AS \"{col_name}\""));
+            }
+        }
+
+        selects
+    }
+
+    /// Build SELECT expressions for PostgreSQL decoded columns.
+    fn build_select_expressions_postgres(
+        &self,
+        used_columns: Option<&HashSet<String>>,
+    ) -> Vec<String> {
+        let mut selects = Vec::new();
+        let mut topic_idx = 2;
+        let mut data_offset = 0;
+
+        for (i, param) in self.params.iter().enumerate() {
+            let col_name = param
+                .name
+                .as_deref()
+                .map_or_else(|| format!("arg{i}"), |n| n.to_string());
+
+            let (decode_expr, new_topic_idx, new_data_offset) = if param.indexed {
+                let expr = param.ty.topic_decode_sql_postgres(topic_idx);
+                (expr, topic_idx + 1, data_offset)
+            } else {
+                let expr = param.ty.data_decode_sql_postgres(data_offset);
+                (expr, topic_idx, data_offset + 32)
+            };
+
+            topic_idx = new_topic_idx;
+            data_offset = new_data_offset;
+
             let include = match used_columns {
                 None => true,
                 Some(cols) => cols.contains(&col_name) || cols.contains(&col_name.to_lowercase()),
@@ -290,89 +245,6 @@ impl EventSignature {
                     .map_or_else(|| format!("arg{i}"), |n| n.to_string())
             })
             .collect()
-    }
-
-    /// Returns a mapping from decoded column names to their raw column info.
-    /// Used for late-decode optimization (GROUP BY/ORDER BY rewriting).
-    pub fn get_column_mappings(&self) -> Vec<ColumnMapping> {
-        let mut mappings = Vec::new();
-        let mut topic_idx = 1; // topic1, topic2, topic3
-        let mut data_offset = 0;
-
-        for (i, param) in self.params.iter().enumerate() {
-            let decoded_name = param
-                .name
-                .as_deref()
-                .map_or_else(|| format!("arg{i}"), |n| n.to_string());
-
-            let (raw_column, decode_expr) = if param.indexed {
-                let raw_col = format!("topic{}", topic_idx);
-                let decode = param.ty.topic_decode_sql_duckdb(topic_idx + 1);
-                topic_idx += 1;
-                (raw_col, decode)
-            } else {
-                let raw_col = format!("data"); // For data, we use offset
-                let decode = param.ty.data_decode_sql_duckdb(data_offset);
-                data_offset += 32;
-                (raw_col, decode)
-            };
-
-            mappings.push(ColumnMapping {
-                decoded_name,
-                raw_column,
-                decode_expr,
-                is_indexed: param.indexed,
-                data_offset: if param.indexed { None } else { Some(data_offset - 32) },
-            });
-        }
-
-        mappings
-    }
-
-    /// Build pushdown WHERE clauses for equality filters on decoded columns.
-    /// Returns SQL fragments like "AND topic1 = unhex('...')" for DuckDB.
-    pub fn build_pushdown_filters_duckdb(&self, filters: &HashMap<String, String>) -> Vec<String> {
-        let mut clauses = Vec::new();
-        let mut topic_idx = 2; // topic0 is selector, topic1 starts at 2
-        let mut data_offset = 0;
-
-        for (i, param) in self.params.iter().enumerate() {
-            let col_name = param
-                .name
-                .as_deref()
-                .map_or_else(|| format!("arg{i}"), |n| n.to_lowercase());
-
-            // Check if this column has a filter
-            if let Some(filter_value) = filters.get(&col_name) {
-                if param.indexed {
-                    // Indexed param -> compare against topicN
-                    let topic_col = format!("topic{}", topic_idx - 1);
-                    if let Some(encoded) = self.encode_value_for_pushdown(&param.ty, filter_value) {
-                        clauses.push(format!("{topic_col} = unhex('{encoded}')"));
-                    }
-                } else {
-                    // Non-indexed param -> compare against data slice
-                    // For now, only support fixed-size types at specific offsets
-                    if let Some(encoded) = self.encode_value_for_pushdown(&param.ty, filter_value) {
-                        // Compare 32-byte slice of data at offset
-                        clauses.push(format!(
-                            "substring(data, {}, 32) = unhex('{}')",
-                            data_offset + 1, // SQL is 1-indexed
-                            encoded
-                        ));
-                    }
-                }
-            }
-
-            // Update offsets for next param
-            if param.indexed {
-                topic_idx += 1;
-            } else {
-                data_offset += 32;
-            }
-        }
-
-        clauses
     }
 
     /// Encode a filter value based on the ABI type.
@@ -518,134 +390,6 @@ pub fn encode_address_for_topic(addr: &str) -> Option<String> {
 pub fn encode_uint256_for_topic(value: &str) -> Option<String> {
     let n: u128 = value.parse().ok()?;
     Some(format!("{:064x}", n))
-}
-
-/// Result of late-decode query rewriting.
-#[derive(Debug, Clone)]
-pub struct LateDecodeRewrite {
-    /// The full SQL to execute (WITH raw CTE + wrapped query)
-    pub sql: String,
-    /// Whether any late-decode optimization was applied
-    pub optimized: bool,
-}
-
-/// Rewrite a query for late-decode optimization.
-/// If GROUP BY or ORDER BY uses decoded columns, rewrites to:
-/// 1. Use raw CTE (no decoding)
-/// 2. Replace decoded columns with raw columns in GROUP BY/ORDER BY
-/// 3. Wrap result to decode only final rows
-pub fn rewrite_for_late_decode(
-    sql: &str,
-    sig: &EventSignature,
-    equality_filters: &HashMap<String, String>,
-) -> LateDecodeRewrite {
-    let group_by_cols = extract_group_by_columns(sql);
-    let order_by_cols = extract_order_by_columns(sql);
-    let mappings = sig.get_column_mappings();
-    
-    // Check if any decoded columns are used in GROUP BY or ORDER BY
-    let decoded_in_group_by: Vec<_> = mappings
-        .iter()
-        .filter(|m| group_by_cols.contains(&m.decoded_name.to_lowercase()))
-        .collect();
-    
-    let decoded_in_order_by: Vec<_> = mappings
-        .iter()
-        .filter(|m| order_by_cols.contains(&m.decoded_name.to_lowercase()))
-        .collect();
-    
-    // If no decoded columns in GROUP BY/ORDER BY, use standard approach
-    if decoded_in_group_by.is_empty() && decoded_in_order_by.is_empty() {
-        let used_columns = extract_column_references(sql);
-        let filter = if used_columns.is_empty() {
-            None
-        } else {
-            Some(&used_columns)
-        };
-        let pushdown = if equality_filters.is_empty() {
-            None
-        } else {
-            Some(equality_filters)
-        };
-        let cte = sig.to_cte_sql_duckdb_with_pushdown(filter, pushdown);
-        return LateDecodeRewrite {
-            sql: format!("WITH {cte} {sql}"),
-            optimized: false,
-        };
-    }
-    
-    // Build raw CTE
-    let pushdown = if equality_filters.is_empty() {
-        None
-    } else {
-        Some(equality_filters)
-    };
-    let raw_cte = sig.to_raw_cte_sql_duckdb(pushdown);
-    let event_name = sig.name.to_lowercase();
-    let raw_name = format!("{}_raw", event_name);
-    
-    // Rewrite the SQL to use raw columns in GROUP BY/ORDER BY
-    // This is a simple string replacement - works for most cases
-    let mut rewritten_sql = sql.replace(&event_name, &raw_name);
-    
-    // Track which decoded columns were replaced for outer SELECT decode
-    let mut group_order_columns: Vec<&ColumnMapping> = Vec::new();
-    
-    // Replace ALL decoded column names with their decode expressions or raw columns
-    for mapping in &mappings {
-        let decoded = &mapping.decoded_name;
-        let raw = &mapping.raw_column;
-        
-        // Check if this column is used in GROUP BY or ORDER BY
-        let in_group_by = group_by_cols.contains(&decoded.to_lowercase());
-        let in_order_by = order_by_cols.contains(&decoded.to_lowercase());
-        
-        if in_group_by || in_order_by {
-            // GROUP BY/ORDER BY columns: replace with raw, decode in outer SELECT
-            group_order_columns.push(mapping);
-            
-            // Replace quoted versions: "from" -> topic1
-            rewritten_sql = rewritten_sql.replace(&format!("\"{decoded}\""), raw);
-            // Replace unquoted (case variations)
-            rewritten_sql = rewritten_sql.replace(&format!(" {decoded} "), &format!(" {raw} "));
-            rewritten_sql = rewritten_sql.replace(&format!(" {decoded},"), &format!(" {raw},"));
-            rewritten_sql = rewritten_sql.replace(&format!(",{decoded} "), &format!(",{raw} "));
-            rewritten_sql = rewritten_sql.replace(&format!(",{decoded},"), &format!(",{raw},"));
-        } else {
-            // Non-GROUP-BY columns (e.g. SUM(value)): replace with inline decode expression
-            let decode_expr = &mapping.decode_expr;
-            
-            // Replace quoted versions: "value" -> abi_uint(data, 0)
-            rewritten_sql = rewritten_sql.replace(&format!("\"{decoded}\""), decode_expr);
-            // Replace unquoted in common positions
-            rewritten_sql = rewritten_sql.replace(&format!("({decoded})"), &format!("({decode_expr})"));
-            rewritten_sql = rewritten_sql.replace(&format!("({decoded},"), &format!("({decode_expr},"));
-            rewritten_sql = rewritten_sql.replace(&format!(", {decoded})"), &format!(", {decode_expr})"));
-        }
-    }
-    
-    // Build outer SELECT that decodes the GROUP BY/ORDER BY columns
-    let mut outer_selects = Vec::new();
-    for mapping in &group_order_columns {
-        outer_selects.push(format!(
-            "{} AS \"{}\"",
-            mapping.decode_expr, mapping.decoded_name
-        ));
-    }
-    
-    // Add * to capture other columns (aggregates, etc.)
-    outer_selects.push("*".to_string());
-    
-    // Build the final SQL with decode wrapper
-    let outer_select = outer_selects.join(", ");
-    let final_sql = format!(
-        "WITH {raw_cte} SELECT {outer_select} FROM ({rewritten_sql}) AS _inner"
-    );
-    
-    LateDecodeRewrite {
-        sql: final_sql,
-        optimized: true,
-    }
 }
 
 /// Extract GROUP BY column names from a SQL query.
@@ -926,29 +670,64 @@ impl AbiType {
         }
     }
 
-    // DuckDB decode functions (use tidx_abi extension functions)
+    // ClickHouse decode functions for MaterializedPostgreSQL data
+    // 
+    // IMPORTANT: PostgreSQL bytea columns are stored as '\x'-prefixed hex strings.
+    // e.g., topic1 = '\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
+    // We need to:
+    // 1. Strip the '\x' prefix with substring(..., 3)
+    // 2. Work with hex string (64 chars = 32 bytes) using substring on the hex
+    // 3. unhex() only when we need actual bytes for reinterpret functions
 
-    pub fn topic_decode_sql_duckdb(&self, topic_idx: usize) -> String {
+    pub fn topic_decode_sql_clickhouse(&self, topic_idx: usize) -> String {
         // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
         let col = format!("topic{}", topic_idx.saturating_sub(1));
+        // Strip '\x' prefix: substring(col, 3) gives us the 64-char hex string
         match self {
-            AbiType::Address => format!("abi_address({col})"),
-            AbiType::Uint(_) | AbiType::Int(_) => format!("abi_uint({col})"),
-            AbiType::Bool => format!("abi_bool({col})"),
-            AbiType::Bytes(Some(_) | None) => format!("abi_bytes32({col})"),
-            _ => col,
+            // Address: last 20 bytes = last 40 hex chars, add 0x prefix
+            AbiType::Address => format!("concat('0x', lower(substring({col}, 27)))"),
+            // Uint: unhex the full 64 chars, reverse for big-endian, reinterpret
+            AbiType::Uint(_) | AbiType::Int(_) => {
+                format!("reinterpretAsUInt256(reverse(unhex(substring({col}, 3))))")
+            }
+            // Bool: check last byte (last 2 hex chars)
+            AbiType::Bool => format!("unhex(substring({col}, 67, 2)) != unhex('00')"),
+            // Bytes32: just format as 0x-prefixed, already lowercase
+            AbiType::Bytes(Some(_) | None) => format!("concat('0x', substring({col}, 3))"),
+            _ => format!("concat('0x', substring({col}, 3))"),
         }
     }
 
-    pub fn data_decode_sql_duckdb(&self, offset: usize) -> String {
+    pub fn data_decode_sql_clickhouse(&self, offset: usize) -> String {
+        // data is stored as '\x' + hex string
+        // offset is in bytes, but we're working with hex (2 chars per byte)
+        // +3 to skip '\x' prefix, then offset*2 for hex position
+        let hex_start = 3 + offset * 2;
         match self {
-            AbiType::Address => format!("abi_address(data, {offset})"),
-            AbiType::Uint(_) => format!("abi_uint(data, {offset})"),
-            AbiType::Int(_) => format!("abi_uint(data, {offset})"), // TODO: proper signed handling
-            AbiType::Bool => format!("abi_bool(data, {offset})"),
-            AbiType::Bytes(Some(_) | None) => format!("abi_bytes32(data, {offset})"),
-            AbiType::String => format!("abi_bytes32(data, {offset})"), // TODO: dynamic string support
-            _ => format!("abi_bytes32(data, {offset})"),
+            // Address: skip first 12 bytes (24 hex chars) of 32-byte word, take 20 bytes (40 hex chars)
+            AbiType::Address => {
+                format!("concat('0x', lower(substring(data, {}, 40)))", hex_start + 24)
+            }
+            // Uint: unhex 32 bytes (64 hex chars), reverse, reinterpret
+            AbiType::Uint(_) => {
+                format!("reinterpretAsUInt256(reverse(unhex(substring(data, {hex_start}, 64))))")
+            }
+            AbiType::Int(_) => {
+                format!("reinterpretAsInt256(reverse(unhex(substring(data, {hex_start}, 64))))")
+            }
+            // Bool: check last byte of 32-byte word (last 2 hex chars of 64)
+            AbiType::Bool => {
+                format!("unhex(substring(data, {}, 2)) != unhex('00')", hex_start + 62)
+            }
+            // Bytes32: take 64 hex chars, format with 0x prefix
+            AbiType::Bytes(Some(_) | None) => {
+                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
+            }
+            // String: dynamic, not fully supported yet
+            AbiType::String => {
+                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
+            }
+            _ => format!("concat('0x', lower(substring(data, {hex_start}, 64)))"),
         }
     }
 }
@@ -1040,18 +819,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cte_generation_duckdb() {
+    fn test_cte_generation_clickhouse() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
-        let cte = sig.to_cte_sql_duckdb();
+        let cte = sig.to_cte_sql_clickhouse();
         assert!(cte.contains("transfer AS"));
-        assert!(cte.contains("abi_address(topic1)"));
-        assert!(cte.contains("abi_address(topic2)"));
-        assert!(cte.contains("abi_uint(data, 0)"));
-        // DuckDB uses unhex() to convert hex string to BLOB for selector comparison
-        assert!(cte.contains("selector = unhex('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')"));
+        // ClickHouse: addresses from topics use substring to get last 40 hex chars
+        // topic1 = '\x000...address' -> substring(topic1, 27) gets last 40 chars
+        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
+        // ClickHouse: uint256 from data uses unhex then reinterpret
+        assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
+        // ClickHouse: selector comparison uses string match with '\x' prefix
+        // Note: \\x in the output because we're generating SQL with escaped backslash
+        assert!(cte.contains(r"selector = '\\x"));
     }
 
     #[test]
@@ -1074,35 +857,35 @@ mod tests {
     }
 
     #[test]
-    fn test_cte_filtered_duckdb_only_to() {
+    fn test_cte_filtered_clickhouse_only_to() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
         
         let used_cols: HashSet<String> = ["to"].iter().map(|s| s.to_string()).collect();
-        let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
+        let cte = sig.to_cte_sql_clickhouse_filtered(Some(&used_cols));
         
         // Should include "to" but not "from" or "value"
-        assert!(cte.contains("abi_address(topic2) AS \"to\""));
-        assert!(!cte.contains("\"from\""));
-        assert!(!cte.contains("\"value\""));
+        assert!(cte.contains("AS \"to\""));
+        assert!(!cte.contains("AS \"from\""));
+        assert!(!cte.contains("AS \"value\""));
     }
 
     #[test]
-    fn test_cte_filtered_duckdb_from_and_value() {
+    fn test_cte_filtered_clickhouse_from_and_value() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
         
         let used_cols: HashSet<String> = ["from", "value"].iter().map(|s| s.to_string()).collect();
-        let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
+        let cte = sig.to_cte_sql_clickhouse_filtered(Some(&used_cols));
         
         // Should include "from" and "value" but not "to"
-        assert!(cte.contains("abi_address(topic1) AS \"from\""));
-        assert!(cte.contains("abi_uint(data, 0) AS \"value\""));
-        assert!(!cte.contains("\"to\""));
+        assert!(cte.contains("AS \"from\""));
+        assert!(cte.contains("AS \"value\""));
+        assert!(!cte.contains("AS \"to\""));
     }
 
     #[test]
@@ -1128,7 +911,7 @@ mod tests {
         )
         .unwrap();
         
-        let cte = sig.to_cte_sql_duckdb_filtered(None);
+        let cte = sig.to_cte_sql_clickhouse_filtered(None);
         
         // Should include all columns
         assert!(cte.contains("\"from\""));
@@ -1145,12 +928,14 @@ mod tests {
         .unwrap();
         
         let used_cols: HashSet<String> = ["to", "value"].iter().map(|s| s.to_string()).collect();
-        let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
+        let cte = sig.to_cte_sql_clickhouse_filtered(Some(&used_cols));
         
         // "to" is the second indexed param, so it should still be topic2
-        assert!(cte.contains("abi_address(topic2) AS \"to\""));
-        // "value" is the first data param, so it should still be offset 0
-        assert!(cte.contains("abi_uint(data, 0) AS \"value\""));
+        assert!(cte.contains("topic2"));
+        assert!(cte.contains("AS \"to\""));
+        // "value" is the first data param: hex_start = 3 + 0*2 = 3, so substring(data, 3, 64)
+        assert!(cte.contains("substring(data, 3, 64)"));
+        assert!(cte.contains("AS \"value\""));
     }
 
     // ========================================================================
@@ -1194,56 +979,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_pushdown_address_filter() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let mut filters = HashMap::new();
-        filters.insert("from".to_string(), "0xdAC17F958D2ee523a2206206994597C13D831ec7".to_string());
-        
-        let cte = sig.to_cte_sql_duckdb_with_pushdown(None, Some(&filters));
-        
-        // Should contain pushdown filter on topic1
-        assert!(cte.contains("topic1 = unhex('000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7')"));
-    }
-
-    #[test]
-    fn test_pushdown_multiple_filters() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let mut filters = HashMap::new();
-        filters.insert("from".to_string(), "0xAAA0000000000000000000000000000000000001".to_string());
-        filters.insert("to".to_string(), "0xBBB0000000000000000000000000000000000002".to_string());
-        
-        let cte = sig.to_cte_sql_duckdb_with_pushdown(None, Some(&filters));
-        
-        // Should contain pushdown filters on both topic1 and topic2
-        assert!(cte.contains("topic1 = unhex("));
-        assert!(cte.contains("topic2 = unhex("));
-    }
-
-    #[test]
-    fn test_pushdown_data_field_filter() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let mut filters = HashMap::new();
-        filters.insert("value".to_string(), "1000000".to_string());
-        
-        let cte = sig.to_cte_sql_duckdb_with_pushdown(None, Some(&filters));
-        
-        // Should contain pushdown filter on data slice
-        assert!(cte.contains("substring(data, 1, 32) = unhex('00000000000000000000000000000000000000000000000000000000000f4240')"));
-    }
-
     // ========================================================================
     // Late Decode (GROUP BY / ORDER BY) Tests
     // ========================================================================
@@ -1260,91 +995,4 @@ mod tests {
         assert!(cols.contains("from"));
     }
 
-    #[test]
-    fn test_late_decode_group_by_uses_raw_cte() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let sql = "SELECT \"to\", COUNT(*) as cnt FROM transfer GROUP BY \"to\"";
-        let filters = HashMap::new();
-        let rewrite = rewrite_for_late_decode(sql, &sig, &filters);
-        
-        // Should be optimized
-        assert!(rewrite.optimized);
-        // Should use raw CTE
-        assert!(rewrite.sql.contains("transfer_raw AS"));
-        // Should replace "to" with topic2 in GROUP BY
-        assert!(rewrite.sql.contains("GROUP BY topic2"));
-        // Should wrap in outer SELECT with decode
-        assert!(rewrite.sql.contains("SELECT abi_address(topic2) AS \"to\""));
-        // Should include * to pass through other columns (cnt)
-        assert!(rewrite.sql.contains(", *"));
-        // Should wrap inner query as subquery
-        assert!(rewrite.sql.contains("FROM ("));
-        assert!(rewrite.sql.contains(") AS _inner"));
-    }
-
-    #[test]
-    fn test_late_decode_no_group_by_not_optimized() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let sql = "SELECT * FROM transfer LIMIT 10";
-        let filters = HashMap::new();
-        let rewrite = rewrite_for_late_decode(sql, &sig, &filters);
-        
-        // Should NOT be optimized (no GROUP BY on decoded columns)
-        assert!(!rewrite.optimized);
-        // Should use regular CTE with decoding
-        assert!(rewrite.sql.contains("abi_address"));
-    }
-
-    #[test]
-    fn test_late_decode_order_by_uses_raw() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let sql = "SELECT \"from\", COUNT(*) as cnt FROM transfer GROUP BY \"from\" ORDER BY \"from\"";
-        let filters = HashMap::new();
-        let rewrite = rewrite_for_late_decode(sql, &sig, &filters);
-        
-        // Should be optimized
-        assert!(rewrite.optimized);
-        // Should replace "from" with topic1
-        assert!(rewrite.sql.contains("topic1"));
-    }
-
-    #[test]
-    fn test_get_column_mappings() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)",
-        )
-        .unwrap();
-        
-        let mappings = sig.get_column_mappings();
-        
-        assert_eq!(mappings.len(), 3);
-        
-        // "from" is indexed, maps to topic1
-        assert_eq!(mappings[0].decoded_name, "from");
-        assert_eq!(mappings[0].raw_column, "topic1");
-        assert!(mappings[0].is_indexed);
-        
-        // "to" is indexed, maps to topic2
-        assert_eq!(mappings[1].decoded_name, "to");
-        assert_eq!(mappings[1].raw_column, "topic2");
-        assert!(mappings[1].is_indexed);
-        
-        // "value" is not indexed, uses data
-        assert_eq!(mappings[2].decoded_name, "value");
-        assert_eq!(mappings[2].raw_column, "data");
-        assert!(!mappings[2].is_indexed);
-        assert_eq!(mappings[2].data_offset, Some(0));
-    }
 }
