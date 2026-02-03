@@ -63,6 +63,14 @@ tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parame
 | `postgres` (default) | Point lookups, real-time streaming | `WHERE hash = '0x...'` |
 | `clickhouse` | Aggregations, scans, analytics | `GROUP BY`, `COUNT(*)`, `SUM()` |
 
+```bash
+# PostgreSQL (OLTP) - point lookups
+curl "http://<host>/query?chainId=4217&sql=SELECT * FROM txs WHERE hash = '0x...'"
+
+# ClickHouse (OLAP) - analytics
+curl "http://<host>/query?chainId=4217&engine=clickhouse&sql=SELECT COUNT(*) FROM txs"
+```
+
 ## Installation
 
 ### Docker
@@ -109,7 +117,7 @@ port = 9090
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user:pass@localhost:5432/tidx_mainnet"
+pg_url = "postgres://user:pass@<host>:5432/tidx_mainnet"
 batch_size = 100
 
 # Optional: ClickHouse for OLAP queries (uses MaterializedPostgreSQL)
@@ -121,7 +129,7 @@ url = "http://clickhouse:8123"
 name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.moderato.tempo.xyz"
-pg_url = "postgres://user:pass@localhost:5432/tidx_moderato"
+pg_url = "postgres://user:pass@<host>:5432/tidx_moderato"
 ```
 
 ### Reference
@@ -254,15 +262,15 @@ tidx exposes a HTTP API for querying the indexer.
 
 ```bash
 # Point lookup (auto-routed to PostgreSQL)
-curl "http://localhost:8080/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
+curl "http://<host>/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
 > {"columns":["num","hash","timestamp"],"rows":[[12345,"0xabc...","2024-01-01T00:00:00Z"]],"row_count":1,"engine":"postgres","ok":true}
 
 # Aggregation (auto-routed to ClickHouse)
-curl "http://localhost:8080/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
+curl "http://<host>/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
 > {"columns":["type","count"],"rows":[[0,50000],[2,120000]],"row_count":2,"engine":"clickhouse","ok":true}
 
 # Status
-curl http://localhost:8080/status
+curl http://<host>/status
 > {"ok":true,"chains":[{"chain_id":4217,"synced_num":567890,"head_num":567890,"lag":0}]}
 ```
 
