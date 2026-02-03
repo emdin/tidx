@@ -50,12 +50,30 @@ curl -L https://tidx.vercel.app/docker | bash
 tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parameter to choose:
 
 ```
-┌─────────────────────┐                         ┌─────────────────────┐
-│    PostgreSQL       │       WAL stream        │     ClickHouse      │
-│    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
-│                     │   MaterializedPG        │                     │
-│  engine=postgres    │                         │  engine=clickhouse  │
-└─────────────────────┘                         └─────────────────────┘
+                                              ┌─────────────────────┐
+                                              │      /query         │
+                                              │                     │
+                                              │  ?signature=...     │◄─── Lazy event decoding
+                                              │  ?engine=...        │     (no pre-registration)
+                                              └──────────┬──────────┘
+                                                         │
+              ┌──────────────────────────────────────────┼──────────────────────────────────────────┐
+              │                                          │                                          │
+              ▼                                          ▼                                          ▼
+┌─────────────────────┐                    ┌─────────────────────┐                    ┌─────────────────────┐
+│    PostgreSQL       │     WAL stream     │     ClickHouse      │                    │  Materialized Views │
+│    (OLTP)           │ ─────────────────► │      (OLAP)         │ ─────────────────► │  (auto-updated)     │
+│                     │   MaterializedPG   │                     │                    │                     │
+│  blocks, txs, logs  │                    │  blocks, txs, logs  │                    │  top_holders, etc.  │
+│         │           │                    │         │           │                    └─────────────────────┘
+│         ▼           │                    │         ▼           │
+│  ┌─────────────┐    │                    │  ┌─────────────┐    │
+│  │ Transfer()  │    │                    │  │ Transfer()  │    │
+│  │ Approval()  │    │                    │  │ Approval()  │    │
+│  │ ...         │    │                    │  │ ...         │    │
+│  └─────────────┘    │                    │  └─────────────┘    │
+│   (lazy decode)     │                    │   (lazy decode)     │
+└─────────────────────┘                    └─────────────────────┘
 ```
 
 ```bash
