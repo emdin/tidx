@@ -45,6 +45,9 @@ pub enum ViewsCommand {
         /// ClickHouse engine (default: SummingMergeTree())
         #[arg(long, default_value = "SummingMergeTree()")]
         engine: String,
+        /// Event signature for automatic CTE generation (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
+        #[arg(long)]
+        signature: Option<String>,
     },
     /// Delete a view
     Delete {
@@ -64,6 +67,8 @@ struct CreateViewRequest {
     name: String,
     #[serde(rename = "orderBy")]
     order_by: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
     sql: String,
 }
 
@@ -160,7 +165,7 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
 
-        ViewsCommand::Create { chain_id, name, sql, order_by, engine } => {
+        ViewsCommand::Create { chain_id, name, sql, order_by, engine, signature } => {
             let url = format!("{}/views", base_url);
             let req = CreateViewRequest {
                 chain_id,
@@ -168,6 +173,7 @@ pub async fn run(args: Args) -> Result<()> {
                 sql,
                 order_by,
                 engine,
+                signature,
             };
 
             let resp: CreateViewResponse = client
