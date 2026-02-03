@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use super::{AppState, ApiError};
+use crate::query::EventSignature;
 
 /// Validate view name (alphanumeric + underscore only)
 fn is_valid_view_name(name: &str) -> bool {
@@ -110,6 +111,9 @@ pub struct CreateViewRequest {
     name: String,
     #[serde(rename = "orderBy")]
     order_by: Vec<String>,
+    /// Optional event signature for automatic CTE generation and decoding.
+    /// E.g., "Transfer(address indexed from, address indexed to, uint256 value)"
+    signature: Option<String>,
     sql: String,
 }
 
@@ -151,6 +155,14 @@ pub async fn create_view(
         return Err(ApiError::BadRequest("SQL must be a SELECT statement".to_string()));
     }
 
+    // Parse signature if provided
+    let signature = if let Some(ref sig_str) = req.signature {
+        Some(EventSignature::parse(sig_str)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid signature: {}", e)))?)
+    } else {
+        None
+    };
+
     let clickhouse = state
         .get_clickhouse(Some(req.chain_id))
         .await
@@ -166,6 +178,15 @@ pub async fn create_view(
 
     // Rewrite table references in SQL to include database prefix
     let sql = super::rewrite_analytics_tables(&req.sql, req.chain_id);
+
+    // If signature provided, generate CTE with decoded columns and apply predicate pushdown
+    let sql = if let Some(ref sig) = signature {
+        let sql = sig.rewrite_filters_for_pushdown(&sql);
+        let cte = sig.to_cte_sql_clickhouse();
+        format!("WITH {} {}", cte, sql)
+    } else {
+        sql
+    };
 
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
@@ -347,5 +368,265 @@ mod tests {
         assert!(!is_valid_view_name("123view")); // Starts with number
         assert!(!is_valid_view_name("my-view")); // Has hyphen
         assert!(!is_valid_view_name("my view")); // Has space
+    }
+
+    // ========================================================================
+    // Signature CTE Generation Tests for Views
+    // ========================================================================
+
+    #[test]
+    fn test_signature_generates_cte_for_transfer() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"SELECT "to", SUM("value") as total FROM Transfer GROUP BY "to""#;
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, user_sql);
+        
+        // CTE should include decoded columns
+        assert!(full_sql.contains("AS \"from\""));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("AS \"value\""));
+        
+        // CTE should have proper ClickHouse decode functions
+        assert!(full_sql.contains("concat('0x', lower(substring("));  // address decode
+        assert!(full_sql.contains("reinterpretAsUInt256"));           // uint256 decode
+        
+        // User's query is preserved
+        assert!(full_sql.contains(r#"SELECT "to", SUM("value") as total"#));
+    }
+
+    #[test]
+    fn test_signature_generates_cte_for_swap() {
+        let sig = EventSignature::parse(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // Indexed params: sender (topic1), to (topic2)
+        assert!(cte.contains("AS \"sender\""));
+        assert!(cte.contains("AS \"to\""));
+        
+        // Non-indexed data params
+        assert!(cte.contains("AS \"amount0In\""));
+        assert!(cte.contains("AS \"amount1In\""));
+        assert!(cte.contains("AS \"amount0Out\""));
+        assert!(cte.contains("AS \"amount1Out\""));
+    }
+
+    #[test]
+    fn test_signature_with_bool_param() {
+        let sig = EventSignature::parse("Paused(bool paused)").unwrap();
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // Bool decode uses unhex comparison
+        assert!(cte.contains("unhex("));
+        assert!(cte.contains("!= unhex('00')"));
+        assert!(cte.contains("AS \"paused\""));
+    }
+
+    #[test]
+    fn test_signature_with_bytes32_indexed() {
+        let sig = EventSignature::parse(
+            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // bytes32 indexed is passed through as hex
+        assert!(cte.contains("AS \"role\""));
+        assert!(cte.contains("AS \"account\""));
+        assert!(cte.contains("AS \"sender\""));
+    }
+
+    #[test]
+    fn test_signature_with_int256() {
+        let sig = EventSignature::parse("PriceUpdate(int256 price)").unwrap();
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // int256 uses reinterpretAsInt256
+        assert!(cte.contains("reinterpretAsInt256"));
+        assert!(cte.contains("AS \"price\""));
+    }
+
+    #[test]
+    fn test_signature_predicate_pushdown_in_view() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        // User query with filter on decoded column
+        let user_sql = r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"#;
+        
+        // Apply pushdown
+        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
+        
+        // Should rewrite to topic1 with left-padded address
+        assert!(rewritten.contains("topic1 = '0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7'"));
+        assert!(!rewritten.contains(r#""from" ="#));
+    }
+
+    #[test]
+    fn test_signature_multiple_filters_pushdown() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7' AND "to" = '0xa726a1CD723409074DF9108A2187cfA19899aCF8'"#;
+        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
+        
+        // Both should be rewritten
+        assert!(rewritten.contains("topic1 = '0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7'"));
+        assert!(rewritten.contains("topic2 = '0x000000000000000000000000a726a1cd723409074df9108a2187cfa19899acf8'"));
+    }
+
+    #[test]
+    fn test_signature_non_indexed_not_pushed_down() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        // "value" is not indexed - should not be rewritten
+        let user_sql = r#"SELECT * FROM Transfer WHERE "value" > 1000000"#;
+        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
+        
+        // Should remain unchanged (no equality filter on value anyway)
+        assert_eq!(user_sql, rewritten);
+    }
+
+    #[test]
+    fn test_signature_invalid_address_not_pushed_down() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        // Invalid address (too short) - should not be rewritten
+        let user_sql = r#"SELECT * FROM Transfer WHERE "from" = '0xabc'"#;
+        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
+        
+        // Should remain unchanged
+        assert_eq!(user_sql, rewritten);
+    }
+
+    #[test]
+    fn test_signature_parse_error() {
+        // Missing closing paren
+        let result = EventSignature::parse("Transfer(address indexed from");
+        assert!(result.is_err());
+        
+        // Empty name
+        let result = EventSignature::parse("(address from)");
+        assert!(result.is_err());
+        
+        // Invalid type
+        let result = EventSignature::parse("Transfer(invalid_type from)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cte_selector_filter() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // CTE should filter by selector (topic0)
+        // Transfer selector: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+        assert!(cte.contains("selector ="));
+        assert!(cte.contains("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
+    }
+
+    #[test]
+    fn test_cte_exposes_raw_columns() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // CTE should expose raw columns for filtering
+        assert!(cte.contains("topic1"));
+        assert!(cte.contains("topic2"));
+        assert!(cte.contains("topic3"));
+        assert!(cte.contains("data"));
+        assert!(cte.contains("selector"));
+    }
+
+    #[test]
+    fn test_full_view_sql_generation() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        // Simulate what create_view does
+        let user_sql = r#"SELECT "to", COUNT(*) as cnt, SUM("value") as total FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7' GROUP BY "to""#;
+        
+        // Step 1: Predicate pushdown
+        let sql = sig.rewrite_filters_for_pushdown(user_sql);
+        
+        // Step 2: Add CTE
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, sql);
+        
+        // Verify complete SQL has all components
+        assert!(full_sql.starts_with("WITH transfer AS"));
+        assert!(full_sql.contains("topic1 = '0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7'")); // Pushed down filter
+        assert!(full_sql.contains("AS \"to\"")); // Decoded column
+        assert!(full_sql.contains("AS \"value\"")); // Decoded column
+        assert!(full_sql.contains("GROUP BY \"to\"")); // User's GROUP BY preserved
+    }
+
+    #[test]
+    fn test_approval_event_signature() {
+        let sig = EventSignature::parse(
+            "Approval(address indexed owner, address indexed spender, uint256 value)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // Check all params are decoded
+        assert!(cte.contains("AS \"owner\""));
+        assert!(cte.contains("AS \"spender\""));
+        assert!(cte.contains("AS \"value\""));
+        
+        // Check correct topic assignments
+        assert!(cte.contains("topic1")); // owner
+        assert!(cte.contains("topic2")); // spender
+    }
+
+    #[test]
+    fn test_unnamed_params_get_arg_names() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed, address indexed, uint256)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // Unnamed params should get arg0, arg1, arg2
+        assert!(cte.contains("AS \"arg0\""));
+        assert!(cte.contains("AS \"arg1\""));
+        assert!(cte.contains("AS \"arg2\""));
+    }
+
+    #[test]
+    fn test_mixed_indexed_and_data_params() {
+        // Deposit(address indexed dst, uint256 wad)
+        // dst is indexed (topic1), wad is in data
+        let sig = EventSignature::parse(
+            "Deposit(address indexed dst, uint256 wad)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        
+        // dst from topic1
+        assert!(cte.contains("topic1"));
+        assert!(cte.contains("AS \"dst\""));
+        
+        // wad from data (first 32 bytes)
+        assert!(cte.contains("AS \"wad\""));
+        assert!(cte.contains("substring(data,")); // Data decode
     }
 }
