@@ -8,3 +8,19 @@ pub use parser::{
 };
 pub use router::{route_query, QueryEngine};
 pub use validator::validate_query;
+
+use regex_lite::Regex;
+use std::sync::LazyLock;
+
+/// Regex to match hex literals: '0x' followed by 40+ hex characters (addresses, topics, hashes)
+/// This avoids matching short '0x' prefixes used in concat() expressions
+static HEX_LITERAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"'0x([0-9a-fA-F]{40,})'").unwrap());
+
+/// Convert '0x...' hex literals to '\x...' for ClickHouse/PostgreSQL.
+/// Only replaces hex values of 40+ chars (addresses, topics, hashes), not short '0x' prefixes.
+pub fn convert_hex_literals(sql: &str) -> String {
+    HEX_LITERAL_RE
+        .replace_all(sql, r"'\x$1'")
+        .into_owned()
+}

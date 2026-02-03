@@ -81,8 +81,9 @@ impl ClickHouseEngine {
             sql.to_string()
         };
         
-        // Convert '0x...' hex strings to '\x...' for ClickHouse (MaterializedPostgreSQL format)
-        let sql = sql.replace("'0x", "'\\x");
+        // Convert '0x...' hex literals to '\x...' for ClickHouse (MaterializedPostgreSQL format)
+        // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
+        let sql = crate::query::convert_hex_literals(&sql);
         
         let start = std::time::Instant::now();
         

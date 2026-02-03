@@ -188,8 +188,9 @@ pub async fn create_view(
         sql
     };
     
-    // Convert '0x...' hex strings to '\x...' for ClickHouse (MaterializedPostgreSQL format)
-    let sql = sql.replace("'0x", "'\\x");
+    // Convert '0x...' hex literals to '\x...' for ClickHouse (MaterializedPostgreSQL format)
+    // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
+    let sql = crate::query::convert_hex_literals(&sql);
 
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
@@ -388,7 +389,7 @@ mod tests {
     /// Generate runtime SQL with 0x -> \x conversion (what actually gets executed)
     fn generate_runtime_sql(signature: &str, user_sql: &str) -> String {
         let sql = generate_view_sql(signature, user_sql);
-        sql.replace("'0x", "'\\x")
+        crate::query::convert_hex_literals(&sql)
     }
 
     // ========================================================================
@@ -508,32 +509,21 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_runtime_sql_has_backslash_x_prefix() {
+    fn test_runtime_sql_with_pushdown() {
         let sql = generate_runtime_sql(
             "Transfer(address indexed from, address indexed to, uint256 value)",
             r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"#,
         );
-        
-        // Runtime SQL should have \x prefix (for ClickHouse MaterializedPostgreSQL format)
-        assert!(sql.contains(r"'\x"), "Runtime SQL should use \\x prefix");
-        assert!(!sql.contains("'0x"), "Runtime SQL should not have 0x prefix in literals");
-        
-        // Pushdown should have converted topic1 filter
-        assert!(sql.contains("topic1 ="), "Pushdown should replace with topic1");
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_runtime_sql_selector_format() {
+    fn test_runtime_sql_simple_query() {
         let sql = generate_runtime_sql(
             "Transfer(address indexed from, address indexed to, uint256 value)",
             r#"SELECT * FROM Transfer LIMIT 1"#,
         );
-        
-        // Selector in WHERE clause should use \x format for ClickHouse
-        // The CTE format string '\\x' produces "\\x" (escaped backslash) in the string
-        assert!(sql.contains("selector = '\\\\x") || sql.contains(r"selector = '\x"), 
-            "Selector should use \\x format");
-        assert!(sql.contains("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
+        assert_snapshot!(sql);
     }
 
     // ========================================================================
