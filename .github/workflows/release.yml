@@ -10,10 +10,35 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      published: ${{ steps.changelogs.outputs.published }}
+      publishedPackages: ${{ steps.changelogs.outputs.publishedPackages }}
     steps:
       - uses: actions/checkout@v4
-      - uses: wevm/changelogs-rs@master
+      - id: changelogs
+        uses: wevm/changelogs-rs@master
         with:
           conventional-commit: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build and upload binaries after release
+  binaries:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    uses: ./.github/workflows/binary.yml
+    with:
+      tag: ${{ fromJson(needs.release.outputs.publishedPackages)[0].tag }}
+    permissions:
+      contents: write
+
+  # Build and push Docker image after release
+  docker:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: ${{ fromJson(needs.release.outputs.publishedPackages)[0].tag }}
+    permissions:
+      contents: read
+      packages: write
