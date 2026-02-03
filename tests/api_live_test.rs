@@ -254,7 +254,7 @@ async fn test_query_rejects_non_select() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

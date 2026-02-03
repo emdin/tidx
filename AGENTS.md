@@ -18,7 +18,7 @@ cargo build --release # Release build
 docker compose -f docker/local/docker-compose.yml up -d postgres tempo
 
 # Wait for services to be healthy
-docker compose -f docker-compose.test.yml ps
+docker compose -f docker/local/docker-compose.yml ps
 
 # Run tests
 cargo test
@@ -100,7 +100,9 @@ cargo bench
 - `src/db/` - Database pool and schema management
 - `src/types.rs` - Core data types (BlockRow, TxRow, LogRow)
 - `migrations/` - SQL migrations
-- `tests/common/` - Test infrastructure (real Tempo node, TestDb)
+- `tests/common/` - Test infrastructure (real Tempo node, TestDb, TestClickHouse)
+- `tests/smoke_test.rs` - PostgreSQL integration tests (sync, queries, events)
+- `tests/clickhouse_test.rs` - ClickHouse OLAP integration tests
 
 ## Tempo Networks
 

@@ -17,7 +17,7 @@ pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
 backfill = true
 batch_size = 100
 
-# ClickHouse OLAP engine (optional, disabled for local dev)
-# [chains.clickhouse]
-# enabled = true
-# url = "http://clickhouse:8123"
+# ClickHouse OLAP engine
+[chains.clickhouse]
+enabled = true
+url = "http://clickhouse:8123"

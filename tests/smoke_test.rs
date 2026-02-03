@@ -1013,4 +1013,269 @@ async fn test_event_signature_topic0() {
     assert!(sig.topic0_hex().starts_with("8c5be1e5"));
 }
 
+// ============================================================================
+// Event CTE generation tests (various signatures)
+// ============================================================================
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_transfer_with_indexed_params() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    // Test that the CTE generates correct SQL with indexed params
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT "from", "to", value FROM transfer LIMIT 5"#,
+        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &opts,
+    )
+    .await
+    .expect("Query with indexed params failed");
+
+    assert_eq!(result.engine.as_deref(), Some("postgres"));
+    assert!(result.columns.contains(&"from".to_string()));
+    assert!(result.columns.contains(&"to".to_string()));
+    assert!(result.columns.contains(&"value".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_approval_signature() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT owner, spender, value FROM Approval LIMIT 5"#,
+        Some("Approval(address indexed owner, address indexed spender, uint256 value)"),
+        &opts,
+    )
+    .await
+    .expect("Query with Approval signature failed");
+
+    assert!(result.columns.contains(&"owner".to_string()));
+    assert!(result.columns.contains(&"spender".to_string()));
+    assert!(result.columns.contains(&"value".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_swap_complex_signature() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT sender, "amount0In", "amount1In", "amount0Out", "amount1Out", "to" FROM Swap LIMIT 5"#,
+        Some("Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"),
+        &opts,
+    )
+    .await
+    .expect("Query with Swap signature failed");
+
+    assert!(result.columns.contains(&"sender".to_string()));
+    assert!(result.columns.contains(&"amount0In".to_string()));
+    assert!(result.columns.contains(&"to".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_with_aggregation() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT "to", COUNT(*) as cnt FROM transfer GROUP BY "to" ORDER BY cnt DESC LIMIT 10"#,
+        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &opts,
+    )
+    .await
+    .expect("Aggregation query failed");
+
+    assert!(result.columns.contains(&"to".to_string()));
+    assert!(result.columns.contains(&"cnt".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_case_insensitive_table_name() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    // Query with lowercase table name, signature has "Transfer" with capital T
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT * FROM transfer LIMIT 1"#,
+        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &opts,
+    )
+    .await
+    .expect("Case-insensitive table query failed");
+
+    assert!(result.columns.contains(&"from".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_with_hex_filter() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    // Query with a hex address filter - should be converted to bytea
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT * FROM blocks WHERE miner = '0x0000000000000000000000000000000000000000' LIMIT 1"#,
+        None,
+        &opts,
+    )
+    .await
+    .expect("Hex filter query failed");
+
+    assert_eq!(result.engine.as_deref(), Some("postgres"));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_bytes32_indexed_param() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT role, account, sender FROM RoleGranted LIMIT 5"#,
+        Some("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"),
+        &opts,
+    )
+    .await
+    .expect("Query with bytes32 indexed param failed");
+
+    assert!(result.columns.contains(&"role".to_string()));
+    assert!(result.columns.contains(&"account".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_bool_param() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT paused FROM Paused LIMIT 5"#,
+        Some("Paused(bool paused)"),
+        &opts,
+    )
+    .await
+    .expect("Query with bool param failed");
+
+    assert!(result.columns.contains(&"paused".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_unnamed_params() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    // Unnamed params should become arg0, arg1, arg2
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT arg0, arg1, arg2 FROM Transfer LIMIT 5"#,
+        Some("Transfer(address indexed, address indexed, uint256)"),
+        &opts,
+    )
+    .await
+    .expect("Query with unnamed params failed");
+
+    assert!(result.columns.contains(&"arg0".to_string()));
+    assert!(result.columns.contains(&"arg1".to_string()));
+    assert!(result.columns.contains(&"arg2".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_int256_param() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT price FROM PriceUpdate LIMIT 5"#,
+        Some("PriceUpdate(int256 price)"),
+        &opts,
+    )
+    .await
+    .expect("Query with int256 param failed");
+
+    assert!(result.columns.contains(&"price".to_string()));
+}
+
+// ============================================================================
+// Complex query pattern tests
+// ============================================================================
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_token_holder_pattern() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    // Token holder balance calculation pattern
+    let sql = r#"
+        SELECT holder, SUM(delta) as balance
+        FROM (
+            SELECT "to" as holder, CAST(value AS numeric) as delta FROM Transfer
+            UNION ALL
+            SELECT "from" as holder, -CAST(value AS numeric) as delta FROM Transfer
+        ) t
+        GROUP BY holder
+        HAVING SUM(delta) > 0
+        LIMIT 10
+    "#;
+
+    let result = execute_query_postgres(
+        &db.pool,
+        sql,
+        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &opts,
+    )
+    .await
+    .expect("Token holder pattern query failed");
+
+    assert!(result.columns.contains(&"holder".to_string()));
+    assert!(result.columns.contains(&"balance".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_daily_stats_pattern() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let sql = r#"
+        SELECT 
+            DATE(block_timestamp) as day,
+            COUNT(*) as transfer_count,
+            COUNT(DISTINCT "from") as unique_senders
+        FROM Transfer
+        GROUP BY DATE(block_timestamp)
+        ORDER BY day DESC
+        LIMIT 10
+    "#;
+
+    let result = execute_query_postgres(
+        &db.pool,
+        sql,
+        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &opts,
+    )
+    .await
+    .expect("Daily stats pattern query failed");
+
+    assert!(result.columns.contains(&"day".to_string()));
+    assert!(result.columns.contains(&"transfer_count".to_string()));
+}
+
 

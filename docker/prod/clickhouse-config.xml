@@ -1,5 +1,6 @@
 <clickhouse>
     <!-- Enable MaterializedPostgreSQL engine for real-time WAL replication -->
+    <allow_experimental_database_materialized_postgresql>1</allow_experimental_database_materialized_postgresql>
     <allow_experimental_materialized_postgresql_table>1</allow_experimental_materialized_postgresql_table>
     
     <!-- Allow reading from localhost PostgreSQL -->
