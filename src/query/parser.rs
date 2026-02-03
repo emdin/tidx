@@ -90,7 +90,7 @@ impl EventSignature {
 
         format!(
             r#"{name} AS (
-    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address{select_clause}
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
     WHERE selector = '\x{topic0}'
 )"#,
@@ -143,7 +143,7 @@ impl EventSignature {
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
-           {address_col}{select_clause}
+           {address_col}, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
     WHERE selector = '\\x{topic0}'
 )"#,
