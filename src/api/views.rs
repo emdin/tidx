@@ -629,4 +629,260 @@ mod tests {
         assert!(cte.contains("AS \"wad\""));
         assert!(cte.contains("substring(data,")); // Data decode
     }
+
+    // ========================================================================
+    // Complex Real-World View Tests
+    // ========================================================================
+
+    #[test]
+    fn test_token_holders_view() {
+        // Token holders view: tracks balance per (token, address)
+        // Needs to sum incoming transfers and subtract outgoing
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        // This is a complex query that creates a holder balance view
+        // It unions incoming (+value) and outgoing (-value) transfers
+        let user_sql = r#"
+            SELECT 
+                address as token,
+                holder,
+                SUM(delta) as balance
+            FROM (
+                SELECT address, "to" as holder, CAST("value" AS Int256) as delta FROM Transfer
+                UNION ALL
+                SELECT address, "from" as holder, -CAST("value" AS Int256) as delta FROM Transfer
+            )
+            GROUP BY token, holder
+            HAVING balance > 0
+        "#;
+        
+        let sql = sig.rewrite_filters_for_pushdown(user_sql);
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, sql);
+        
+        // Verify CTE has all required decoded columns
+        assert!(full_sql.contains("AS \"from\""));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("AS \"value\""));
+        
+        // Verify user query structure preserved
+        assert!(full_sql.contains("UNION ALL"));
+        assert!(full_sql.contains("GROUP BY token, holder"));
+        assert!(full_sql.contains("HAVING balance > 0"));
+    }
+
+    #[test]
+    fn test_token_supply_view() {
+        // Token supply view: tracks total supply per token
+        // Supply = sum of mints (from = 0x0) - sum of burns (to = 0x0)
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"
+            SELECT 
+                address as token,
+                SUM(CASE 
+                    WHEN "from" = '0x0000000000000000000000000000000000000000' THEN CAST("value" AS Int256)
+                    WHEN "to" = '0x0000000000000000000000000000000000000000' THEN -CAST("value" AS Int256)
+                    ELSE 0
+                END) as supply
+            FROM Transfer
+            GROUP BY token
+        "#;
+        
+        let sql = sig.rewrite_filters_for_pushdown(user_sql);
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, sql);
+        
+        // Verify structure
+        assert!(full_sql.contains("AS \"from\""));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("AS \"value\""));
+        assert!(full_sql.contains("CASE"));
+        assert!(full_sql.contains("GROUP BY token"));
+    }
+
+    #[test]
+    fn test_transfer_count_per_address_view() {
+        // Count transfers per address (both sent and received)
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"
+            SELECT 
+                addr,
+                SUM(sent) as total_sent,
+                SUM(received) as total_received,
+                SUM(sent) + SUM(received) as total_transfers
+            FROM (
+                SELECT "from" as addr, 1 as sent, 0 as received FROM Transfer
+                UNION ALL
+                SELECT "to" as addr, 0 as sent, 1 as received FROM Transfer
+            )
+            GROUP BY addr
+            ORDER BY total_transfers DESC
+        "#;
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, user_sql);
+        
+        assert!(full_sql.contains("AS \"from\""));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("UNION ALL"));
+        assert!(full_sql.contains("ORDER BY total_transfers DESC"));
+    }
+
+    #[test]
+    fn test_uniswap_swap_volume_view() {
+        // Uniswap V2 swap volume aggregation
+        let sig = EventSignature::parse(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
+        ).unwrap();
+        
+        let user_sql = r#"
+            SELECT 
+                address as pair,
+                toStartOfHour(block_timestamp) as hour,
+                COUNT(*) as swap_count,
+                SUM("amount0In") + SUM("amount0Out") as volume0,
+                SUM("amount1In") + SUM("amount1Out") as volume1
+            FROM Swap
+            GROUP BY pair, hour
+            ORDER BY hour DESC
+        "#;
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, user_sql);
+        
+        // Verify all data params are decoded
+        assert!(full_sql.contains("AS \"sender\""));
+        assert!(full_sql.contains("AS \"amount0In\""));
+        assert!(full_sql.contains("AS \"amount1In\""));
+        assert!(full_sql.contains("AS \"amount0Out\""));
+        assert!(full_sql.contains("AS \"amount1Out\""));
+        assert!(full_sql.contains("AS \"to\""));
+        
+        // Verify aggregation structure
+        assert!(full_sql.contains("toStartOfHour"));
+        assert!(full_sql.contains("GROUP BY pair, hour"));
+    }
+
+    #[test]
+    fn test_approval_allowances_view() {
+        // Track current allowances from Approval events (last approval wins)
+        let sig = EventSignature::parse(
+            "Approval(address indexed owner, address indexed spender, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"
+            SELECT 
+                address as token,
+                "owner",
+                "spender",
+                argMax("value", block_num) as current_allowance
+            FROM Approval
+            GROUP BY token, "owner", "spender"
+        "#;
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, user_sql);
+        
+        assert!(full_sql.contains("AS \"owner\""));
+        assert!(full_sql.contains("AS \"spender\""));
+        assert!(full_sql.contains("AS \"value\""));
+        assert!(full_sql.contains("argMax"));
+    }
+
+    #[test]
+    fn test_filtered_token_holders_view() {
+        // Token holders for a specific token address
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        // Filter by specific token contract using address column
+        let user_sql = r#"
+            SELECT 
+                "to" as holder,
+                SUM(CAST("value" AS Int256)) as balance
+            FROM Transfer
+            WHERE address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+            GROUP BY holder
+            HAVING balance > 0
+        "#;
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, user_sql);
+        
+        // Address filter preserved (not a decoded column, no pushdown)
+        assert!(full_sql.contains("address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("AS \"value\""));
+    }
+
+    #[test]
+    fn test_daily_transfer_stats_view() {
+        // Daily transfer statistics
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"
+            SELECT 
+                toDate(block_timestamp) as day,
+                address as token,
+                COUNT(*) as transfer_count,
+                COUNT(DISTINCT "from") as unique_senders,
+                COUNT(DISTINCT "to") as unique_receivers,
+                SUM("value") as total_volume,
+                AVG("value") as avg_transfer_size
+            FROM Transfer
+            GROUP BY day, token
+            ORDER BY day DESC, total_volume DESC
+        "#;
+        
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, user_sql);
+        
+        assert!(full_sql.contains("AS \"from\""));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("AS \"value\""));
+        assert!(full_sql.contains("toDate(block_timestamp)"));
+        assert!(full_sql.contains("COUNT(DISTINCT"));
+    }
+
+    #[test]
+    fn test_whale_transfers_view() {
+        // Large transfers (whales) - filters on non-indexed value column
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        
+        let user_sql = r#"
+            SELECT 
+                block_num,
+                block_timestamp,
+                address as token,
+                "from",
+                "to",
+                "value"
+            FROM Transfer
+            WHERE "value" > 1000000000000000000000
+            ORDER BY block_num DESC
+        "#;
+        
+        let sql = sig.rewrite_filters_for_pushdown(user_sql);
+        let cte = sig.to_cte_sql_clickhouse();
+        let full_sql = format!("WITH {} {}", cte, sql);
+        
+        // value filter should NOT be pushed down (not indexed, not equality)
+        assert!(full_sql.contains("\"value\" > 1000000000000000000000"));
+        assert!(full_sql.contains("AS \"from\""));
+        assert!(full_sql.contains("AS \"to\""));
+        assert!(full_sql.contains("AS \"value\""));
+    }
 }
