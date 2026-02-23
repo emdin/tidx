@@ -183,6 +183,12 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
+    /// Environment variable name containing the `tidx_api` role password.
+    /// When set, the HTTP API uses a separate read-only connection pool
+    /// as the `tidx_api` user with this password.
+    #[serde(default)]
+    pub api_pg_password_env: Option<String>,
+
     /// ClickHouse OLAP settings (for analytical queries via MaterializedPostgreSQL)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
@@ -253,6 +259,31 @@ impl ChainConfig {
                 Ok(url.to_string())
             }
             None => Ok(self.pg_url.clone()),
+        }
+    }
+
+    /// Returns a separate API database URL if `api_pg_password_env` is configured.
+    /// The URL is derived from `pg_url` with the username set to `tidx_api`
+    /// and the password from the specified environment variable.
+    pub fn resolved_api_pg_url(&self) -> Result<Option<String>> {
+        match &self.api_pg_password_env {
+            Some(pass_env) => {
+                let password = std::env::var(pass_env).with_context(|| {
+                    format!("api_pg_password_env '{pass_env}' is set but environment variable not found")
+                })?;
+
+                let base_url = self.resolved_pg_url()?;
+                let mut url = url::Url::parse(&base_url)
+                    .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
+
+                url.set_username("tidx_api")
+                    .map_err(|()| anyhow::anyhow!("Failed to set API username in pg_url"))?;
+                url.set_password(Some(&password))
+                    .map_err(|()| anyhow::anyhow!("Failed to set API password in pg_url"))?;
+
+                Ok(Some(url.to_string()))
+            }
+            None => Ok(None),
         }
     }
 }
@@ -402,6 +433,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            api_pg_password_env: None,
             clickhouse: None,
         };
         
@@ -422,6 +454,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            api_pg_password_env: None,
             clickhouse: None,
         };
         
@@ -444,6 +477,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            api_pg_password_env: None,
             clickhouse: None,
         };
         
