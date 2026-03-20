@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::fmt::Write;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -13,7 +12,7 @@ pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
 }
 
-/// Batch insert multiple blocks in a single query
+/// Batch insert blocks using COPY BINARY via a staging temp table
 pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
@@ -22,44 +21,59 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     let start = Instant::now();
     let conn = pool.get().await?;
 
-    // Build multi-row VALUES clause
-    let mut query = String::from(
-        "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) VALUES ",
-    );
+    conn.execute("BEGIN", &[]).await?;
+    conn.execute(
+        "CREATE TEMP TABLE _staging_blocks (LIKE blocks INCLUDING DEFAULTS) ON COMMIT DROP",
+        &[],
+    )
+    .await?;
 
-    for (i, _block) in blocks.iter().enumerate() {
-        if i > 0 {
-            query.push_str(", ");
-        }
-        let base = i * 9;
-        write!(
-            &mut query,
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-            base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7, base + 8, base + 9
-        )?;
+    let types = &[
+        Type::INT8,        // num
+        Type::BYTEA,       // hash
+        Type::BYTEA,       // parent_hash
+        Type::TIMESTAMPTZ, // timestamp
+        Type::INT8,        // timestamp_ms
+        Type::INT8,        // gas_limit
+        Type::INT8,        // gas_used
+        Type::BYTEA,       // miner
+        Type::BYTEA,       // extra_data
+    ];
+
+    let sink = conn
+        .copy_in(
+            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+        )
+        .await?;
+
+    let writer = BinaryCopyInWriter::new(sink, types);
+    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+    for block in blocks {
+        pinned_writer
+            .as_mut()
+            .write(&[
+                &block.num,
+                &block.hash,
+                &block.parent_hash,
+                &block.timestamp,
+                &block.timestamp_ms,
+                &block.gas_limit,
+                &block.gas_used,
+                &block.miner,
+                &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+            ])
+            .await?;
     }
 
-    query.push_str(" ON CONFLICT (timestamp, num) DO NOTHING");
+    pinned_writer.as_mut().finish().await?;
 
-    // Collect params - need to store values to extend lifetime
-    let param_values: Vec<_> = blocks
-        .iter()
-        .flat_map(|b| {
-            vec![
-                &b.num as &(dyn tokio_postgres::types::ToSql + Sync),
-                &b.hash,
-                &b.parent_hash,
-                &b.timestamp,
-                &b.timestamp_ms,
-                &b.gas_limit,
-                &b.gas_used,
-                &b.miner,
-                &b.extra_data,
-            ]
-        })
-        .collect();
-
-    conn.execute(&query, &param_values).await?;
+    conn.execute(
+        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
+        &[],
+    )
+    .await?;
+    conn.execute("COMMIT", &[]).await?;
 
     metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
     metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
@@ -465,9 +479,28 @@ pub async fn get_block_hash(pool: &Pool, block_num: u64) -> Result<Option<Vec<u8
     Ok(row.map(|r| r.get(0)))
 }
 
+/// Fast check: are there any gaps in [from, to]?
+/// Uses COUNT + btree index scan — O(range) not O(table).
+pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
+    if to < from {
+        return Ok(false);
+    }
+    let conn = pool.get().await?;
+    let row = conn
+        .query_one(
+            "SELECT COUNT(*) FROM blocks WHERE num >= $1 AND num <= $2",
+            &[&(from as i64), &(to as i64)],
+        )
+        .await?;
+    let count: i64 = row.get(0);
+    let expected = (to - from + 1) as i64;
+    Ok(count != expected)
+}
+
 /// Detect gaps in the block sequence (between existing blocks only)
-/// Returns a list of (start, end) ranges that are missing
-pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
+/// Returns a list of (start, end) ranges that are missing.
+/// `below` bounds the scan to `num <= below`, avoiding a full-table scan.
+pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
 
     let rows = conn
@@ -476,12 +509,13 @@ pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
             WITH numbered AS (
                 SELECT num, LAG(num) OVER (ORDER BY num) as prev_num
                 FROM blocks
+                WHERE num <= $1
             )
             SELECT prev_num + 1 as gap_start, num - 1 as gap_end
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[],
+            &[&(below as i64)],
         )
         .await?;
 
@@ -530,7 +564,7 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
         .await?
         .get(0);
 
-    let mut gaps = detect_gaps(pool).await?;
+    let mut gaps = detect_gaps(pool, tip_num).await?;
 
     // Add gap from block 1 to first block (if we have any blocks and min > 1)
     // Block 0 is typically empty/genesis, so we start from block 1
