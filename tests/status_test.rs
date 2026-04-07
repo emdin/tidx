@@ -8,6 +8,8 @@ use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use deadpool_postgres::{Config as PgConfig, Runtime};
+use tokio_postgres::NoTls;
 use tower::Service;
 
 use tidx::api;
@@ -99,6 +101,79 @@ async fn test_status_includes_postgres_watermarks() {
         pg["receipts"].as_i64().unwrap() >= 997_000,
         "receipts watermark should be >= 997_000, got {:?}",
         pg["receipts"]
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_status_includes_configured_chain_when_sync_state_is_empty() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let chains = json["chains"].as_array().expect("chains should be array");
+    assert_eq!(chains.len(), 1, "expected configured chain to be present");
+    assert_eq!(chains[0]["chain_id"], 1);
+}
+
+#[tokio::test]
+async fn test_status_surfaces_query_failures() {
+    let broadcaster = Arc::new(Broadcaster::new());
+    let mut pools = HashMap::new();
+    let chain_id = 1u64;
+
+    let mut cfg = PgConfig::new();
+    cfg.url = Some("postgres://tidx:tidx@127.0.0.1:1/tidx?connect_timeout=1".to_string());
+    let broken_pool = cfg
+        .create_pool(Some(Runtime::Tokio1), NoTls)
+        .expect("failed to create broken pool");
+    pools.insert(chain_id, broken_pool);
+
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Failed to load status for chain 1"),
+        "unexpected error body: {json:?}"
     );
 }
 

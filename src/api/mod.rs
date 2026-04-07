@@ -21,6 +21,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use chrono::Utc;
 
 use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
@@ -198,11 +199,17 @@ const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") { rev } else { "
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let mut all_chains = Vec::new();
     let pools = state.pools.read().await;
-    for pool in pools.values() {
-        if let Ok(chains) = crate::service::get_all_status(pool).await {
+    for (chain_id, pool) in pools.iter() {
+        let chains = crate::service::get_all_status(pool)
+            .await
+            .map_err(|e| ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}")))?;
+        if chains.is_empty() {
+            all_chains.push(empty_status(*chain_id));
+        } else {
             all_chains.extend(chains);
         }
     }
+    all_chains.sort_by_key(|chain| chain.chain_id);
 
     // Populate per-table store status for each chain
     let ch_configs = state.clickhouse_configs.read().await;
@@ -242,6 +249,25 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         rev: GIT_REV,
         chains: all_chains,
     }))
+}
+
+fn empty_status(chain_id: u64) -> SyncStatus {
+    SyncStatus {
+        chain_id: chain_id as i64,
+        head_num: 0,
+        synced_num: 0,
+        tip_num: 0,
+        lag: 0,
+        gap_blocks: 0,
+        gaps: Vec::new(),
+        backfill_num: None,
+        backfill_remaining: 0,
+        sync_rate: None,
+        eta_secs: None,
+        updated_at: Utc::now(),
+        postgres: None,
+        clickhouse: None,
+    }
 }
 
 #[derive(Deserialize)]
