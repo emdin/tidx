@@ -767,6 +767,85 @@ body[data-page-mode="home"] .header-search-slot {
   gap: 14px;
 }
 
+.panel-stack-tight {
+  gap: 10px;
+  padding: 14px;
+}
+
+.split-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.subpanel-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-card);
+  box-shadow: var(--shadow-panel);
+  overflow: hidden;
+}
+
+.subpanel-title {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.definition-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.definition-item {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px dashed var(--color-distinct);
+}
+
+.definition-item:last-child {
+  border-bottom: 0;
+}
+
+.definition-label {
+  color: var(--color-secondary);
+  font-size: 12px;
+}
+
+.definition-value {
+  min-width: 0;
+  color: var(--color-primary);
+  font-size: 13px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.code-block {
+  margin: 0;
+  padding: 16px;
+  color: var(--color-primary);
+  background: var(--color-card-soft);
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.empty-mini {
+  padding: 16px;
+  color: var(--color-secondary);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 .kpi-grid {
   display: grid;
   gap: 14px;
@@ -985,6 +1064,10 @@ body[data-page-mode="home"] .header-search-slot {
   .kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .split-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 799px) {
@@ -1000,5 +1083,13 @@ body[data-page-mode="home"] .header-search-slot {
   .pagination-actions {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .definition-item {
+    grid-template-columns: 1fr;
+  }
+
+  .definition-value {
+    text-align: left;
   }
 }

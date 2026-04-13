@@ -1,5 +1,9 @@
 const PAGE_SIZE = 25;
 const AUTO_REFRESH_MS = 10_000;
+const PORTFOLIO_PAGE_SIZE = 12;
+const TOKEN_HOLDER_PAGE_SIZE = 10;
+const TOKEN_TRANSFER_PAGE_SIZE = 15;
+const CONTRACT_METHOD_PAGE_SIZE = 12;
 
 const TOPICS = {
   transfer: "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
@@ -9,6 +13,62 @@ const TOPICS = {
 const KNOWN_EVENTS = {
   [TOPICS.transfer]: "Transfer",
   [TOPICS.approval]: "Approval",
+};
+
+const KNOWN_METHODS = {
+  "0x06fdde03": { label: "name()", args: [] },
+  "0x095ea7b3": {
+    label: "approve(address,uint256)",
+    args: [
+      { label: "spender", type: "address" },
+      { label: "value", type: "uint256" },
+    ],
+  },
+  "0x18160ddd": { label: "totalSupply()", args: [] },
+  "0x23b872dd": {
+    label: "transferFrom(address,address,uint256)",
+    args: [
+      { label: "from", type: "address" },
+      { label: "to", type: "address" },
+      { label: "value", type: "uint256" },
+    ],
+  },
+  "0x313ce567": { label: "decimals()", args: [] },
+  "0x42842e0e": {
+    label: "safeTransferFrom(address,address,uint256)",
+    args: [
+      { label: "from", type: "address" },
+      { label: "to", type: "address" },
+      { label: "tokenId", type: "uint256" },
+    ],
+  },
+  "0x70a08231": {
+    label: "balanceOf(address)",
+    args: [{ label: "account", type: "address" }],
+  },
+  "0x95d89b41": { label: "symbol()", args: [] },
+  "0xa9059cbb": {
+    label: "transfer(address,uint256)",
+    args: [
+      { label: "to", type: "address" },
+      { label: "value", type: "uint256" },
+    ],
+  },
+  "0xb88d4fde": {
+    label: "safeTransferFrom(address,address,uint256,bytes)",
+    args: [
+      { label: "from", type: "address" },
+      { label: "to", type: "address" },
+      { label: "tokenId", type: "uint256" },
+    ],
+  },
+  "0xdd62ed3e": {
+    label: "allowance(address,address)",
+    args: [
+      { label: "owner", type: "address" },
+      { label: "spender", type: "address" },
+    ],
+  },
 };
 
 const state = {
@@ -463,6 +523,11 @@ async function renderReceiptPage(hash) {
         txs.block_timestamp,
         txs.idx,
         encode(txs.hash, 'hex') AS hash,
+        CASE
+          WHEN octet_length(txs.input) >= 4 THEN encode(substring(txs.input FROM 1 FOR 4), 'hex')
+          ELSE NULL
+        END AS selector,
+        encode(txs.input, 'hex') AS input_data,
         encode(txs."from", 'hex') AS from_addr,
         encode(txs."to", 'hex') AS to_addr,
         txs.value,
@@ -505,6 +570,10 @@ async function renderReceiptPage(hash) {
 
   const statusKind = tx.status === null ? "pending" : Number(tx.status) === 1 ? "success" : "failed";
   const gasFee = multiplyNumericStrings(tx.gas_used, tx.effective_gas_price);
+  const decodedInput = decodeCallData(tx.input_data);
+  const selector = tx.selector ? with0x(tx.selector) : decodedInput?.selector || null;
+  const methodLabel = decodedInput?.label || methodName(selector);
+  const inputLength = tx.input_data ? Math.max(0, tx.input_data.length / 2) : 0;
 
   elements.pageRoot.innerHTML = `
     <section class="content-page">
@@ -523,6 +592,7 @@ async function renderReceiptPage(hash) {
         ${renderKpiCard("Logs", formatNumber(logRows.length), "Event rows emitted")}
         ${renderKpiCard("Gas used", formatNumber(tx.gas_used), "Execution gas consumed")}
         ${renderKpiCard("Fee", gasFee ? formatNumericString(gasFee) : "-", "gas_used × effective_gas_price")}
+        ${renderKpiCard("Method", methodLabel || "-", selector ? selector : "No calldata selector")}
       </section>
 
       <div class="page-grid">
@@ -537,22 +607,37 @@ async function renderReceiptPage(hash) {
           ${renderSummaryRow("Nonce", formatNumber(tx.nonce))}
           ${renderSummaryRow("Type", formatNumber(tx.type))}
           ${renderSummaryRow("Value", formatNumericString(tx.value || "0"))}
+          ${renderSummaryRow("Selector", selector ? `<span class="wrap-anywhere">${escapeHtml(selector)}</span>` : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Gas limit", formatNumber(tx.gas_limit))}
           ${renderSummaryRow("Gas price", tx.effective_gas_price ? formatNumericString(tx.effective_gas_price) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Cumulative gas", tx.cumulative_gas_used ? formatNumber(tx.cumulative_gas_used) : '<span class="text-secondary">-</span>')}
         </aside>
 
-        <section class="panel-card">
-          <div class="panel-header">
-            <div>
-              <div class="panel-title">Logs</div>
-              <div class="panel-subtitle">${formatNumber(logRows.length)} log(s) recorded for this receipt</div>
+        <div class="panel-stack">
+          <section class="panel-card">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Function input</div>
+                <div class="panel-subtitle">${methodLabel || "Raw calldata"} · ${formatNumber(inputLength)} byte(s)</div>
+              </div>
             </div>
-          </div>
-          <div class="panel-body table-wrap">
-            ${renderLogsTable(logRows)}
-          </div>
-        </section>
+            <div class="panel-body">
+              ${renderInputPanel(tx.input_data, decodedInput)}
+            </div>
+          </section>
+
+          <section class="panel-card">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Logs</div>
+                <div class="panel-subtitle">${formatNumber(logRows.length)} log(s) recorded for this receipt</div>
+              </div>
+            </div>
+            <div class="panel-body table-wrap">
+              ${renderLogsTable(logRows)}
+            </div>
+          </section>
+        </div>
       </div>
     </section>
   `;
@@ -567,37 +652,40 @@ async function renderAddressPage(address, requestedTab, page) {
   const body = hexBody(address);
   const padded = paddedAddressTopic(address);
 
-  const summaryRows = await runQuery(`
-    SELECT
-      (SELECT COUNT(*) FROM txs WHERE "from" = decode('${body}', 'hex') OR "to" = decode('${body}', 'hex')) AS tx_count,
-      (SELECT COUNT(*) FROM txs WHERE "from" = decode('${body}', 'hex')) AS sent_count,
-      (SELECT COUNT(*) FROM txs WHERE "to" = decode('${body}', 'hex')) AS received_count,
-      (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') OR topic1 = decode('${padded}', 'hex') OR topic2 = decode('${padded}', 'hex') OR topic3 = decode('${padded}', 'hex')) AS related_logs,
-      (SELECT MIN(block_num) FROM (
-        SELECT block_num FROM txs WHERE "from" = decode('${body}', 'hex') OR "to" = decode('${body}', 'hex')
-        UNION ALL
-        SELECT block_num FROM receipts WHERE contract_address = decode('${body}', 'hex')
-        UNION ALL
-        SELECT block_num FROM logs WHERE address = decode('${body}', 'hex')
-      ) AS seen) AS first_seen_block,
-      (SELECT MAX(block_num) FROM (
-        SELECT block_num FROM txs WHERE "from" = decode('${body}', 'hex') OR "to" = decode('${body}', 'hex')
-        UNION ALL
-        SELECT block_num FROM receipts WHERE contract_address = decode('${body}', 'hex')
-        UNION ALL
-        SELECT block_num FROM logs WHERE address = decode('${body}', 'hex')
-      ) AS seen) AS last_seen_block,
-      EXISTS(SELECT 1 FROM receipts WHERE contract_address = decode('${body}', 'hex')) AS was_created,
-      (SELECT MIN(block_num) FROM receipts WHERE contract_address = decode('${body}', 'hex')) AS created_block,
-      (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex')) AS emitted_logs,
-      (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_logs,
-      (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_logs
-  `);
+  const [summaryRows, inspect] = await Promise.all([
+    runQuery(`
+      SELECT
+        (SELECT COUNT(*) FROM txs WHERE "from" = decode('${body}', 'hex') OR "to" = decode('${body}', 'hex')) AS tx_count,
+        (SELECT COUNT(*) FROM txs WHERE "from" = decode('${body}', 'hex')) AS sent_count,
+        (SELECT COUNT(*) FROM txs WHERE "to" = decode('${body}', 'hex')) AS received_count,
+        (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') OR topic1 = decode('${padded}', 'hex') OR topic2 = decode('${padded}', 'hex') OR topic3 = decode('${padded}', 'hex')) AS related_logs,
+        (SELECT MIN(block_num) FROM (
+          SELECT block_num FROM txs WHERE "from" = decode('${body}', 'hex') OR "to" = decode('${body}', 'hex')
+          UNION ALL
+          SELECT block_num FROM receipts WHERE contract_address = decode('${body}', 'hex')
+          UNION ALL
+          SELECT block_num FROM logs WHERE address = decode('${body}', 'hex')
+        ) AS seen) AS first_seen_block,
+        (SELECT MAX(block_num) FROM (
+          SELECT block_num FROM txs WHERE "from" = decode('${body}', 'hex') OR "to" = decode('${body}', 'hex')
+          UNION ALL
+          SELECT block_num FROM receipts WHERE contract_address = decode('${body}', 'hex')
+          UNION ALL
+          SELECT block_num FROM logs WHERE address = decode('${body}', 'hex')
+        ) AS seen) AS last_seen_block,
+        EXISTS(SELECT 1 FROM receipts WHERE contract_address = decode('${body}', 'hex')) AS was_created,
+        (SELECT MIN(block_num) FROM receipts WHERE contract_address = decode('${body}', 'hex')) AS created_block,
+        (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex')) AS emitted_logs,
+        (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_logs,
+        (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_logs
+    `),
+    tryFetchExplorerJson(`/explore/api/address/${address}/inspect?chainId=${encodeURIComponent(state.chainId)}`),
+  ]);
 
   const summary = summaryRows[0] || {};
-  const kind = classifyAddress(summary);
+  const profile = inspect?.profile || null;
+  const kind = classifyAddress(summary, profile);
   const tab = normalizeAddressTab(requestedTab, kind);
-  const offset = (page - 1) * PAGE_SIZE;
 
   setDocumentTitle(`${kind.title} ${shortHex(address)} · Igra Explorer`);
 
@@ -609,6 +697,7 @@ async function renderAddressPage(address, requestedTab, page) {
   let hasNextPage = false;
 
   if (tab === "transactions") {
+    const offset = (page - 1) * PAGE_SIZE;
     const txRows = await runQuery(`
       SELECT
         txs.block_num,
@@ -632,7 +721,16 @@ async function renderAddressPage(address, requestedTab, page) {
     panelSubtitle = `${formatNumber(summary.tx_count || 0)} transaction(s) indexed for this address`;
     panelBody = renderAddressTransactionsTable(txRows, address);
     hasNextPage = txRows.length === PAGE_SIZE;
+  } else if (tab === "portfolio") {
+    const portfolio = await tryFetchExplorerJson(
+      `/explore/api/address/${address}/portfolio?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${PORTFOLIO_PAGE_SIZE}`,
+    );
+    panelTitle = "Portfolio";
+    panelSubtitle = "Native balance and token balances inferred from indexed Transfer logs";
+    panelBody = renderPortfolioPanel(portfolio, profile);
+    hasNextPage = Boolean(portfolio?.holdings?.length === PORTFOLIO_PAGE_SIZE);
   } else if (tab === "logs") {
+    const offset = (page - 1) * PAGE_SIZE;
     const logRows = await runQuery(`
       SELECT
         block_num,
@@ -665,27 +763,32 @@ async function renderAddressPage(address, requestedTab, page) {
     panelBody = renderAddressLogsTable(logRows);
     hasNextPage = logRows.length === PAGE_SIZE;
   } else if (tab === "contract") {
-    const contractLogs = await runQuery(`
-      SELECT
-        block_num,
-        block_timestamp,
-        log_idx,
-        encode(tx_hash, 'hex') AS tx_hash,
-        encode(topic0, 'hex') AS topic0
-      FROM logs
-      WHERE address = decode('${body}', 'hex')
-      ORDER BY block_num DESC, log_idx DESC
-      LIMIT 12
-    `);
+    const [contractLogs, methods] = await Promise.all([
+      runQuery(`
+        SELECT
+          block_num,
+          block_timestamp,
+          log_idx,
+          encode(tx_hash, 'hex') AS tx_hash,
+          encode(topic0, 'hex') AS topic0
+        FROM logs
+        WHERE address = decode('${body}', 'hex')
+        ORDER BY block_num DESC, log_idx DESC
+        LIMIT 12
+      `),
+      tryFetchExplorerJson(
+        `/explore/api/contract/${address}/methods?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${CONTRACT_METHOD_PAGE_SIZE}`,
+      ),
+    ]);
 
     panelTitle = "Contract";
     panelSubtitle = kind.isContract
-      ? "Inferred from creation receipts and/or logs emitted by this address"
+      ? "Live bytecode inspection plus indexed method and event activity"
       : "This address does not currently look like a contract from indexed data";
-    panelBody = renderContractPanel(kind, summary, contractLogs);
-    hasNextPage = false;
+    panelBody = renderContractPanel(kind, summary, contractLogs, inspect, methods);
+    hasNextPage = Boolean(methods?.methods?.length === CONTRACT_METHOD_PAGE_SIZE);
   } else {
-    const [tokenSummaryRows, tokenEvents] = await Promise.all([
+    const [tokenSummaryRows, tokenView, tokenTransfers] = await Promise.all([
       runQuery(`
         SELECT
           (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_count,
@@ -696,34 +799,21 @@ async function renderAddressPage(address, requestedTab, page) {
             SELECT DISTINCT topic2 FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex') AND topic2 IS NOT NULL
           ) AS token_participants) AS participant_count
       `),
-      runQuery(`
-        SELECT
-          block_num,
-          block_timestamp,
-          log_idx,
-          encode(tx_hash, 'hex') AS tx_hash,
-          encode(topic0, 'hex') AS topic0,
-          encode(topic1, 'hex') AS topic1,
-          encode(topic2, 'hex') AS topic2
-        FROM logs
-        WHERE address = decode('${body}', 'hex')
-          AND (
-            topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')
-            OR topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')
-          )
-        ORDER BY block_num DESC, log_idx DESC
-        LIMIT ${PAGE_SIZE}
-        OFFSET ${offset}
-      `),
+      tryFetchExplorerJson(
+        `/explore/api/token/${address}/holders?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${TOKEN_HOLDER_PAGE_SIZE}`,
+      ),
+      tryFetchExplorerJson(
+        `/explore/api/token/${address}/transfers?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${TOKEN_TRANSFER_PAGE_SIZE}`,
+      ),
     ]);
 
     const tokenSummary = tokenSummaryRows[0] || {};
     panelTitle = "Token";
     panelSubtitle = kind.isToken
-      ? "Token-like contract inferred from Transfer/Approval event signatures"
+      ? "Metadata, top holders, and recent transfers"
       : "This address is not currently classified as token-like";
-    panelBody = renderTokenPanel(kind, tokenSummary, tokenEvents);
-    hasNextPage = kind.isToken && tokenEvents.length === PAGE_SIZE;
+    panelBody = renderTokenPanel(kind, tokenSummary, inspect, tokenView, tokenTransfers);
+    hasNextPage = Boolean(tokenTransfers?.transfers?.length === TOKEN_TRANSFER_PAGE_SIZE || tokenView?.holders?.length === TOKEN_HOLDER_PAGE_SIZE);
   }
 
   elements.pageRoot.innerHTML = `
@@ -743,6 +833,7 @@ async function renderAddressPage(address, requestedTab, page) {
       <section class="kpi-grid">
         ${renderKpiCard("Transactions", formatNumber(summary.tx_count || 0), "Direct tx activity")}
         ${renderKpiCard("Logs", formatNumber(summary.related_logs || 0), "Logs emitted or indexed to this address")}
+        ${renderKpiCard("Native balance", profile ? formatTokenAmount(profile.native_balance || "0", 18, 6) : "-", "Latest RPC balance")}
         ${renderKpiCard("First seen", summary.first_seen_block ? formatNumber(summary.first_seen_block) : "-", "Earliest indexed block")}
         ${renderKpiCard("Last seen", summary.last_seen_block ? formatNumber(summary.last_seen_block) : "-", "Latest indexed block")}
       </section>
@@ -751,6 +842,8 @@ async function renderAddressPage(address, requestedTab, page) {
         <aside class="summary-card">
           ${renderSummaryRow("Address", escapeHtml(address))}
           ${renderSummaryRow("Kind", escapeHtml(kind.badge))}
+          ${renderSummaryRow("Detected kind", profile?.detected_kind ? escapeHtml(profile.detected_kind.toUpperCase()) : '<span class="text-secondary">Indexed only</span>')}
+          ${renderSummaryRow("Native balance", profile ? formatTokenAmount(profile.native_balance || "0", 18, 6) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
           ${renderSummaryRow("Received", formatNumber(summary.received_count || 0))}
@@ -758,6 +851,7 @@ async function renderAddressPage(address, requestedTab, page) {
           ${renderSummaryRow("Last seen", summary.last_seen_block ? `<a href="/explore/block/${summary.last_seen_block}">${formatNumber(summary.last_seen_block)}</a>` : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Created as contract", summary.was_created ? "Yes" : "No")}
           ${renderSummaryRow("Created block", summary.created_block ? `<a href="/explore/block/${summary.created_block}">${formatNumber(summary.created_block)}</a>` : '<span class="text-secondary">-</span>')}
+          ${renderSummaryRow("Bytecode", profile?.is_contract ? `${formatNumber(profile.bytecode_size || 0)} bytes` : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Emitted logs", formatNumber(summary.emitted_logs || 0))}
           ${renderSummaryRow("Transfer logs", formatNumber(summary.transfer_logs || 0))}
           ${renderSummaryRow("Approval logs", formatNumber(summary.approval_logs || 0))}
@@ -990,25 +1084,61 @@ function renderAddressLogsTable(rows) {
   `;
 }
 
-function renderContractPanel(kind, summary, rows) {
+function renderContractPanel(kind, summary, rows, inspect, methodsPayload) {
   if (!kind.isContract) {
     return `
       <div class="notice-card">
         <div class="notice-copy">
-          This address does not currently have contract-like signals in the indexed data. If your RPC exposes
-          eth_getCode, we can add explicit bytecode-based detection next.
+          This address does not currently have contract-like signals in the indexed data or live RPC bytecode reads.
         </div>
       </div>
     `;
   }
+
+  const profile = inspect?.profile || null;
+  const creator = inspect?.creator || null;
+  const methods = methodsPayload?.methods || [];
+  const readRows = [
+    ["Name", profile?.name],
+    ["Symbol", profile?.symbol],
+    ["Decimals", profile?.decimals],
+    ["Total supply", profile?.total_supply ? formatTokenAmount(profile.total_supply, profile?.decimals ?? 0, 6) : null],
+    ["ERC165", profile?.supports_erc165 ? "Yes" : null],
+    ["ERC721", profile?.supports_erc721 ? "Yes" : null],
+    ["ERC1155", profile?.supports_erc1155 ? "Yes" : null],
+  ].filter(([, value]) => value !== null && value !== undefined && value !== "");
 
   return `
     <div class="panel-stack">
       <div class="kpi-grid kpi-grid-tight">
         ${renderKpiCard("Created block", summary.created_block ? formatNumber(summary.created_block) : "-", "Contract deployment")}
         ${renderKpiCard("Emitted logs", formatNumber(summary.emitted_logs || 0), "Logs from this address")}
-        ${renderKpiCard("Transfer logs", formatNumber(summary.transfer_logs || 0), "Transfer signature hits")}
+        ${renderKpiCard("Bytecode", profile?.is_contract ? `${formatNumber(profile.bytecode_size || 0)} B` : "-", "Latest eth_getCode snapshot")}
       </div>
+      <div class="split-grid">
+        <section class="subpanel-card">
+          <div class="subpanel-title">Contract profile</div>
+          <div class="definition-list">
+            ${renderDefinitionItem("Kind", profile?.detected_kind ? profile.detected_kind.toUpperCase() : kind.badge)}
+            ${renderDefinitionItem("Code hash", profile?.code_hash || "-")}
+            ${renderDefinitionItem("Preview", profile?.code_preview || "-")}
+            ${renderDefinitionItem("Creator", creator ? renderMonoLink(`/explore/address/${creator.creator_address}`, creator.creator_address, false) : '<span class="text-secondary">-</span>')}
+            ${renderDefinitionItem("Creation tx", creator ? renderMonoLink(`/explore/receipt/${creator.tx_hash}`, creator.tx_hash, false) : '<span class="text-secondary">-</span>')}
+          </div>
+        </section>
+        <section class="subpanel-card">
+          <div class="subpanel-title">Read contract</div>
+          ${
+            readRows.length
+              ? `<div class="definition-list">${readRows.map(([label, value]) => renderDefinitionItem(label, value)).join("")}</div>`
+              : '<div class="empty-mini">No standard ERC reads succeeded against this contract.</div>'
+          }
+        </section>
+      </div>
+      <section class="subpanel-card">
+        <div class="subpanel-title">Top methods</div>
+        ${renderContractMethodsTable(methods)}
+      </section>
       <div class="table-wrap">
         <table class="data-table">
           <thead>
@@ -1043,7 +1173,7 @@ function renderContractPanel(kind, summary, rows) {
   `;
 }
 
-function renderTokenPanel(kind, tokenSummary, rows) {
+function renderTokenPanel(kind, tokenSummary, inspect, holdersPayload, transfersPayload) {
   if (!kind.isToken) {
     return `
       <div class="notice-card">
@@ -1055,50 +1185,61 @@ function renderTokenPanel(kind, tokenSummary, rows) {
     `;
   }
 
+  const profile = inspect?.profile || holdersPayload?.profile || transfersPayload?.profile || null;
+  const holders = holdersPayload?.holders || [];
+  const transfers = transfersPayload?.transfers || [];
+  const holderCount = Number(holdersPayload?.total_holders || 0);
+
   return `
     <div class="panel-stack">
       <div class="kpi-grid kpi-grid-tight">
         ${renderKpiCard("Transfers", formatNumber(tokenSummary.transfer_count || 0), "Transfer event count")}
         ${renderKpiCard("Approvals", formatNumber(tokenSummary.approval_count || 0), "Approval event count")}
-        ${renderKpiCard("Participants", formatNumber(tokenSummary.participant_count || 0), "Distinct indexed addresses")}
+        ${renderKpiCard("Holders", formatNumber(holderCount), "Positive balances inferred from logs")}
       </div>
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Block</th>
-              <th>Time</th>
-              <th>Tx</th>
-              <th>Event</th>
-              <th>From / Owner</th>
-              <th>To / Spender</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${
-              rows.length
-                ? rows
-                    .map((row) => {
-                      const event = eventName(row.topic0);
-                      const first = topicToAddress(row.topic1);
-                      const second = topicToAddress(row.topic2);
-                      return `
-                        <tr>
-                          <td class="mono"><a href="/explore/block/${row.block_num}">${formatNumber(row.block_num)}</a></td>
-                          <td>${escapeHtml(formatRelativeTime(row.block_timestamp))}</td>
-                          <td class="mono"><a href="/explore/receipt/${with0x(row.tx_hash)}">${escapeHtml(shortHex(with0x(row.tx_hash), 10))}</a></td>
-                          <td>${escapeHtml(event)}</td>
-                          <td class="mono">${first ? `<a href="/explore/address/${first}">${escapeHtml(shortHex(first, 8))}</a>` : '<span class="text-secondary">-</span>'}</td>
-                          <td class="mono">${second ? `<a href="/explore/address/${second}">${escapeHtml(shortHex(second, 8))}</a>` : '<span class="text-secondary">-</span>'}</td>
-                        </tr>
-                      `;
-                    })
-                    .join("")
-                : '<tr><td colspan="6" class="text-secondary">No token-like events found.</td></tr>'
-            }
-          </tbody>
-        </table>
+      <div class="split-grid">
+        <section class="subpanel-card">
+          <div class="subpanel-title">Token profile</div>
+          <div class="definition-list">
+            ${renderDefinitionItem("Standard", profile?.detected_kind ? profile.detected_kind.toUpperCase() : "TOKEN")}
+            ${renderDefinitionItem("Name", profile?.name || "-")}
+            ${renderDefinitionItem("Symbol", profile?.symbol || "-")}
+            ${renderDefinitionItem("Decimals", profile?.decimals ?? "-")}
+            ${renderDefinitionItem("Total supply", profile?.total_supply ? formatTokenAmount(profile.total_supply, profile?.decimals ?? 0, 6) : "-")}
+          </div>
+        </section>
+        <section class="subpanel-card">
+          <div class="subpanel-title">Top holders</div>
+          ${renderTokenHoldersTable(holders, profile?.decimals ?? 0)}
+        </section>
       </div>
+      <section class="subpanel-card">
+        <div class="subpanel-title">Recent transfers</div>
+        ${renderTokenTransfersTable(transfers, profile?.decimals ?? 0)}
+      </section>
+    </div>
+  `;
+}
+
+function renderPortfolioPanel(portfolio, profile) {
+  if (!portfolio) {
+    return `
+      <div class="notice-card">
+        <div class="notice-copy">
+          Portfolio data is unavailable right now. The explorer needs live RPC access plus indexed Transfer logs to build this view.
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="panel-stack">
+      <div class="kpi-grid kpi-grid-tight">
+        ${renderKpiCard("Native balance", formatTokenAmount(portfolio.native_balance || profile?.native_balance || "0", 18, 6), "Latest RPC balance")}
+        ${renderKpiCard("Token holdings", formatNumber(portfolio.holdings?.length || 0), "Positive balances on this page")}
+        ${renderKpiCard("Account kind", profile?.detected_kind ? profile.detected_kind.toUpperCase() : "ACCOUNT", "Live bytecode classification")}
+      </div>
+      ${renderPortfolioTable(portfolio.holdings || [])}
     </div>
   `;
 }
@@ -1175,9 +1316,187 @@ function renderLogsTable(rows) {
   `;
 }
 
+function renderInputPanel(inputData, decodedInput) {
+  const rawInput = with0x(inputData);
+  const decodedRows = decodedInput?.args || [];
+
+  return `
+    <div class="panel-stack panel-stack-tight">
+      ${
+        decodedRows.length
+          ? `
+            <section class="subpanel-card">
+              <div class="subpanel-title">Decoded arguments</div>
+              <div class="definition-list">
+                ${decodedRows.map((arg) => renderDefinitionItem(`${arg.label} · ${arg.type}`, arg.href ? renderMonoLink(arg.href, arg.display || arg.value, false) : arg.display || arg.value)).join("")}
+              </div>
+            </section>
+          `
+          : `
+            <section class="subpanel-card">
+              <div class="subpanel-title">Decoded arguments</div>
+              <div class="empty-mini">No built-in decoder matched this calldata. Raw input is shown below.</div>
+            </section>
+          `
+      }
+      <section class="subpanel-card">
+        <div class="subpanel-title">Raw calldata</div>
+        <pre class="code-block mono">${escapeHtml(rawInput || "0x")}</pre>
+      </section>
+    </div>
+  `;
+}
+
+function renderContractMethodsTable(rows) {
+  if (!rows.length) {
+    return '<div class="empty-mini">No method selectors have been indexed for this contract yet.</div>';
+  }
+
+  const body = rows
+    .map(
+      (row) => `
+        <tr>
+          <td class="mono">${escapeHtml(methodName(row.selector))}</td>
+          <td class="mono">${escapeHtml(row.selector)}</td>
+          <td class="align-right mono">${formatNumber(row.call_count || 0)}</td>
+          <td class="align-right mono">${formatNumber(row.success_count || 0)}</td>
+          <td class="align-right mono"><a href="/explore/block/${row.last_block}">${formatNumber(row.last_block)}</a></td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Method</th>
+            <th>Selector</th>
+            <th class="align-right">Calls</th>
+            <th class="align-right">Success</th>
+            <th class="align-right">Last block</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderTokenHoldersTable(rows, decimals) {
+  if (!rows.length) {
+    return '<div class="empty-mini">No positive holders inferred from indexed transfers yet.</div>';
+  }
+
+  const body = rows
+    .map(
+      (row) => `
+        <tr>
+          <td class="mono"><a href="/explore/address/${row.holder_address}">${escapeHtml(shortHex(row.holder_address, 8))}</a></td>
+          <td class="align-right mono">${formatTokenAmount(row.balance, decimals, 6)}</td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Holder</th>
+            <th class="align-right">Balance</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderTokenTransfersTable(rows, decimals) {
+  if (!rows.length) {
+    return '<div class="empty-mini">No transfers indexed for this token yet.</div>';
+  }
+
+  const body = rows
+    .map(
+      (row) => `
+        <tr>
+          <td class="mono"><a href="/explore/block/${row.block_num}">${formatNumber(row.block_num)}</a></td>
+          <td>${escapeHtml(formatRelativeTime(row.block_timestamp))}</td>
+          <td class="mono"><a href="/explore/address/${row.from_address}">${escapeHtml(shortHex(row.from_address, 8))}</a></td>
+          <td class="mono"><a href="/explore/address/${row.to_address}">${escapeHtml(shortHex(row.to_address, 8))}</a></td>
+          <td class="align-right mono">${formatTokenAmount(row.amount, decimals, 6)}</td>
+          <td class="mono"><a href="/explore/receipt/${row.tx_hash}">${escapeHtml(shortHex(row.tx_hash, 10))}</a></td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Block</th>
+            <th>Time</th>
+            <th>From</th>
+            <th>To</th>
+            <th class="align-right">Amount</th>
+            <th>Tx</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderPortfolioTable(rows) {
+  if (!rows.length) {
+    return '<div class="empty-state">No positive token balances inferred for this address yet.</div>';
+  }
+
+  const body = rows
+    .map((row) => {
+      const metadata = row.metadata || {};
+      const label = metadata.symbol || metadata.name || shortHex(row.token_address, 8);
+      return `
+        <tr>
+          <td class="mono"><a href="/explore/token/${row.token_address}">${escapeHtml(label)}</a></td>
+          <td>${escapeHtml(metadata.name || metadata.detected_kind?.toUpperCase?.() || "Token")}</td>
+          <td class="align-right mono">${formatTokenAmount(row.balance, metadata.decimals ?? 0, 6)}</td>
+          <td class="align-right mono">${formatNumber(row.received_count || 0)}</td>
+          <td class="align-right mono"><a href="/explore/block/${row.last_block}">${formatNumber(row.last_block)}</a></td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>Profile</th>
+            <th class="align-right">Balance</th>
+            <th class="align-right">Inbound</th>
+            <th class="align-right">Last block</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderAddressTabs(address, activeTab, kind) {
   const tabs = [
     { key: "transactions", label: "Transactions" },
+    { key: "portfolio", label: "Portfolio" },
     { key: "logs", label: "Logs" },
   ];
 
@@ -1272,6 +1591,17 @@ function renderSummaryRow(label, value) {
   `;
 }
 
+function renderDefinitionItem(label, value) {
+  const renderedValue =
+    typeof value === "string" && value.trim().startsWith("<") ? value : escapeHtml(String(value ?? "-"));
+  return `
+    <div class="definition-item">
+      <div class="definition-label">${escapeHtml(label)}</div>
+      <div class="definition-value mono">${renderedValue}</div>
+    </div>
+  `;
+}
+
 function renderKpiCard(label, value, note) {
   return `
     <div class="kpi-card">
@@ -1323,12 +1653,20 @@ function statusKindFromValue(value) {
   return Number(value) === 1 ? "success" : "failed";
 }
 
-function classifyAddress(summary) {
-  const isContract = Boolean(summary.was_created) || Number(summary.emitted_logs || 0) > 0;
-  const isToken = isContract && (Number(summary.transfer_logs || 0) > 0 || Number(summary.approval_logs || 0) > 0);
+function classifyAddress(summary, profile = null) {
+  const liveKind = String(profile?.detected_kind || "").toLowerCase();
+  const isContract =
+    Boolean(profile?.is_contract) || Boolean(summary.was_created) || Number(summary.emitted_logs || 0) > 0;
+  const isToken =
+    liveKind === "erc20" ||
+    liveKind === "erc721" ||
+    liveKind === "erc1155" ||
+    (isContract && (Number(summary.transfer_logs || 0) > 0 || Number(summary.approval_logs || 0) > 0));
 
   if (isToken) {
-    return { isContract: true, isToken: true, badge: "Token-like contract", title: "Token Contract" };
+    const label =
+      liveKind === "erc721" ? "ERC-721 Contract" : liveKind === "erc1155" ? "ERC-1155 Contract" : "Token Contract";
+    return { isContract: true, isToken: true, badge: label, title: label };
   }
   if (isContract) {
     return { isContract: true, isToken: false, badge: "Contract", title: "Contract" };
@@ -1348,7 +1686,7 @@ function normalizeAddressTab(requestedTab, kind) {
     return "transactions";
   }
 
-  const allowed = new Set(["transactions", "logs"]);
+  const allowed = new Set(["transactions", "portfolio", "logs"]);
   if (kind.isContract) {
     allowed.add("contract");
   }
@@ -1372,6 +1710,14 @@ function eventName(topic0) {
   return KNOWN_EVENTS[normalized] || shortHex(normalized, 10);
 }
 
+function methodName(selector) {
+  const normalized = with0x(selector);
+  if (!normalized) {
+    return "No selector";
+  }
+  return KNOWN_METHODS[normalized]?.label || normalized;
+}
+
 function setDocumentTitle(title) {
   document.title = title;
 }
@@ -1391,6 +1737,26 @@ async function runQuery(sql) {
   }
 
   return rowsToObjects(payload.columns || [], payload.rows || []);
+}
+
+async function fetchExplorerJson(path) {
+  const response = await fetch(path);
+  const payload = await safeJson(response);
+
+  if (!response.ok || !payload?.ok) {
+    const error = payload?.error || payload?.message || `Request failed (${response.status})`;
+    throw new Error(error);
+  }
+
+  return payload;
+}
+
+async function tryFetchExplorerJson(path) {
+  try {
+    return await fetchExplorerJson(path);
+  } catch (_error) {
+    return null;
+  }
 }
 
 async function safeJson(response) {
@@ -1489,6 +1855,100 @@ function multiplyNumericStrings(left, right) {
   } catch (_error) {
     return null;
   }
+}
+
+function formatTokenAmount(value, decimals = 0, precision = 4) {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+
+  const raw = String(value);
+  if (!/^-?\d+$/.test(raw)) {
+    return raw;
+  }
+
+  try {
+    const negative = raw.startsWith("-");
+    const digits = negative ? raw.slice(1) : raw;
+    const places = Number.isFinite(Number(decimals)) ? Number(decimals) : 0;
+
+    if (places <= 0) {
+      return `${negative ? "-" : ""}${formatNumericString(digits)}`;
+    }
+
+    const padded = digits.padStart(places + 1, "0");
+    const whole = padded.slice(0, -places);
+    const fraction = padded.slice(-places).replace(/0+$/, "").slice(0, precision);
+    return `${negative ? "-" : ""}${formatNumericString(whole)}${fraction ? `.${fraction}` : ""}`;
+  } catch (_error) {
+    return raw;
+  }
+}
+
+function decodeCallData(inputData) {
+  const normalized = with0x(inputData);
+  if (!/^0x[0-9a-f]{8,}$/.test(normalized)) {
+    return null;
+  }
+
+  const selector = normalized.slice(0, 10);
+  const spec = KNOWN_METHODS[selector];
+  const body = normalized.slice(10);
+  const slots = body.match(/.{1,64}/g) || [];
+
+  if (!spec) {
+    return { selector, label: selector, args: [] };
+  }
+
+  const args = spec.args.map((arg, index) => decodeInputArg(arg, slots[index]));
+  return {
+    selector,
+    label: spec.label,
+    args: args.filter(Boolean),
+  };
+}
+
+function decodeInputArg(spec, slot) {
+  if (!slot || slot.length < 64) {
+    return null;
+  }
+
+  if (spec.type === "address") {
+    const address = `0x${slot.slice(-40)}`;
+    return {
+      label: spec.label,
+      type: spec.type,
+      value: address,
+      display: address,
+      href: `/explore/address/${address}`,
+    };
+  }
+
+  if (spec.type === "uint256") {
+    try {
+      const value = BigInt(`0x${slot}`).toString();
+      return {
+        label: spec.label,
+        type: spec.type,
+        value,
+        display: formatNumericString(value),
+      };
+    } catch (_error) {
+      return {
+        label: spec.label,
+        type: spec.type,
+        value: `0x${slot}`,
+        display: `0x${slot}`,
+      };
+    }
+  }
+
+  return {
+    label: spec.label,
+    type: spec.type,
+    value: `0x${slot}`,
+    display: `0x${slot}`,
+  };
 }
 
 function formatTimestamp(value) {
