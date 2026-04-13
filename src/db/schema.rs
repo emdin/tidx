@@ -6,13 +6,13 @@ use super::Pool;
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
 
-    // Kill ALL other connections to this database before running migrations.
-    // On container restart, any existing connections are stale (from the old process)
-    // and may hold locks that block DDL (e.g., COPY mid-flight blocks CREATE INDEX).
-    let terminated: Vec<_> = conn
+    // Best-effort cleanup of other connections before running migrations.
+    // We cannot always terminate admin/superuser sessions from the app role,
+    // so failures are logged and migrations continue.
+    let sessions = conn
         .query(
             r#"
-            SELECT pg_terminate_backend(pid)
+            SELECT pid, usename
             FROM pg_stat_activity
             WHERE pid != pg_backend_pid()
               AND datname = current_database()
@@ -21,8 +21,27 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         )
         .await?;
 
-    if !terminated.is_empty() {
-        warn!(count = terminated.len(), "Terminated stale connections before migrations");
+    let mut terminated = 0usize;
+    let mut skipped = 0usize;
+
+    for session in sessions {
+        let pid: i32 = session.get(0);
+        let user: String = session.get(1);
+
+        match conn.execute("SELECT pg_terminate_backend($1)", &[&pid]).await {
+            Ok(_) => terminated += 1,
+            Err(error) => {
+                skipped += 1;
+                warn!(pid, user = %user, error = %error, "Could not terminate existing database session before migrations");
+            }
+        }
+    }
+
+    if terminated > 0 {
+        warn!(count = terminated, "Terminated stale connections before migrations");
+    }
+    if skipped > 0 {
+        warn!(count = skipped, "Skipped non-terminable sessions before migrations");
     }
 
     info!("Running schema migrations");
@@ -38,5 +57,4 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
 
     Ok(())
 }
-
 
