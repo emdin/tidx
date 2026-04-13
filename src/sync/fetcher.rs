@@ -197,6 +197,14 @@ impl RpcClient {
             .into_iter()
             .enumerate()
             .map(|(i, r)| {
+                if let Some(err) = r.error {
+                    return Err(anyhow!(
+                        "RPC batch item error {} for block {}: {}",
+                        err.code,
+                        range.start() + i as u64,
+                        err.message
+                    ));
+                }
                 r.result
                     .ok_or_else(|| anyhow!("Block {} not found", range.start() + i as u64))
             })
@@ -279,7 +287,18 @@ impl RpcClient {
 
         responses
             .into_iter()
-            .map(|r| Ok(r.result.unwrap_or_default()))
+            .enumerate()
+            .map(|(i, r)| {
+                if let Some(err) = r.error {
+                    return Err(anyhow!(
+                        "RPC batch item error {} for receipts at block {}: {}",
+                        err.code,
+                        range.start() + i as u64,
+                        err.message
+                    ));
+                }
+                Ok(r.result.unwrap_or_default())
+            })
             .collect()
     }
 
@@ -370,7 +389,18 @@ impl RpcClient {
 
         responses
             .into_iter()
-            .map(|resp| Ok(resp.result.unwrap_or(None)))
+            .enumerate()
+            .map(|(i, resp)| {
+                if let Some(err) = resp.error {
+                    return Err(anyhow!(
+                        "RPC tx receipt batch item error {} at index {}: {}",
+                        err.code,
+                        i,
+                        err.message
+                    ));
+                }
+                Ok(resp.result.unwrap_or(None))
+            })
             .collect()
     }
 
@@ -515,7 +545,9 @@ impl RpcClient {
     pub fn is_block_receipts_unsupported(err: &anyhow::Error) -> bool {
         let message = err.to_string().to_lowercase();
         message.contains("-32601")
+            || message.contains("-32002")
             || message.contains("method not found")
+            || message.contains("not allowed")
             || message.contains("not supported")
             || message.contains("unsupported")
             || message.contains("not implemented")
