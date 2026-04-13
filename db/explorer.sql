@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS contract_verifications (
 
 CREATE INDEX IF NOT EXISTS idx_contract_verifications_name ON contract_verifications (lower(contract_name));
 
+ALTER TABLE contract_verifications
+    ADD COLUMN IF NOT EXISTS verification_status TEXT,
+    ADD COLUMN IF NOT EXISTS bytecode_match BOOLEAN,
+    ADD COLUMN IF NOT EXISTS bytecode_match_type TEXT,
+    ADD COLUMN IF NOT EXISTS status_reason TEXT,
+    ADD COLUMN IF NOT EXISTS submitted_runtime_bytecode TEXT,
+    ADD COLUMN IF NOT EXISTS deployed_runtime_code_hash TEXT,
+    ADD COLUMN IF NOT EXISTS bytecode_checked_at TIMESTAMPTZ;
+
+UPDATE contract_verifications
+SET verification_status = 'imported'
+WHERE verification_status IS NULL;
+
 CREATE TABLE IF NOT EXISTS token_metadata (
     address             BYTEA PRIMARY KEY,
     detected_kind       TEXT NOT NULL,

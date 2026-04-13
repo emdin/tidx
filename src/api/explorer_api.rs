@@ -29,6 +29,12 @@ const ERC1155_INTERFACE_ID: [u8; 4] = [0xd9, 0xb6, 0x7a, 0x26];
 const TRANSFER_TOPIC: &str = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const APPROVAL_TOPIC: &str = "8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+const VERIFICATION_STATUS_IMPORTED: &str = "imported";
+const VERIFICATION_STATUS_BYTECODE_MATCHED: &str = "bytecode_matched";
+const VERIFICATION_STATUS_FULLY_VERIFIED: &str = "fully_verified";
+const BYTECODE_MATCH_TYPE_EXACT: &str = "exact";
+const BYTECODE_MATCH_TYPE_METADATA_STRIPPED: &str = "metadata_stripped";
+const BYTECODE_MATCH_TYPE_MISMATCH: &str = "mismatch";
 
 #[derive(Deserialize)]
 pub struct ChainQuery {
@@ -92,6 +98,13 @@ pub struct VerificationSummary {
     pub license: Option<String>,
     pub constructor_args: Option<String>,
     pub verified_at: chrono::DateTime<chrono::Utc>,
+    pub verification_status: String,
+    pub bytecode_match: Option<bool>,
+    pub bytecode_match_type: Option<String>,
+    pub status_reason: Option<String>,
+    pub has_runtime_bytecode: bool,
+    pub deployed_runtime_code_hash: Option<String>,
+    pub bytecode_checked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub has_source_code: bool,
     pub abi_function_count: usize,
 }
@@ -102,6 +115,7 @@ pub struct ContractVerificationDetail {
     pub abi: Value,
     pub source_code: Option<String>,
     pub metadata: Option<Value>,
+    pub submitted_runtime_bytecode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +176,8 @@ pub struct LabelUpsertRequest {
 pub struct VerifyContractRequest {
     pub contract_name: String,
     pub abi: Value,
+    #[serde(default)]
+    pub runtime_bytecode: Option<String>,
     #[serde(default)]
     pub source_code: Option<String>,
     #[serde(default)]
@@ -339,6 +355,17 @@ pub struct ReadContractResponse {
     pub address: String,
     pub function: ReadFunctionInfo,
     pub outputs: Vec<ReadContractValue>,
+}
+
+#[derive(Debug, Clone)]
+struct VerificationAssessment {
+    verification_status: String,
+    bytecode_match: Option<bool>,
+    bytecode_match_type: Option<String>,
+    status_reason: Option<String>,
+    submitted_runtime_bytecode: Option<String>,
+    deployed_runtime_code_hash: Option<String>,
+    bytecode_checked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Serialize)]
@@ -625,8 +652,12 @@ pub async fn verify_contract(
         .get_write_pool(Some(chain_id))
         .await
         .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let rpc = state.get_rpc(Some(chain_id)).await.ok_or_else(|| {
+        ApiError::BadRequest(format!("RPC not configured for chain_id: {chain_id}"))
+    })?;
     validate_contract_verification_payload(&payload)?;
-    save_contract_verification(&pool, &normalized, &payload).await?;
+    let assessment = assess_contract_verification(rpc, &normalized, &payload).await?;
+    save_contract_verification(&pool, &normalized, &payload, &assessment).await?;
 
     contract_verification(
         State(state),
@@ -1344,7 +1375,14 @@ async fn load_contract_verification(
                 abi,
                 source_code,
                 metadata,
-                verified_at
+                verified_at,
+                verification_status,
+                bytecode_match,
+                bytecode_match_type,
+                status_reason,
+                submitted_runtime_bytecode,
+                deployed_runtime_code_hash,
+                bytecode_checked_at
             FROM contract_verifications
             WHERE address = $1
             LIMIT 1
@@ -1359,6 +1397,10 @@ async fn load_contract_verification(
         let source_code: Option<String> = row.get("source_code");
         let metadata: Option<Value> = row.get("metadata");
         let contract_name: String = row.get("contract_name");
+        let submitted_runtime_bytecode: Option<String> = row.get("submitted_runtime_bytecode");
+        let verification_status = row
+            .get::<_, Option<String>>("verification_status")
+            .unwrap_or_else(|| VERIFICATION_STATUS_IMPORTED.to_string());
         ContractVerificationDetail {
             summary: VerificationSummary {
                 contract_name,
@@ -1369,6 +1411,16 @@ async fn load_contract_verification(
                 license: row.get("license"),
                 constructor_args: row.get("constructor_args"),
                 verified_at: row.get("verified_at"),
+                verification_status,
+                bytecode_match: row.get("bytecode_match"),
+                bytecode_match_type: row.get("bytecode_match_type"),
+                status_reason: row.get("status_reason"),
+                has_runtime_bytecode: submitted_runtime_bytecode
+                    .as_ref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                deployed_runtime_code_hash: row.get("deployed_runtime_code_hash"),
+                bytecode_checked_at: row.get("bytecode_checked_at"),
                 has_source_code: source_code
                     .as_ref()
                     .map(|value| !value.trim().is_empty())
@@ -1380,6 +1432,7 @@ async fn load_contract_verification(
             abi,
             source_code,
             metadata,
+            submitted_runtime_bytecode,
         }
     }))
 }
@@ -1388,6 +1441,7 @@ async fn save_contract_verification(
     pool: &Pool,
     address: &str,
     payload: &VerifyContractRequest,
+    assessment: &VerificationAssessment,
 ) -> Result<(), ApiError> {
     let conn = pool
         .get()
@@ -1409,10 +1463,17 @@ async fn save_contract_verification(
             abi,
             source_code,
             metadata,
+            verification_status,
+            bytecode_match,
+            bytecode_match_type,
+            status_reason,
+            submitted_runtime_bytecode,
+            deployed_runtime_code_hash,
+            bytecode_checked_at,
             verified_at,
             updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, now(), now())
         ON CONFLICT (address) DO UPDATE SET
             contract_name = EXCLUDED.contract_name,
             language = EXCLUDED.language,
@@ -1424,6 +1485,13 @@ async fn save_contract_verification(
             abi = EXCLUDED.abi,
             source_code = EXCLUDED.source_code,
             metadata = EXCLUDED.metadata,
+            verification_status = EXCLUDED.verification_status,
+            bytecode_match = EXCLUDED.bytecode_match,
+            bytecode_match_type = EXCLUDED.bytecode_match_type,
+            status_reason = EXCLUDED.status_reason,
+            submitted_runtime_bytecode = EXCLUDED.submitted_runtime_bytecode,
+            deployed_runtime_code_hash = EXCLUDED.deployed_runtime_code_hash,
+            bytecode_checked_at = EXCLUDED.bytecode_checked_at,
             updated_at = now()
         ",
         &[
@@ -1438,6 +1506,13 @@ async fn save_contract_verification(
             &payload.abi,
             &payload.source_code,
             &payload.metadata,
+            &assessment.verification_status,
+            &assessment.bytecode_match,
+            &assessment.bytecode_match_type,
+            &assessment.status_reason,
+            &assessment.submitted_runtime_bytecode,
+            &assessment.deployed_runtime_code_hash,
+            &assessment.bytecode_checked_at,
         ],
     )
     .await
@@ -1521,9 +1596,131 @@ fn validate_contract_verification_payload(payload: &VerifyContractRequest) -> Re
         ));
     }
 
+    if let Some(runtime_bytecode) = extract_submitted_runtime_bytecode(payload)? {
+        if decode_hex_data(&runtime_bytecode).is_none() {
+            return Err(ApiError::BadRequest(
+                "runtime_bytecode must be valid hex".to_string(),
+            ));
+        }
+    }
+
     parse_json_abi(&payload.abi)
         .map(|_| ())
         .map_err(|e| ApiError::BadRequest(format!("Invalid ABI JSON: {e}")))
+}
+
+async fn assess_contract_verification(
+    rpc: Arc<RpcClient>,
+    address: &str,
+    payload: &VerifyContractRequest,
+) -> Result<VerificationAssessment, ApiError> {
+    let source_code_present = payload
+        .source_code
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let submitted_runtime_bytecode = extract_submitted_runtime_bytecode(payload)?;
+    let bytecode_checked_at = Some(chrono::Utc::now());
+
+    let deployed_code_hex = match rpc.get_code(address).await {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(VerificationAssessment {
+                verification_status: VERIFICATION_STATUS_IMPORTED.to_string(),
+                bytecode_match: None,
+                bytecode_match_type: None,
+                status_reason: Some(format!(
+                    "Imported metadata only: failed to fetch deployed runtime bytecode from RPC ({error})"
+                )),
+                submitted_runtime_bytecode,
+                deployed_runtime_code_hash: None,
+                bytecode_checked_at,
+            });
+        }
+    };
+
+    let deployed_runtime_bytes = decode_hex_data(&deployed_code_hex).unwrap_or_default();
+    let deployed_runtime_code_hash = if deployed_runtime_bytes.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "0x{}",
+            hex::encode(keccak256(&deployed_runtime_bytes))
+        ))
+    };
+
+    let Some(submitted_runtime_bytecode) = submitted_runtime_bytecode else {
+        return Ok(VerificationAssessment {
+            verification_status: VERIFICATION_STATUS_IMPORTED.to_string(),
+            bytecode_match: None,
+            bytecode_match_type: None,
+            status_reason: Some(
+                "Imported metadata only: no submitted runtime bytecode was provided".to_string(),
+            ),
+            submitted_runtime_bytecode: None,
+            deployed_runtime_code_hash,
+            bytecode_checked_at,
+        });
+    };
+
+    if deployed_runtime_bytes.is_empty() {
+        return Ok(VerificationAssessment {
+            verification_status: VERIFICATION_STATUS_IMPORTED.to_string(),
+            bytecode_match: None,
+            bytecode_match_type: None,
+            status_reason: Some(
+                "Imported metadata only: address has no deployed runtime bytecode".to_string(),
+            ),
+            submitted_runtime_bytecode: Some(submitted_runtime_bytecode),
+            deployed_runtime_code_hash,
+            bytecode_checked_at,
+        });
+    }
+
+    let submitted_runtime_bytes = decode_hex_data(&submitted_runtime_bytecode).ok_or_else(|| {
+        ApiError::BadRequest("runtime_bytecode must be valid hex".to_string())
+    })?;
+    let bytecode_match_type =
+        compare_runtime_bytecode(&submitted_runtime_bytes, &deployed_runtime_bytes);
+
+    let (verification_status, bytecode_match, status_reason) = match bytecode_match_type.as_deref() {
+        Some(BYTECODE_MATCH_TYPE_EXACT) | Some(BYTECODE_MATCH_TYPE_METADATA_STRIPPED) => {
+            let status = if source_code_present {
+                VERIFICATION_STATUS_FULLY_VERIFIED
+            } else {
+                VERIFICATION_STATUS_BYTECODE_MATCHED
+            };
+            let reason = if source_code_present {
+                None
+            } else {
+                Some("Runtime bytecode matched, but no source code was stored".to_string())
+            };
+            (status.to_string(), Some(true), reason)
+        }
+        Some(BYTECODE_MATCH_TYPE_MISMATCH) => (
+            VERIFICATION_STATUS_IMPORTED.to_string(),
+            Some(false),
+            Some(
+                "Imported metadata only: submitted runtime bytecode did not match deployed runtime bytecode"
+                    .to_string(),
+            ),
+        ),
+        _ => (
+            VERIFICATION_STATUS_IMPORTED.to_string(),
+            None,
+            Some("Imported metadata only: runtime bytecode comparison was unavailable".to_string()),
+        ),
+    };
+
+    Ok(VerificationAssessment {
+        verification_status,
+        bytecode_match,
+        bytecode_match_type,
+        status_reason,
+        submitted_runtime_bytecode: Some(submitted_runtime_bytecode),
+        deployed_runtime_code_hash,
+        bytecode_checked_at,
+    })
 }
 
 fn parse_json_abi(value: &Value) -> Result<JsonAbi, serde_json::Error> {
@@ -1684,6 +1881,100 @@ fn optional_non_empty(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn extract_submitted_runtime_bytecode(
+    payload: &VerifyContractRequest,
+) -> Result<Option<String>, ApiError> {
+    let candidate = payload
+        .runtime_bytecode
+        .as_ref()
+        .cloned()
+        .or_else(|| {
+            payload
+                .metadata
+                .as_ref()
+                .and_then(|metadata| extract_runtime_bytecode_from_metadata(metadata))
+        });
+
+    candidate
+        .map(|value| normalize_hex_blob(&value, "runtime_bytecode"))
+        .transpose()
+}
+
+fn extract_runtime_bytecode_from_metadata(metadata: &Value) -> Option<String> {
+    const PATHS: &[&[&str]] = &[
+        &["runtime_bytecode"],
+        &["deployed_bytecode"],
+        &["runtimeBytecode"],
+        &["deployedBytecode"],
+        &["runtimeBytecode", "object"],
+        &["deployedBytecode", "object"],
+        &["artifact", "deployedBytecode", "object"],
+        &["artifact", "runtimeBytecode", "object"],
+    ];
+
+    PATHS
+        .iter()
+        .find_map(|path| extract_json_string_path(metadata, path))
+}
+
+fn extract_json_string_path(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().map(ToString::to_string)
+}
+
+fn normalize_hex_blob(value: &str, field_name: &str) -> Result<String, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_name} cannot be empty when provided"
+        )));
+    }
+
+    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if body.is_empty() || !body.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field_name} must be valid hex"
+        )));
+    }
+
+    Ok(format!("0x{}", body.to_ascii_lowercase()))
+}
+
+fn compare_runtime_bytecode(submitted: &[u8], deployed: &[u8]) -> Option<String> {
+    if submitted == deployed {
+        return Some(BYTECODE_MATCH_TYPE_EXACT.to_string());
+    }
+
+    let stripped_submitted = strip_solc_metadata(submitted);
+    let stripped_deployed = strip_solc_metadata(deployed);
+    if stripped_submitted == stripped_deployed {
+        return Some(BYTECODE_MATCH_TYPE_METADATA_STRIPPED.to_string());
+    }
+
+    if !submitted.is_empty() && !deployed.is_empty() {
+        return Some(BYTECODE_MATCH_TYPE_MISMATCH.to_string());
+    }
+
+    None
+}
+
+fn strip_solc_metadata(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() < 2 {
+        return bytes.to_vec();
+    }
+
+    let metadata_len = u16::from_be_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]]) as usize;
+    let trailer_len = metadata_len.saturating_add(2);
+    if trailer_len >= bytes.len() {
+        return bytes.to_vec();
+    }
+
+    bytes[..bytes.len() - trailer_len].to_vec()
 }
 
 async fn inspect_token_profile(rpc: Arc<RpcClient>, address: &str) -> ContractProfile {
@@ -1910,4 +2201,45 @@ fn preview_hex(bytes: &[u8], max_bytes: usize) -> String {
     let preview = &bytes[..bytes.len().min(max_bytes)];
     let suffix = if bytes.len() > max_bytes { "…" } else { "" };
     format!("0x{}{}", hex::encode(preview), suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_runtime_bytecode_detects_exact_matches() {
+        let submitted = hex::decode("6001600055").unwrap();
+        let deployed = hex::decode("6001600055").unwrap();
+        assert_eq!(
+            compare_runtime_bytecode(&submitted, &deployed),
+            Some(BYTECODE_MATCH_TYPE_EXACT.to_string())
+        );
+    }
+
+    #[test]
+    fn compare_runtime_bytecode_detects_metadata_stripped_matches() {
+        let mut submitted = hex::decode("6001600055").unwrap();
+        submitted.extend(hex::decode("a1b2c3").unwrap());
+        submitted.extend([0x00, 0x03]);
+
+        let mut deployed = hex::decode("6001600055").unwrap();
+        deployed.extend(hex::decode("d4e5f6").unwrap());
+        deployed.extend([0x00, 0x03]);
+
+        assert_eq!(
+            compare_runtime_bytecode(&submitted, &deployed),
+            Some(BYTECODE_MATCH_TYPE_METADATA_STRIPPED.to_string())
+        );
+    }
+
+    #[test]
+    fn compare_runtime_bytecode_detects_mismatch() {
+        let submitted = hex::decode("6001600055").unwrap();
+        let deployed = hex::decode("6002600055").unwrap();
+        assert_eq!(
+            compare_runtime_bytecode(&submitted, &deployed),
+            Some(BYTECODE_MATCH_TYPE_MISMATCH.to_string())
+        );
+    }
 }
