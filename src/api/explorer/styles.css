@@ -846,6 +846,68 @@ body[data-page-mode="home"] .header-search-slot {
   line-height: 1.55;
 }
 
+.read-contract-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+}
+
+.read-contract-card {
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-card-soft);
+  overflow: hidden;
+}
+
+.read-contract-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px dashed var(--color-distinct);
+}
+
+.read-contract-title {
+  color: var(--color-primary);
+  font-size: 13px;
+}
+
+.read-contract-subtitle {
+  color: var(--color-secondary);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.read-contract-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+}
+
+.field-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  color: var(--color-secondary);
+  font-size: 12px;
+}
+
+.read-contract-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.read-contract-result {
+  border-top: 1px dashed var(--color-distinct);
+}
+
 .kpi-grid {
   display: grid;
   gap: 14px;

@@ -211,6 +211,9 @@ function currentRoute() {
   if (parts[0] === "blocks") {
     return { name: "blocks", page, params };
   }
+  if (parts[0] === "search") {
+    return { name: "search", query: params.get("q") || "", page: 1, params };
+  }
   if (parts[0] === "block" && parts[1]) {
     return { name: "block", id: parts[1], page, params };
   }
@@ -264,6 +267,9 @@ async function renderRoute(_options = {}) {
       return;
     case "blocks":
       await renderBlocksPage(route.page);
+      return;
+    case "search":
+      await renderSearchResultsPage(route.query);
       return;
     case "block":
       await renderBlockPage(route.id, route.page);
@@ -401,6 +407,54 @@ async function renderBlocksPage(page) {
   `;
 }
 
+async function renderSearchResultsPage(rawQuery) {
+  const query = String(rawQuery || "").trim();
+  setDocumentTitle(query ? `${query} · Search · Igra Explorer` : "Search · Igra Explorer");
+
+  if (!query) {
+    elements.pageRoot.innerHTML = `
+      <section class="content-page">
+        <section class="not-found-card">
+          <div class="not-found-copy">Enter an address, transaction hash, block number, label, or token symbol to search.</div>
+        </section>
+      </section>
+    `;
+    return;
+  }
+
+  const payload = await fetchExplorerJson(
+    `/explore/api/search?chainId=${encodeURIComponent(state.chainId)}&q=${encodeURIComponent(query)}`,
+  );
+  const results = Array.isArray(payload.results) ? payload.results : [];
+
+  elements.pageRoot.innerHTML = `
+    <section class="content-page">
+      <header class="page-header">
+        <div class="badge-row">
+          <a class="muted-badge" href="/explore">${icons.arrow} Search</a>
+          <span class="muted-badge">${formatNumber(results.length)} result(s)</span>
+        </div>
+        <div>
+          <h1 class="page-heading">Search results</h1>
+          <p class="page-subheading mono wrap-anywhere">${escapeHtml(query)}</p>
+        </div>
+      </header>
+
+      <section class="panel-card">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Explorer search</div>
+            <div class="panel-subtitle">Blocks, transactions, labels, contracts, and token metadata</div>
+          </div>
+        </div>
+        <div class="panel-body">
+          ${renderSearchResultsTable(results)}
+        </div>
+      </section>
+    </section>
+  `;
+}
+
 async function renderBlockPage(blockId, page) {
   const blockNum = Number(blockId);
   if (!Number.isFinite(blockNum)) {
@@ -507,6 +561,8 @@ async function renderBlockPage(blockId, page) {
       </div>
     </section>
   `;
+
+  bindReadContractForms();
 }
 
 async function renderReceiptPage(hash) {
@@ -684,10 +740,11 @@ async function renderAddressPage(address, requestedTab, page) {
 
   const summary = summaryRows[0] || {};
   const profile = inspect?.profile || null;
+  const label = inspect?.label || null;
   const kind = classifyAddress(summary, profile);
   const tab = normalizeAddressTab(requestedTab, kind);
 
-  setDocumentTitle(`${kind.title} ${shortHex(address)} · Igra Explorer`);
+  setDocumentTitle(`${label?.label || kind.title} ${shortHex(address)} · Igra Explorer`);
 
   let panelTitle = "Transactions";
   let panelSubtitle = "";
@@ -763,7 +820,7 @@ async function renderAddressPage(address, requestedTab, page) {
     panelBody = renderAddressLogsTable(logRows);
     hasNextPage = logRows.length === PAGE_SIZE;
   } else if (tab === "contract") {
-    const [contractLogs, methods] = await Promise.all([
+    const [contractLogs, methods, verification] = await Promise.all([
       runQuery(`
         SELECT
           block_num,
@@ -779,13 +836,16 @@ async function renderAddressPage(address, requestedTab, page) {
       tryFetchExplorerJson(
         `/explore/api/contract/${address}/methods?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${CONTRACT_METHOD_PAGE_SIZE}`,
       ),
+      tryFetchExplorerJson(
+        `/explore/api/contract/${address}/verification?chainId=${encodeURIComponent(state.chainId)}`,
+      ),
     ]);
 
     panelTitle = "Contract";
     panelSubtitle = kind.isContract
       ? "Live bytecode inspection plus indexed method and event activity"
       : "This address does not currently look like a contract from indexed data";
-    panelBody = renderContractPanel(kind, summary, contractLogs, inspect, methods);
+    panelBody = renderContractPanel(address, kind, summary, contractLogs, inspect, methods, verification);
     hasNextPage = Boolean(methods?.methods?.length === CONTRACT_METHOD_PAGE_SIZE);
   } else {
     const [tokenSummaryRows, tokenView, tokenTransfers] = await Promise.all([
@@ -825,7 +885,7 @@ async function renderAddressPage(address, requestedTab, page) {
           ${kind.isToken ? `<a class="muted-badge" href="/explore/token/${address}">${icons.tokens} Token view</a>` : ""}
         </div>
         <div>
-          <h1 class="page-heading">${kind.title}</h1>
+          <h1 class="page-heading">${escapeHtml(label?.label || kind.title)}</h1>
           <p class="page-subheading mono wrap-anywhere">${escapeHtml(address)}</p>
         </div>
       </header>
@@ -841,8 +901,10 @@ async function renderAddressPage(address, requestedTab, page) {
       <div class="page-grid">
         <aside class="summary-card">
           ${renderSummaryRow("Address", escapeHtml(address))}
+          ${renderSummaryRow("Label", label?.label ? escapeHtml(label.label) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Kind", escapeHtml(kind.badge))}
           ${renderSummaryRow("Detected kind", profile?.detected_kind ? escapeHtml(profile.detected_kind.toUpperCase()) : '<span class="text-secondary">Indexed only</span>')}
+          ${renderSummaryRow("Verified source", inspect?.verification ? "Yes" : "No")}
           ${renderSummaryRow("Native balance", profile ? formatTokenAmount(profile.native_balance || "0", 18, 6) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
@@ -1084,7 +1146,7 @@ function renderAddressLogsTable(rows) {
   `;
 }
 
-function renderContractPanel(kind, summary, rows, inspect, methodsPayload) {
+function renderContractPanel(address, kind, summary, rows, inspect, methodsPayload, verificationPayload) {
   if (!kind.isContract) {
     return `
       <div class="notice-card">
@@ -1098,6 +1160,9 @@ function renderContractPanel(kind, summary, rows, inspect, methodsPayload) {
   const profile = inspect?.profile || null;
   const creator = inspect?.creator || null;
   const methods = methodsPayload?.methods || [];
+  const verification = verificationPayload?.verification || null;
+  const readFunctions = Array.isArray(verificationPayload?.read_functions) ? verificationPayload.read_functions : [];
+  const label = verificationPayload?.label || inspect?.label || null;
   const readRows = [
     ["Name", profile?.name],
     ["Symbol", profile?.symbol],
@@ -1115,6 +1180,23 @@ function renderContractPanel(kind, summary, rows, inspect, methodsPayload) {
         ${renderKpiCard("Emitted logs", formatNumber(summary.emitted_logs || 0), "Logs from this address")}
         ${renderKpiCard("Bytecode", profile?.is_contract ? `${formatNumber(profile.bytecode_size || 0)} B` : "-", "Latest eth_getCode snapshot")}
       </div>
+      <section class="subpanel-card">
+        <div class="subpanel-title">Verification</div>
+        ${
+          verification
+            ? `
+              <div class="definition-list">
+                ${renderDefinitionItem("Contract", verification.summary.contract_name)}
+                ${renderDefinitionItem("Compiler", verification.summary.compiler_version || "-")}
+                ${renderDefinitionItem("Language", verification.summary.language || "-")}
+                ${renderDefinitionItem("License", verification.summary.license || "-")}
+                ${renderDefinitionItem("Label", label?.label || "-")}
+                ${renderDefinitionItem("Verified at", formatTimestamp(verification.summary.verified_at))}
+              </div>
+            `
+            : '<div class="empty-mini">No stored verification record yet. Use the trusted API to publish ABI and source metadata for this contract.</div>'
+        }
+      </section>
       <div class="split-grid">
         <section class="subpanel-card">
           <div class="subpanel-title">Contract profile</div>
@@ -1129,12 +1211,24 @@ function renderContractPanel(kind, summary, rows, inspect, methodsPayload) {
         <section class="subpanel-card">
           <div class="subpanel-title">Read contract</div>
           ${
-            readRows.length
-              ? `<div class="definition-list">${readRows.map(([label, value]) => renderDefinitionItem(label, value)).join("")}</div>`
-              : '<div class="empty-mini">No standard ERC reads succeeded against this contract.</div>'
+            verification && readFunctions.length
+              ? renderReadContractPanel(address, readFunctions)
+              : readRows.length
+                ? `<div class="definition-list">${readRows.map(([labelName, value]) => renderDefinitionItem(labelName, value)).join("")}</div>`
+                : '<div class="empty-mini">No stored ABI or standard ERC reads are available for this contract yet.</div>'
           }
         </section>
       </div>
+      ${
+        verification?.source_code
+          ? `
+            <section class="subpanel-card">
+              <div class="subpanel-title">Source code</div>
+              <pre class="code-block mono">${escapeHtml(verification.source_code)}</pre>
+            </section>
+          `
+          : ""
+      }
       <section class="subpanel-card">
         <div class="subpanel-title">Top methods</div>
         ${renderContractMethodsTable(methods)}
@@ -1312,6 +1406,84 @@ function renderLogsTable(rows) {
         </thead>
         <tbody>${body}</tbody>
       </table>
+    </div>
+  `;
+}
+
+function renderSearchResultsTable(rows) {
+  if (!rows.length) {
+    return '<div class="empty-state">No explorer results matched that search.</div>';
+  }
+
+  const body = rows
+    .map(
+      (row) => `
+        <tr>
+          <td>${escapeHtml(row.entity_type || "-")}</td>
+          <td><a href="${row.href}">${escapeHtml(row.title || "-")}</a></td>
+          <td>${escapeHtml(row.subtitle || "-")}</td>
+          <td class="mono">${escapeHtml(shortHex(row.address || row.tx_hash || "", 10))}</td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Title</th>
+            <th>Subtitle</th>
+            <th>Reference</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderReadContractPanel(address, functions) {
+  return `
+    <div class="read-contract-stack">
+      ${functions
+        .slice(0, 24)
+        .map(
+          (fn, index) => `
+            <section class="read-contract-card">
+              <div class="read-contract-head">
+                <div>
+                  <div class="read-contract-title mono">${escapeHtml(fn.signature)}</div>
+                  <div class="read-contract-subtitle">${escapeHtml(fn.state_mutability)} read via stored ABI</div>
+                </div>
+              </div>
+              <form
+                class="read-contract-form"
+                data-read-contract-form
+                data-address="${escapeHtml(address)}"
+                data-selector="${escapeHtml(fn.selector)}"
+              >
+                ${fn.inputs
+                  .map(
+                    (input, inputIndex) => `
+                      <label class="field-stack">
+                        <span class="field-label">${escapeHtml(input.name || `arg${inputIndex}`)} · ${escapeHtml(input.kind)}</span>
+                        <input class="search-input search-input-small" type="text" name="arg-${inputIndex}" placeholder="${escapeHtml(input.kind)}" />
+                      </label>
+                    `,
+                  )
+                  .join("")}
+                <div class="read-contract-actions">
+                  <button class="pagination-link" type="submit">Call</button>
+                </div>
+              </form>
+              <div class="read-contract-result" id="read-contract-result-${index}"></div>
+            </section>
+          `,
+        )
+        .join("")}
     </div>
   `;
 }
@@ -1539,11 +1711,11 @@ function renderSearchForm({ compact, autofocus = false }) {
 
 function bindSearchForms() {
   document.querySelectorAll("[data-search-form]").forEach((form) => {
-    form.addEventListener("submit", (event) => {
+    form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const input = form.querySelector("input[name='explore-query']");
       const value = input?.value?.trim() || "";
-      const target = resolveSearchTarget(value);
+      const target = await resolveSearchTarget(value);
       if (!target) {
         input?.focus();
         return;
@@ -1553,7 +1725,7 @@ function bindSearchForms() {
   });
 }
 
-function resolveSearchTarget(value) {
+async function resolveSearchTarget(value) {
   if (!value) {
     return null;
   }
@@ -1570,7 +1742,15 @@ function resolveSearchTarget(value) {
     return `/explore/address/${normalized}`;
   }
 
-  return "/explore/tokens";
+  const payload = await tryFetchExplorerJson(
+    `/explore/api/search?chainId=${encodeURIComponent(state.chainId)}&q=${encodeURIComponent(value)}`,
+  );
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  if (results.length === 1 && results[0]?.href) {
+    return results[0].href;
+  }
+
+  return buildUrl("/explore/search", { q: value });
 }
 
 function renderPillLink(label, href, icon) {
@@ -1598,6 +1778,56 @@ function renderDefinitionItem(label, value) {
     <div class="definition-item">
       <div class="definition-label">${escapeHtml(label)}</div>
       <div class="definition-value mono">${renderedValue}</div>
+    </div>
+  `;
+}
+
+function bindReadContractForms() {
+  document.querySelectorAll("[data-read-contract-form]").forEach((form, formIndex) => {
+    if (form.dataset.bound === "true") {
+      return;
+    }
+    form.dataset.bound = "true";
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const address = form.dataset.address;
+      const selector = form.dataset.selector;
+      const result = form.parentElement?.querySelector(".read-contract-result");
+      const args = Array.from(form.querySelectorAll("input")).map((input) => input.value.trim()).filter((value) => value.length > 0);
+
+      if (result) {
+        result.innerHTML = '<div class="empty-mini">Calling contract…</div>';
+      }
+
+      try {
+        const payload = await fetchJson("/explore/api/contract/" + address + "/read?chainId=" + encodeURIComponent(state.chainId), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ selector, args }),
+        });
+
+        if (result) {
+          result.innerHTML = renderReadContractResult(payload.outputs || []);
+        }
+      } catch (error) {
+        if (result) {
+          result.innerHTML = `<div class="empty-mini">${escapeHtml(error.message || "Contract call failed")}</div>`;
+        }
+      }
+    });
+  });
+}
+
+function renderReadContractResult(outputs) {
+  if (!outputs.length) {
+    return '<div class="empty-mini">No output values were returned.</div>';
+  }
+
+  return `
+    <div class="definition-list">
+      ${outputs.map((output, index) => renderDefinitionItem(`output${index} · ${output.kind}`, output.value)).join("")}
     </div>
   `;
 }
@@ -1740,7 +1970,11 @@ async function runQuery(sql) {
 }
 
 async function fetchExplorerJson(path) {
-  const response = await fetch(path);
+  return fetchJson(path);
+}
+
+async function fetchJson(path, options) {
+  const response = await fetch(path, options);
   const payload = await safeJson(response);
 
   if (!response.ok || !payload?.ok) {
