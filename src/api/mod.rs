@@ -232,7 +232,12 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/explore/assets/styles.css", get(explorer::styles_css))
         .route("/explore/assets/favicon.svg", get(explorer::favicon_svg))
         .route("/explore/assets/logo.png", get(explorer::logo_png))
+        .route(
+            "/explore/api/admin/capabilities",
+            get(explorer_api::admin_capabilities),
+        )
         .route("/explore/api/search", get(explorer_api::search))
+        .route("/explore/api/tokens", get(explorer_api::tokens))
         .route(
             "/explore/api/address/{address}/inspect",
             get(explorer_api::inspect_address),
@@ -256,6 +261,10 @@ fn build_router(state: AppState) -> Router<()> {
         .route(
             "/explore/api/token/{address}/transfers",
             get(explorer_api::token_transfers),
+        )
+        .route(
+            "/explore/api/token/{address}/approvals",
+            get(explorer_api::token_approvals),
         )
         .route(
             "/explore/api/contract/{address}/methods",

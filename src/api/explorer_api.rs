@@ -27,6 +27,7 @@ const ERC165_INTERFACE_ID: [u8; 4] = [0x01, 0xff, 0xc9, 0xa7];
 const ERC721_INTERFACE_ID: [u8; 4] = [0x80, 0xac, 0x58, 0xcd];
 const ERC1155_INTERFACE_ID: [u8; 4] = [0xd9, 0xb6, 0x7a, 0x26];
 const TRANSFER_TOPIC: &str = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const APPROVAL_TOPIC: &str = "8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[derive(Deserialize)]
@@ -233,6 +234,26 @@ pub struct TokenHoldersResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TokenApproval {
+    pub block_num: i64,
+    pub block_timestamp: chrono::DateTime<chrono::Utc>,
+    pub log_idx: i32,
+    pub tx_hash: String,
+    pub owner_address: String,
+    pub spender_address: String,
+    pub amount: String,
+}
+
+#[derive(Serialize)]
+pub struct TokenApprovalsResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub address: String,
+    pub profile: ContractProfile,
+    pub approvals: Vec<TokenApproval>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TokenTransfer {
     pub block_num: i64,
     pub block_timestamp: chrono::DateTime<chrono::Utc>,
@@ -250,6 +271,30 @@ pub struct TokenTransfersResponse {
     pub address: String,
     pub profile: ContractProfile,
     pub transfers: Vec<TokenTransfer>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenListItem {
+    pub address: String,
+    pub detected_kind: String,
+    pub label: Option<String>,
+    pub is_official: bool,
+    pub name: Option<String>,
+    pub symbol: Option<String>,
+    pub decimals: Option<i32>,
+    pub total_supply: Option<String>,
+    pub transfer_count: i64,
+    pub approval_count: i64,
+    pub last_seen_block: i64,
+}
+
+#[derive(Serialize)]
+pub struct TokensResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub page: i64,
+    pub limit: i64,
+    pub tokens: Vec<TokenListItem>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,6 +341,22 @@ pub struct ReadContractResponse {
     pub outputs: Vec<ReadContractValue>,
 }
 
+#[derive(Serialize)]
+pub struct AdminCapabilitiesResponse {
+    pub ok: bool,
+    pub can_write_metadata: bool,
+}
+
+pub async fn admin_capabilities(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<AdminCapabilitiesResponse>, ApiError> {
+    Ok(Json(AdminCapabilitiesResponse {
+        ok: true,
+        can_write_metadata: state.is_trusted_ip(&addr),
+    }))
+}
+
 pub async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -339,14 +400,22 @@ pub async fn search(
                 label,
                 subtitle,
                 entity_type,
-                rank
+                rank,
+                official_rank,
+                entity_rank
             FROM (
                 SELECT
                     address AS addr,
                     label,
                     COALESCE(category, '') AS subtitle,
                     'label' AS entity_type,
-                    CASE WHEN lower(label) = $1 THEN 0 ELSE 1 END AS rank
+                    CASE
+                        WHEN lower(label) = $1 THEN 0
+                        WHEN lower(COALESCE(category, '')) = $1 THEN 1
+                        ELSE 2
+                    END AS rank,
+                    CASE WHEN is_official THEN 0 ELSE 1 END AS official_rank,
+                    0 AS entity_rank
                 FROM address_labels
                 WHERE lower(label) LIKE $2
                    OR lower(COALESCE(category, '')) LIKE $2
@@ -356,25 +425,32 @@ pub async fn search(
                     contract_name AS label,
                     COALESCE(compiler_version, '') AS subtitle,
                     'verified_contract' AS entity_type,
-                    CASE WHEN lower(contract_name) = $1 THEN 0 ELSE 2 END AS rank
+                    CASE WHEN lower(contract_name) = $1 THEN 0 ELSE 2 END AS rank,
+                    0 AS official_rank,
+                    1 AS entity_rank
                 FROM contract_verifications
                 WHERE lower(contract_name) LIKE $2
                 UNION ALL
                 SELECT
-                    address AS addr,
-                    COALESCE(symbol, name, encode(address, 'hex')) AS label,
-                    COALESCE(name, detected_kind) AS subtitle,
+                    tm.address AS addr,
+                    COALESCE(al.label, tm.symbol, tm.name, encode(tm.address, 'hex')) AS label,
+                    COALESCE(tm.name, tm.detected_kind) AS subtitle,
                     'token' AS entity_type,
                     CASE
-                        WHEN lower(COALESCE(symbol, '')) = $1 THEN 0
-                        WHEN lower(COALESCE(name, '')) = $1 THEN 1
+                        WHEN lower(COALESCE(tm.symbol, '')) = $1 THEN 0
+                        WHEN lower(COALESCE(tm.name, '')) = $1 THEN 1
+                        WHEN lower(COALESCE(al.label, '')) = $1 THEN 1
                         ELSE 3
-                    END AS rank
-                FROM token_metadata
-                WHERE lower(COALESCE(symbol, '')) LIKE $2
-                   OR lower(COALESCE(name, '')) LIKE $2
+                    END AS rank,
+                    CASE WHEN COALESCE(al.is_official, FALSE) THEN 0 ELSE 1 END AS official_rank,
+                    2 AS entity_rank
+                FROM token_metadata tm
+                LEFT JOIN address_labels al ON al.address = tm.address
+                WHERE lower(COALESCE(tm.symbol, '')) LIKE $2
+                   OR lower(COALESCE(tm.name, '')) LIKE $2
+                   OR lower(COALESCE(al.label, '')) LIKE $2
             ) search_hits
-            ORDER BY rank ASC, label ASC
+            ORDER BY rank ASC, official_rank ASC, entity_rank ASC, label ASC
             LIMIT 20
             ",
             &[&trimmed.to_lowercase(), &like],
@@ -408,6 +484,96 @@ pub async fn search(
         chain_id,
         query: trimmed,
         results,
+    }))
+}
+
+pub async fn tokens(
+    State(state): State<AppState>,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<TokensResponse>, ApiError> {
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let limit = query.limit.unwrap_or(25).clamp(1, 50);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+    let transfer_topic = hex::decode(TRANSFER_TOPIC)
+        .map_err(|_| ApiError::Internal("Invalid transfer topic".to_string()))?;
+    let approval_topic = hex::decode(APPROVAL_TOPIC)
+        .map_err(|_| ApiError::Internal("Invalid approval topic".to_string()))?;
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+
+    let rows = conn
+        .query(
+            "
+            WITH activity AS (
+                SELECT
+                    address,
+                    COUNT(*) FILTER (WHERE topic0 = $1)::BIGINT AS transfer_count,
+                    COUNT(*) FILTER (WHERE topic0 = $2)::BIGINT AS approval_count,
+                    MAX(block_num) AS last_seen_block
+                FROM logs
+                WHERE topic0 = $1 OR topic0 = $2
+                GROUP BY address
+            )
+            SELECT
+                encode(activity.address, 'hex') AS address,
+                COALESCE(tm.detected_kind, 'token') AS detected_kind,
+                al.label,
+                COALESCE(al.is_official, FALSE) AS is_official,
+                tm.name,
+                tm.symbol,
+                tm.decimals,
+                tm.total_supply,
+                activity.transfer_count,
+                activity.approval_count,
+                activity.last_seen_block
+            FROM activity
+            LEFT JOIN token_metadata tm ON tm.address = activity.address
+            LEFT JOIN address_labels al ON al.address = activity.address
+            ORDER BY
+                CASE WHEN COALESCE(al.is_official, FALSE) THEN 0 ELSE 1 END,
+                CASE WHEN COALESCE(tm.symbol, '') <> '' THEN 0 ELSE 1 END,
+                CASE WHEN COALESCE(tm.name, '') <> '' THEN 0 ELSE 1 END,
+                activity.transfer_count DESC,
+                activity.approval_count DESC,
+                activity.last_seen_block DESC
+            LIMIT $3
+            OFFSET $4
+            ",
+            &[&transfer_topic, &approval_topic, &limit, &offset],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load token list: {e}")))?;
+
+    let tokens = rows
+        .into_iter()
+        .map(|row| TokenListItem {
+            address: format!("0x{}", row.get::<_, String>("address")),
+            detected_kind: row.get("detected_kind"),
+            label: row.get("label"),
+            is_official: row.get("is_official"),
+            name: row.get("name"),
+            symbol: row.get("symbol"),
+            decimals: row.get("decimals"),
+            total_supply: row.get("total_supply"),
+            transfer_count: row.get("transfer_count"),
+            approval_count: row.get("approval_count"),
+            last_seen_block: row.get("last_seen_block"),
+        })
+        .collect();
+
+    Ok(Json(TokensResponse {
+        ok: true,
+        chain_id,
+        page,
+        limit,
+        tokens,
     }))
 }
 
@@ -655,8 +821,20 @@ pub async fn address_portfolio(
                 SELECT
                     address AS token_address,
                     (
-                        SUM(CASE WHEN topic2 = $1 THEN abi_uint(data) ELSE 0::NUMERIC END)
-                        - SUM(CASE WHEN topic1 = $1 THEN abi_uint(data) ELSE 0::NUMERIC END)
+                        SUM(
+                            CASE
+                                WHEN topic2 = $1 AND octet_length(data) >= 32 THEN abi_uint(data)
+                                WHEN topic2 = $1 AND topic3 IS NOT NULL THEN abi_uint(topic3)
+                                ELSE 0::NUMERIC
+                            END
+                        )
+                        - SUM(
+                            CASE
+                                WHEN topic1 = $1 AND octet_length(data) >= 32 THEN abi_uint(data)
+                                WHEN topic1 = $1 AND topic3 IS NOT NULL THEN abi_uint(topic3)
+                                ELSE 0::NUMERIC
+                            END
+                        )
                     ) AS balance,
                     COUNT(*) FILTER (WHERE topic2 = $1) AS received_count,
                     COUNT(*) FILTER (WHERE topic1 = $1) AS sent_count,
@@ -752,14 +930,26 @@ pub async fn token_holders(
         .query(
             "
             WITH deltas AS (
-                SELECT abi_address(topic1) AS holder, -abi_uint(data) AS delta
+                SELECT
+                    abi_address(topic1) AS holder,
+                    -CASE
+                        WHEN octet_length(data) >= 32 THEN abi_uint(data)
+                        WHEN topic3 IS NOT NULL THEN abi_uint(topic3)
+                        ELSE 0::NUMERIC
+                    END AS delta
                 FROM logs
                 WHERE address = $1
                   AND topic0 = $2
                   AND topic1 IS NOT NULL
                   AND topic1 <> $3
                 UNION ALL
-                SELECT abi_address(topic2) AS holder, abi_uint(data) AS delta
+                SELECT
+                    abi_address(topic2) AS holder,
+                    CASE
+                        WHEN octet_length(data) >= 32 THEN abi_uint(data)
+                        WHEN topic3 IS NOT NULL THEN abi_uint(topic3)
+                        ELSE 0::NUMERIC
+                    END AS delta
                 FROM logs
                 WHERE address = $1
                   AND topic0 = $2
@@ -838,7 +1028,11 @@ pub async fn token_transfers(
                 encode(tx_hash, 'hex') AS tx_hash,
                 encode(abi_address(topic1), 'hex') AS from_address,
                 encode(abi_address(topic2), 'hex') AS to_address,
-                abi_uint(data)::TEXT AS amount
+                CASE
+                    WHEN octet_length(data) >= 32 THEN abi_uint(data)::TEXT
+                    WHEN topic3 IS NOT NULL THEN abi_uint(topic3)::TEXT
+                    ELSE '0'
+                END AS amount
             FROM logs
             WHERE address = $1
               AND topic0 = $2
@@ -870,6 +1064,75 @@ pub async fn token_transfers(
         address: normalized.clone(),
         profile: inspect_token_profile(rpc, &normalized).await,
         transfers,
+    }))
+}
+
+pub async fn token_approvals(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<TokenApprovalsResponse>, ApiError> {
+    let normalized = normalize_address(&address)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let (pool, rpc) = load_pool_and_rpc(&state, chain_id).await?;
+    let limit = query.limit.unwrap_or(12).clamp(1, 50);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+    let token_bytes = address_bytes(&normalized)?;
+    let approval_topic = hex::decode(APPROVAL_TOPIC)
+        .map_err(|_| ApiError::Internal("Invalid approval topic".to_string()))?;
+
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+
+    let rows = conn
+        .query(
+            "
+            SELECT
+                block_num,
+                block_timestamp,
+                log_idx,
+                encode(tx_hash, 'hex') AS tx_hash,
+                encode(abi_address(topic1), 'hex') AS owner_address,
+                encode(abi_address(topic2), 'hex') AS spender_address,
+                CASE
+                    WHEN octet_length(data) >= 32 THEN abi_uint(data)::TEXT
+                    WHEN topic3 IS NOT NULL THEN abi_uint(topic3)::TEXT
+                    ELSE '0'
+                END AS amount
+            FROM logs
+            WHERE address = $1
+              AND topic0 = $2
+            ORDER BY block_num DESC, log_idx DESC
+            LIMIT $3
+            OFFSET $4
+            ",
+            &[&token_bytes, &approval_topic, &limit, &offset],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load token approvals: {e}")))?;
+
+    let approvals = rows
+        .into_iter()
+        .map(|row| TokenApproval {
+            block_num: row.get("block_num"),
+            block_timestamp: row.get("block_timestamp"),
+            log_idx: row.get("log_idx"),
+            tx_hash: format!("0x{}", row.get::<_, String>("tx_hash")),
+            owner_address: format!("0x{}", row.get::<_, String>("owner_address")),
+            spender_address: format!("0x{}", row.get::<_, String>("spender_address")),
+            amount: row.get("amount"),
+        })
+        .collect();
+
+    Ok(Json(TokenApprovalsResponse {
+        ok: true,
+        chain_id,
+        address: normalized.clone(),
+        profile: inspect_token_profile(rpc, &normalized).await,
+        approvals,
     }))
 }
 
