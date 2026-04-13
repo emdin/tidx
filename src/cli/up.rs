@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 
 use tidx::api::{
     self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedClickHouseEngines, SharedPools,
+    SharedRpcClients,
 };
 use tidx::broadcast::Broadcaster;
 use tidx::clickhouse::ClickHouseEngine;
@@ -17,6 +18,7 @@ use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
+use tidx::sync::fetcher::RpcClient;
 use tidx::sync::sink::SinkSet;
 
 #[derive(ClapArgs)]
@@ -72,6 +74,7 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
+    let rpc_clients: SharedRpcClients = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_configs: SharedClickHouseConfigs = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_engines: SharedClickHouseEngines = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
@@ -82,6 +85,11 @@ pub async fn run(args: Args) -> Result<()> {
         if default_chain_id == 0 {
             default_chain_id = chain.chain_id;
         }
+
+        rpc_clients
+            .write()
+            .await
+            .insert(chain.chain_id, Arc::new(RpcClient::new(&chain.rpc_url)));
 
         // Initialize ClickHouse if configured (for each chain)
         if let Some(ref ch_config) = chain.clickhouse {
@@ -132,6 +140,7 @@ pub async fn run(args: Args) -> Result<()> {
 
             let router = api::router_shared(
                 Arc::clone(&pools),
+                Arc::clone(&rpc_clients),
                 default_chain_id,
                 broadcaster.clone(),
                 Arc::clone(&clickhouse_configs),
@@ -158,6 +167,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
+        let rpc_clients_for_watcher = Arc::clone(&rpc_clients);
         let clickhouse_configs_for_watcher = Arc::clone(&clickhouse_configs);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
@@ -179,6 +189,10 @@ pub async fn run(args: Args) -> Result<()> {
                             .write()
                             .await
                             .insert(event.chain.chain_id, api_pool);
+                        rpc_clients_for_watcher.write().await.insert(
+                            event.chain.chain_id,
+                            Arc::new(RpcClient::new(&event.chain.rpc_url)),
+                        );
 
                         spawn_sync_engine(
                             event.chain,
@@ -197,6 +211,7 @@ pub async fn run(args: Args) -> Result<()> {
         let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
         let router = api::router_with_options(
             pools.read().await.clone(),
+            rpc_clients.read().await.clone(),
             default_chain_id,
             broadcaster.clone(),
             clickhouse_configs.read().await.clone(),

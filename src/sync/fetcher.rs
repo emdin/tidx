@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
 use alloy::network::TransactionResponse;
 use alloy::primitives::B256;
+use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
@@ -106,8 +106,10 @@ impl RpcClient {
     }
 
     pub fn mark_block_receipts_unsupported(&self) {
-        self.receipt_fetch_mode
-            .store(ReceiptFetchMode::TransactionReceipts as u8, Ordering::Relaxed);
+        self.receipt_fetch_mode.store(
+            ReceiptFetchMode::TransactionReceipts as u8,
+            Ordering::Relaxed,
+        );
     }
 
     pub async fn chain_id(&self) -> Result<u64> {
@@ -124,6 +126,38 @@ impl RpcClient {
             .result
             .ok_or_else(|| anyhow!("No result for eth_blockNumber"))?;
         Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
+    }
+
+    pub async fn get_balance(&self, address: &str) -> Result<String> {
+        let resp: RpcResponse<String> = self
+            .call("eth_getBalance", serde_json::json!([address, "latest"]))
+            .await?;
+        resp.result
+            .ok_or_else(|| anyhow!("No result for eth_getBalance"))
+    }
+
+    pub async fn get_code(&self, address: &str) -> Result<String> {
+        let resp: RpcResponse<String> = self
+            .call("eth_getCode", serde_json::json!([address, "latest"]))
+            .await?;
+        resp.result
+            .ok_or_else(|| anyhow!("No result for eth_getCode"))
+    }
+
+    pub async fn eth_call(&self, to: &str, data: &str) -> Result<String> {
+        let resp: RpcResponse<String> = self
+            .call(
+                "eth_call",
+                serde_json::json!([
+                    {
+                        "to": to,
+                        "data": data,
+                    },
+                    "latest"
+                ]),
+            )
+            .await?;
+        resp.result.ok_or_else(|| anyhow!("No result for eth_call"))
     }
 
     pub async fn get_block(&self, num: u64, full_txs: bool) -> Result<Block> {
