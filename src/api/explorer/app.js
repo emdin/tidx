@@ -74,6 +74,7 @@ const KNOWN_METHODS = {
 const state = {
   chainId: Number(window.__TIDX_DEFAULT_CHAIN_ID__) || null,
   status: null,
+  adminCapabilities: null,
   refreshTimer: null,
   refreshInFlight: false,
 };
@@ -109,6 +110,7 @@ document.addEventListener("DOMContentLoaded", () => {
 async function boot() {
   try {
     await refreshStatus();
+    await refreshAdminCapabilities();
     renderLatestBlock();
     installAutoRefresh();
     await renderRoute();
@@ -180,6 +182,10 @@ async function refreshStatus() {
   if (!state.chainId && state.status) {
     state.chainId = Number(state.status.chain_id);
   }
+}
+
+async function refreshAdminCapabilities() {
+  state.adminCapabilities = await tryFetchExplorerJson("/explore/api/admin/capabilities");
 }
 
 function renderLatestBlock() {
@@ -752,6 +758,7 @@ async function renderAddressPage(address, requestedTab, page) {
   let paginationPath = `/explore/address/${address}`;
   let paginationExtras = { tab };
   let hasNextPage = false;
+  let contractVerification = null;
 
   if (tab === "transactions") {
     const offset = (page - 1) * PAGE_SIZE;
@@ -845,10 +852,11 @@ async function renderAddressPage(address, requestedTab, page) {
     panelSubtitle = kind.isContract
       ? "Live bytecode inspection plus indexed method and event activity"
       : "This address does not currently look like a contract from indexed data";
+    contractVerification = verification;
     panelBody = renderContractPanel(address, kind, summary, contractLogs, inspect, methods, verification);
     hasNextPage = Boolean(methods?.methods?.length === CONTRACT_METHOD_PAGE_SIZE);
   } else {
-    const [tokenSummaryRows, tokenView, tokenTransfers] = await Promise.all([
+    const [tokenSummaryRows, tokenView, tokenTransfers, tokenApprovals] = await Promise.all([
       runQuery(`
         SELECT
           (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_count,
@@ -865,16 +873,23 @@ async function renderAddressPage(address, requestedTab, page) {
       tryFetchExplorerJson(
         `/explore/api/token/${address}/transfers?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${TOKEN_TRANSFER_PAGE_SIZE}`,
       ),
+      tryFetchExplorerJson(
+        `/explore/api/token/${address}/approvals?chainId=${encodeURIComponent(state.chainId)}&limit=10`,
+      ),
     ]);
 
     const tokenSummary = tokenSummaryRows[0] || {};
     panelTitle = "Token";
     panelSubtitle = kind.isToken
-      ? "Metadata, top holders, and recent transfers"
+      ? "Metadata, top holders, recent transfers, and approvals"
       : "This address is not currently classified as token-like";
-    panelBody = renderTokenPanel(kind, tokenSummary, inspect, tokenView, tokenTransfers);
+    panelBody = renderTokenPanel(kind, tokenSummary, inspect, tokenView, tokenTransfers, tokenApprovals);
     hasNextPage = Boolean(tokenTransfers?.transfers?.length === TOKEN_TRANSFER_PAGE_SIZE || tokenView?.holders?.length === TOKEN_HOLDER_PAGE_SIZE);
   }
+
+  const adminPanel = state.adminCapabilities?.can_write_metadata
+    ? renderExplorerAdminPanel(address, kind, inspect, contractVerification)
+    : "";
 
   elements.pageRoot.innerHTML = `
     <section class="content-page">
@@ -935,47 +950,39 @@ async function renderAddressPage(address, requestedTab, page) {
           ${page > 1 || hasNextPage ? renderPagination(paginationPath, page, hasNextPage, paginationExtras) : ""}
         </section>
       </div>
+      ${adminPanel}
     </section>
   `;
+
+  bindReadContractForms();
+  bindExplorerAdminForms();
 }
 
 async function renderTokensPage(page) {
   setDocumentTitle("Tokens · Igra Explorer");
-
-  const offset = (page - 1) * PAGE_SIZE;
-  const tokenRows = await runQuery(`
-    SELECT
-      encode(address, 'hex') AS address,
-      COUNT(*) FILTER (WHERE topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_count,
-      COUNT(*) FILTER (WHERE topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_count,
-      MAX(block_num) AS last_seen_block
-    FROM logs
-    WHERE topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')
-       OR topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')
-    GROUP BY address
-    ORDER BY transfer_count DESC, approval_count DESC, last_seen_block DESC
-    LIMIT ${PAGE_SIZE}
-    OFFSET ${offset}
-  `);
+  const payload = await fetchExplorerJson(
+    `/explore/api/tokens?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${PAGE_SIZE}`,
+  );
+  const tokenRows = Array.isArray(payload?.tokens) ? payload.tokens : [];
 
   elements.pageRoot.innerHTML = `
     <section class="content-page">
       <header class="page-header">
         <div class="badge-row">
-          <span class="status-pill">Inferred</span>
-          <span class="muted-badge">Transfer and Approval event signatures</span>
+          <span class="status-pill">Indexed</span>
+          <span class="muted-badge">Metadata cache + Transfer/Approval activity</span>
         </div>
         <div>
           <h1 class="page-heading">Tokens</h1>
-          <p class="page-subheading">Token-like contracts inferred from indexed logs. Names and decimals are not available yet.</p>
+          <p class="page-subheading">Token-like contracts ranked by cached metadata, official labels, and indexed activity.</p>
         </div>
       </header>
 
       <section class="panel-card">
         <div class="panel-header">
           <div>
-            <div class="panel-title">Token-like contracts</div>
-            <div class="panel-subtitle">Addresses emitting ERC-20-style Transfer or Approval events</div>
+            <div class="panel-title">Token directory</div>
+            <div class="panel-subtitle">Addresses emitting ERC-style Transfer or Approval events with explorer metadata when available</div>
           </div>
         </div>
         <div class="panel-body table-wrap">
@@ -1194,7 +1201,7 @@ function renderContractPanel(address, kind, summary, rows, inspect, methodsPaylo
                 ${renderDefinitionItem("Verified at", formatTimestamp(verification.summary.verified_at))}
               </div>
             `
-            : '<div class="empty-mini">No stored verification record yet. Use the trusted API to publish ABI and source metadata for this contract.</div>'
+            : '<div class="empty-mini">No stored verification record yet. Use the explorer admin panel below to import ABI and source metadata for this contract.</div>'
         }
       </section>
       <div class="split-grid">
@@ -1267,7 +1274,7 @@ function renderContractPanel(address, kind, summary, rows, inspect, methodsPaylo
   `;
 }
 
-function renderTokenPanel(kind, tokenSummary, inspect, holdersPayload, transfersPayload) {
+function renderTokenPanel(kind, tokenSummary, inspect, holdersPayload, transfersPayload, approvalsPayload) {
   if (!kind.isToken) {
     return `
       <div class="notice-card">
@@ -1279,10 +1286,12 @@ function renderTokenPanel(kind, tokenSummary, inspect, holdersPayload, transfers
     `;
   }
 
-  const profile = inspect?.profile || holdersPayload?.profile || transfersPayload?.profile || null;
+  const profile = inspect?.profile || holdersPayload?.profile || transfersPayload?.profile || approvalsPayload?.profile || null;
   const holders = holdersPayload?.holders || [];
   const transfers = transfersPayload?.transfers || [];
+  const approvals = approvalsPayload?.approvals || [];
   const holderCount = Number(holdersPayload?.total_holders || 0);
+  const label = inspect?.label?.label || null;
 
   return `
     <div class="panel-stack">
@@ -1295,6 +1304,7 @@ function renderTokenPanel(kind, tokenSummary, inspect, holdersPayload, transfers
         <section class="subpanel-card">
           <div class="subpanel-title">Token profile</div>
           <div class="definition-list">
+            ${renderDefinitionItem("Label", label || "-")}
             ${renderDefinitionItem("Standard", profile?.detected_kind ? profile.detected_kind.toUpperCase() : "TOKEN")}
             ${renderDefinitionItem("Name", profile?.name || "-")}
             ${renderDefinitionItem("Symbol", profile?.symbol || "-")}
@@ -1310,6 +1320,10 @@ function renderTokenPanel(kind, tokenSummary, inspect, holdersPayload, transfers
       <section class="subpanel-card">
         <div class="subpanel-title">Recent transfers</div>
         ${renderTokenTransfersTable(transfers, profile?.decimals ?? 0)}
+      </section>
+      <section class="subpanel-card">
+        <div class="subpanel-title">Recent approvals</div>
+        ${renderTokenApprovalsTable(approvals, profile?.decimals ?? 0)}
       </section>
     </div>
   `;
@@ -1344,23 +1358,35 @@ function renderTokensTable(rows) {
   }
 
   const body = rows
-    .map(
-      (row) => `
+    .map((row) => {
+      const title = row.label || row.symbol || row.name || shortHex(row.address, 8);
+      const subtitleParts = [row.name, row.symbol].filter(Boolean);
+      return `
         <tr>
-          <td class="mono"><a href="/explore/token/${with0x(row.address)}">${escapeHtml(with0x(row.address))}</a></td>
+          <td>
+            <div class="table-primary-cell">
+              <a href="/explore/token/${with0x(row.address)}">${escapeHtml(title)}</a>
+              ${row.is_official ? '<span class="mini-badge">Official</span>' : ""}
+            </div>
+            <div class="table-secondary-cell mono">${escapeHtml(subtitleParts.join(" · ") || with0x(row.address))}</div>
+          </td>
+          <td>${escapeHtml((row.detected_kind || "token").toUpperCase())}</td>
+          <td class="align-right mono">${row.total_supply ? formatTokenAmount(row.total_supply, row.decimals ?? 0, 4) : "-"}</td>
           <td class="align-right mono">${formatNumber(row.transfer_count || 0)}</td>
           <td class="align-right mono">${formatNumber(row.approval_count || 0)}</td>
           <td class="align-right mono"><a href="/explore/block/${row.last_seen_block}">${formatNumber(row.last_seen_block)}</a></td>
         </tr>
-      `,
-    )
+      `;
+    })
     .join("");
 
   return `
     <table class="data-table">
       <thead>
         <tr>
-          <th>Address</th>
+          <th>Token</th>
+          <th>Kind</th>
+          <th class="align-right">Supply</th>
           <th class="align-right">Transfers</th>
           <th class="align-right">Approvals</th>
           <th class="align-right">Last seen</th>
@@ -1626,6 +1652,45 @@ function renderTokenTransfersTable(rows, decimals) {
   `;
 }
 
+function renderTokenApprovalsTable(rows, decimals) {
+  if (!rows.length) {
+    return '<div class="empty-mini">No approval events indexed for this token yet.</div>';
+  }
+
+  const body = rows
+    .map(
+      (row) => `
+        <tr>
+          <td class="mono"><a href="/explore/block/${row.block_num}">${formatNumber(row.block_num)}</a></td>
+          <td>${escapeHtml(formatRelativeTime(row.block_timestamp))}</td>
+          <td class="mono"><a href="/explore/address/${row.owner_address}">${escapeHtml(shortHex(row.owner_address, 8))}</a></td>
+          <td class="mono"><a href="/explore/address/${row.spender_address}">${escapeHtml(shortHex(row.spender_address, 8))}</a></td>
+          <td class="align-right mono">${formatTokenAmount(row.amount, decimals, 6)}</td>
+          <td class="mono"><a href="/explore/receipt/${row.tx_hash}">${escapeHtml(shortHex(row.tx_hash, 10))}</a></td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Block</th>
+            <th>Time</th>
+            <th>Owner</th>
+            <th>Spender</th>
+            <th class="align-right">Value / ID</th>
+            <th>Tx</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderPortfolioTable(rows) {
   if (!rows.length) {
     return '<div class="empty-state">No positive token balances inferred for this address yet.</div>';
@@ -1780,6 +1845,246 @@ function renderDefinitionItem(label, value) {
       <div class="definition-value mono">${renderedValue}</div>
     </div>
   `;
+}
+
+function renderExplorerAdminPanel(address, kind, inspect, verificationPayload) {
+  const label = inspect?.label || {};
+  const verification = verificationPayload?.verification || null;
+  const summary = verification?.summary || inspect?.verification || {};
+  const abiJson = verification?.abi ? JSON.stringify(verification.abi, null, 2) : "";
+  const sourceCode = verification?.source_code || "";
+
+  return `
+    <section class="panel-card explorer-admin-panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Explorer admin</div>
+          <div class="panel-subtitle">Trusted local metadata tools for labels, verification imports, and cache refresh</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="panel-stack panel-stack-tight">
+          <div class="split-grid">
+            <section class="subpanel-card">
+              <div class="subpanel-title">Address label</div>
+              <form class="explorer-admin-form" data-label-form data-address="${escapeHtml(address)}">
+                <label class="field-stack">
+                  <span class="field-label">Label</span>
+                  <input class="search-input search-input-small" type="text" name="label" value="${escapeHtml(label.label || "")}" placeholder="Treasury, Bridge, Token, Router" />
+                </label>
+                <label class="field-stack">
+                  <span class="field-label">Category</span>
+                  <input class="search-input search-input-small" type="text" name="category" value="${escapeHtml(label.category || "")}" placeholder="token" />
+                </label>
+                <label class="field-stack">
+                  <span class="field-label">Website</span>
+                  <input class="search-input search-input-small" type="text" name="website" value="${escapeHtml(label.website || "")}" placeholder="https://igralabs.com" />
+                </label>
+                <label class="field-stack">
+                  <span class="field-label">Notes</span>
+                  <textarea class="text-area-input mono" name="notes" rows="4" placeholder="Optional internal note">${escapeHtml(label.notes || "")}</textarea>
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" name="is_official" ${label.is_official ? "checked" : ""} />
+                  <span>Official label</span>
+                </label>
+                <div class="admin-action-row">
+                  <button class="pagination-link" type="submit">Save label</button>
+                  <span class="admin-status" data-label-status></span>
+                </div>
+              </form>
+            </section>
+
+            <section class="subpanel-card">
+              <div class="subpanel-title">Metadata cache</div>
+              <div class="empty-mini">
+                Refresh live RPC metadata and token cache for this address without restarting the indexer.
+              </div>
+              <div class="admin-action-row admin-action-row-pad">
+                <button class="pagination-link" type="button" data-refresh-address data-address="${escapeHtml(address)}">
+                  Refresh metadata
+                </button>
+                <span class="admin-status" data-refresh-status></span>
+              </div>
+            </section>
+          </div>
+
+          ${
+            kind.isContract
+              ? `
+                <section class="subpanel-card">
+                  <div class="subpanel-title">Contract verification import</div>
+                  <form class="explorer-admin-form" data-verify-form data-address="${escapeHtml(address)}">
+                    <div class="split-grid">
+                      <label class="field-stack">
+                        <span class="field-label">Contract name</span>
+                        <input class="search-input search-input-small" type="text" name="contract_name" value="${escapeHtml(summary.contract_name || inspect?.profile?.name || label.label || "")}" placeholder="HeartbeatToken0" />
+                      </label>
+                      <label class="field-stack">
+                        <span class="field-label">Language</span>
+                        <input class="search-input search-input-small" type="text" name="language" value="${escapeHtml(summary.language || "Solidity")}" placeholder="Solidity" />
+                      </label>
+                      <label class="field-stack">
+                        <span class="field-label">Compiler version</span>
+                        <input class="search-input search-input-small" type="text" name="compiler_version" value="${escapeHtml(summary.compiler_version || "")}" placeholder="v0.8.x+commit..." />
+                      </label>
+                      <label class="field-stack">
+                        <span class="field-label">License</span>
+                        <input class="search-input search-input-small" type="text" name="license" value="${escapeHtml(summary.license || "")}" placeholder="MIT" />
+                      </label>
+                      <label class="field-stack">
+                        <span class="field-label">Optimization runs</span>
+                        <input class="search-input search-input-small" type="number" name="optimization_runs" value="${escapeHtml(summary.optimization_runs ?? "")}" placeholder="200" />
+                      </label>
+                      <label class="checkbox-row checkbox-row-inline">
+                        <input type="checkbox" name="optimization_enabled" ${summary.optimization_enabled ? "checked" : ""} />
+                        <span>Optimizer enabled</span>
+                      </label>
+                    </div>
+                    <label class="field-stack">
+                      <span class="field-label">ABI JSON</span>
+                      <textarea class="text-area-input mono text-area-large" name="abi" rows="12" placeholder='[{"type":"function","name":"name",...}]'>${escapeHtml(abiJson)}</textarea>
+                    </label>
+                    <label class="field-stack">
+                      <span class="field-label">Source code</span>
+                      <textarea class="text-area-input mono text-area-large" name="source_code" rows="12" placeholder="Optional verified source code">${escapeHtml(sourceCode)}</textarea>
+                    </label>
+                    <div class="admin-action-row">
+                      <button class="pagination-link" type="submit">Save verification</button>
+                      <span class="admin-status" data-verify-status></span>
+                    </div>
+                  </form>
+                </section>
+              `
+              : ""
+          }
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function bindExplorerAdminForms() {
+  document.querySelectorAll("[data-label-form]").forEach((form) => {
+    if (form.dataset.bound === "true") {
+      return;
+    }
+    form.dataset.bound = "true";
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const address = form.dataset.address;
+      const status = form.querySelector("[data-label-status]");
+      const labelField = form.querySelector("[name='label']");
+      const categoryField = form.querySelector("[name='category']");
+      const websiteField = form.querySelector("[name='website']");
+      const notesField = form.querySelector("[name='notes']");
+      const officialField = form.querySelector("[name='is_official']");
+      const payload = {
+        label: labelField?.value.trim() || "",
+        category: optionalFieldValue(categoryField?.value),
+        website: optionalFieldValue(websiteField?.value),
+        notes: optionalFieldValue(notesField?.value),
+        is_official: Boolean(officialField?.checked),
+      };
+
+      setAdminStatus(status, "Saving label…");
+      try {
+        await fetchJson(`/explore/api/labels/${address}?chainId=${encodeURIComponent(state.chainId)}`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        setAdminStatus(status, "Label saved");
+        await renderRoute();
+      } catch (error) {
+        setAdminStatus(status, error.message || "Label save failed", true);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-verify-form]").forEach((form) => {
+    if (form.dataset.bound === "true") {
+      return;
+    }
+    form.dataset.bound = "true";
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const address = form.dataset.address;
+      const status = form.querySelector("[data-verify-status]");
+      const contractNameField = form.querySelector("[name='contract_name']");
+      const abiField = form.querySelector("[name='abi']");
+      const sourceCodeField = form.querySelector("[name='source_code']");
+      const languageField = form.querySelector("[name='language']");
+      const compilerField = form.querySelector("[name='compiler_version']");
+      const optimizationEnabledField = form.querySelector("[name='optimization_enabled']");
+      const optimizationRunsField = form.querySelector("[name='optimization_runs']");
+      const licenseField = form.querySelector("[name='license']");
+      let abi;
+      try {
+        abi = JSON.parse(abiField?.value.trim() || "");
+      } catch (_error) {
+        setAdminStatus(status, "ABI must be valid JSON", true);
+        return;
+      }
+
+      const payload = {
+        contract_name: contractNameField?.value.trim() || "",
+        abi,
+        source_code: optionalFieldValue(sourceCodeField?.value),
+        language: optionalFieldValue(languageField?.value),
+        compiler_version: optionalFieldValue(compilerField?.value),
+        optimization_enabled: Boolean(optimizationEnabledField?.checked),
+        optimization_runs: optionalNumberValue(optimizationRunsField?.value),
+        license: optionalFieldValue(licenseField?.value),
+      };
+
+      setAdminStatus(status, "Saving verification…");
+      try {
+        await fetchJson(`/explore/api/contract/${address}/verify?chainId=${encodeURIComponent(state.chainId)}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        setAdminStatus(status, "Verification saved");
+        await renderRoute();
+      } catch (error) {
+        setAdminStatus(status, error.message || "Verification save failed", true);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-refresh-address]").forEach((button) => {
+    if (button.dataset.bound === "true") {
+      return;
+    }
+    button.dataset.bound = "true";
+    button.addEventListener("click", async () => {
+      const address = button.dataset.address;
+      const status = button.parentElement?.querySelector("[data-refresh-status]");
+      setAdminStatus(status, "Refreshing…");
+      try {
+        await fetchJson(`/explore/api/address/${address}/refresh?chainId=${encodeURIComponent(state.chainId)}`, {
+          method: "POST",
+        });
+        setAdminStatus(status, "Metadata refreshed");
+        await renderRoute();
+      } catch (error) {
+        setAdminStatus(status, error.message || "Refresh failed", true);
+      }
+    });
+  });
+}
+
+function setAdminStatus(node, message, isError = false) {
+  if (!node) {
+    return;
+  }
+  node.textContent = message || "";
+  node.classList.toggle("admin-status-error", Boolean(isError));
 }
 
 function bindReadContractForms() {
@@ -2243,6 +2548,20 @@ function parsePositiveInt(value, fallback) {
     return fallback;
   }
   return parsed;
+}
+
+function optionalFieldValue(value) {
+  const trimmed = String(value || "").trim();
+  return trimmed ? trimmed : null;
+}
+
+function optionalNumberValue(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function buildUrl(path, params = {}) {

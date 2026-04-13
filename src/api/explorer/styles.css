@@ -898,6 +898,72 @@ body[data-page-mode="home"] .header-search-slot {
   font-size: 12px;
 }
 
+.text-area-input {
+  width: 100%;
+  min-height: 108px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: rgba(6, 10, 18, 0.92);
+  color: var(--color-primary);
+  font-size: 13px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.text-area-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 1px rgba(118, 221, 120, 0.18);
+}
+
+.text-area-large {
+  min-height: 220px;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-primary);
+  font-size: 13px;
+}
+
+.checkbox-row-inline {
+  min-height: 42px;
+}
+
+.explorer-admin-panel {
+  margin-top: 14px;
+}
+
+.explorer-admin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px 16px;
+}
+
+.admin-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-action-row-pad {
+  padding: 0 16px 16px;
+}
+
+.admin-status {
+  color: var(--color-secondary);
+  font-size: 12px;
+}
+
+.admin-status-error {
+  color: #ff8c8c;
+}
+
 .read-contract-actions {
   display: flex;
   align-items: center;
@@ -944,6 +1010,32 @@ body[data-page-mode="home"] .header-search-slot {
   color: var(--color-secondary);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.table-primary-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.table-secondary-cell {
+  margin-top: 4px;
+  color: var(--color-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.mini-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  font-size: 11px;
 }
 
 .tab-bar {
