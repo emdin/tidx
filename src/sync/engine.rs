@@ -15,7 +15,7 @@ use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
     timestamp_from_secs,
 };
-use super::fetcher::RpcClient;
+use super::fetcher::{ReceiptFetchMode, RpcClient};
 use super::sink::SinkSet;
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
@@ -550,10 +550,7 @@ impl SyncEngine {
         Vec<crate::types::LogRow>,
         Vec<crate::types::ReceiptRow>,
     )> {
-        let (blocks, receipts) = tokio::try_join!(
-            self.realtime_rpc.get_blocks_batch(from..=to),
-            self.realtime_rpc.get_receipts_batch_adaptive(from..=to)
-        )?;
+        let (blocks, receipts) = fetch_blocks_and_receipts(&self.realtime_rpc, from, to).await?;
 
         // Validate parent hash chain
         self.validate_parent_chain(&blocks).await?;
@@ -623,10 +620,14 @@ impl SyncEngine {
     }
 
     pub async fn sync_block(&self, num: u64) -> Result<()> {
-        let (block, receipts) = tokio::try_join!(
-            self.realtime_rpc.get_block(num, true),
-            self.realtime_rpc.get_block_receipts(num)
-        )?;
+        let (mut blocks, mut receipts_by_block) =
+            fetch_blocks_and_receipts(&self.realtime_rpc, num, num).await?;
+        let block = blocks
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Block {num} not found in receipt fetch result"))?;
+        let receipts = receipts_by_block
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Receipts for block {num} not found"))?;
 
         let block_row = decode_block(&block);
         let block_ts = timestamp_from_secs(block.header.timestamp);
@@ -1336,10 +1337,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
     };
     use alloy::network::ReceiptResponse;
 
-    let (blocks, receipts) = tokio::try_join!(
-        rpc.get_blocks_batch(from..=to),
-        rpc.get_receipts_batch_adaptive(from..=to)
-    )?;
+    let (blocks, receipts) = fetch_blocks_and_receipts(rpc, from, to).await?;
 
     let block_timestamps: HashMap<u64, _> = blocks
         .iter()
@@ -1462,9 +1460,11 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     let mut max_block: Option<u64> = None;
 
     for (from, to) in ranges {
-        // Fetch receipts for this range, splitting on "too large" errors
-        let receipts = match rpc.get_receipts_batch_adaptive(from..=to).await {
-            Ok(r) => r,
+        // Fetch receipts for this range, automatically falling back to
+        // per-transaction receipt batches when the RPC lacks
+        // `eth_getBlockReceipts`.
+        let receipts = match fetch_blocks_and_receipts(rpc, from, to).await {
+            Ok((_, receipts)) => receipts,
             Err(e) => {
                 error!(chain_id, from, to, error = %e, "Receipt backfill: failed to fetch receipts");
                 continue;
@@ -1558,6 +1558,52 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     }
 
     Ok(())
+}
+
+async fn fetch_blocks_and_receipts(
+    rpc: &RpcClient,
+    from: u64,
+    to: u64,
+) -> Result<(Vec<crate::tempo::Block>, Vec<Vec<crate::tempo::Receipt>>)> {
+    match rpc.receipt_fetch_mode() {
+        ReceiptFetchMode::BlockReceipts => {
+            let (blocks, receipts) = tokio::try_join!(
+                rpc.get_blocks_batch(from..=to),
+                rpc.get_receipts_batch_adaptive(from..=to)
+            )?;
+            Ok((blocks, receipts))
+        }
+        ReceiptFetchMode::TransactionReceipts => {
+            let blocks = rpc.get_blocks_batch(from..=to).await?;
+            let receipts = rpc.get_receipts_for_blocks(&blocks).await?;
+            Ok((blocks, receipts))
+        }
+        ReceiptFetchMode::Unknown => {
+            let blocks_future = rpc.get_blocks_batch(from..=to);
+            let receipts_future = rpc.get_receipts_batch_adaptive(from..=to);
+            let (blocks_result, receipts_result) = tokio::join!(blocks_future, receipts_future);
+
+            let blocks = blocks_result?;
+            match receipts_result {
+                Ok(receipts) => {
+                    rpc.mark_block_receipts_supported();
+                    Ok((blocks, receipts))
+                }
+                Err(err) if RpcClient::is_block_receipts_unsupported(&err) => {
+                    rpc.mark_block_receipts_unsupported();
+                    info!(
+                        from,
+                        to,
+                        error = %err,
+                        "RPC does not support eth_getBlockReceipts, falling back to eth_getTransactionReceipt"
+                    );
+                    let receipts = rpc.get_receipts_for_blocks(&blocks).await?;
+                    Ok((blocks, receipts))
+                }
+                Err(err) => Err(err),
+            }
+        }
+    }
 }
 
 /// Group consecutive block numbers into ranges for batch fetching.

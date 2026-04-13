@@ -4,7 +4,7 @@ version = "0.5.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tempoxyz/tidx"
-description = "High-throughput Tempo blockchain indexer"
+description = "High-throughput EVM and reth-based L2 indexer"
 
 [[bin]]
 name = "tidx"
@@ -32,9 +32,8 @@ deadpool-postgres = "0.14"
 postgres-types = { version = "0.2", features = ["derive"] }
 
 
-# Ethereum/Tempo primitives
+# Ethereum/L2 primitives
 alloy = { version = "1", features = ["full"] }
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", default-features = false }
 
 # URL parsing
 form_urlencoded = "1"
