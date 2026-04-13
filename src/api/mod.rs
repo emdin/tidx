@@ -13,11 +13,12 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::{Method, StatusCode, header},
+    middleware,
     response::{
         IntoResponse, Response, Sse,
         sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
     },
-    routing::get,
+    routing::{get, post, put},
 };
 use chrono::Utc;
 use futures::Stream;
@@ -50,6 +51,8 @@ pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig
 pub struct AppState {
     /// Map of chain_id -> pool (hot-reloadable)
     pub pools: SharedPools,
+    /// Map of chain_id -> writable pool for admin/explorer metadata operations.
+    pub write_pools: SharedPools,
     /// Map of chain_id -> RPC client (hot-reloadable)
     pub rpc_clients: SharedRpcClients,
     /// Default chain_id (first chain)
@@ -69,6 +72,11 @@ impl AppState {
         self.pools.read().await.get(&id).cloned()
     }
 
+    async fn get_write_pool(&self, chain_id: Option<u64>) -> Option<Pool> {
+        let id = chain_id.unwrap_or(self.default_chain_id);
+        self.write_pools.read().await.get(&id).cloned()
+    }
+
     async fn get_rpc(&self, chain_id: Option<u64>) -> Option<Arc<RpcClient>> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.rpc_clients.read().await.get(&id).cloned()
@@ -79,10 +87,11 @@ impl AppState {
         self.clickhouse_engines.read().await.get(&id).cloned()
     }
 
-    /// Check if an IP address is in the trusted CIDRs
+    /// Check if an IP address is in the trusted CIDRs.
+    /// When no CIDRs are configured, only loopback peers are trusted.
     pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
         if self.trusted_cidrs.is_empty() {
-            return true;
+            return addr.ip().is_loopback();
         }
         let ip = addr.ip();
         self.trusted_cidrs
@@ -146,6 +155,7 @@ pub fn router(
     router_with_options(
         pools,
         HashMap::new(),
+        HashMap::new(),
         default_chain_id,
         broadcaster,
         HashMap::new(),
@@ -155,6 +165,7 @@ pub fn router(
 
 pub fn router_with_options(
     pools: HashMap<u64, Pool>,
+    write_pools: HashMap<u64, Pool>,
     rpc_clients: HashMap<u64, Arc<RpcClient>>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
@@ -165,6 +176,7 @@ pub fn router_with_options(
 
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
+        write_pools: Arc::new(RwLock::new(write_pools)),
         rpc_clients: Arc::new(RwLock::new(rpc_clients)),
         default_chain_id,
         broadcaster,
@@ -178,6 +190,7 @@ pub fn router_with_options(
 
 pub fn router_shared(
     pools: SharedPools,
+    write_pools: SharedPools,
     rpc_clients: SharedRpcClients,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
@@ -189,6 +202,7 @@ pub fn router_shared(
 
     let state = AppState {
         pools,
+        write_pools,
         rpc_clients,
         default_chain_id,
         broadcaster,
@@ -202,7 +216,13 @@ pub fn router_shared(
 
 fn build_router(state: AppState) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
@@ -212,6 +232,7 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/explore/assets/styles.css", get(explorer::styles_css))
         .route("/explore/assets/favicon.svg", get(explorer::favicon_svg))
         .route("/explore/assets/logo.png", get(explorer::logo_png))
+        .route("/explore/api/search", get(explorer_api::search))
         .route(
             "/explore/api/address/{address}/inspect",
             get(explorer_api::inspect_address),
@@ -219,6 +240,14 @@ fn build_router(state: AppState) -> Router<()> {
         .route(
             "/explore/api/address/{address}/portfolio",
             get(explorer_api::address_portfolio),
+        )
+        .route(
+            "/explore/api/address/{address}/refresh",
+            post(explorer_api::refresh_address_metadata),
+        )
+        .route(
+            "/explore/api/labels/{address}",
+            put(explorer_api::upsert_label),
         )
         .route(
             "/explore/api/token/{address}/holders",
@@ -232,6 +261,18 @@ fn build_router(state: AppState) -> Router<()> {
             "/explore/api/contract/{address}/methods",
             get(explorer_api::contract_methods),
         )
+        .route(
+            "/explore/api/contract/{address}/verification",
+            get(explorer_api::contract_verification),
+        )
+        .route(
+            "/explore/api/contract/{address}/verify",
+            post(explorer_api::verify_contract),
+        )
+        .route(
+            "/explore/api/contract/{address}/read",
+            post(explorer_api::read_contract),
+        )
         .route("/explore/{*path}", get(explorer::index))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
@@ -241,9 +282,31 @@ fn build_router(state: AppState) -> Router<()> {
             "/views/{name}",
             get(views::get_view).delete(views::delete_view),
         )
+        .layer(middleware::map_response(apply_security_headers))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn apply_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        header::HeaderValue::from_static("same-origin"),
+    );
+    response
 }
 
 async fn handle_health() -> &'static str {
@@ -742,6 +805,19 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
 
+    fn test_state(trusted_cidrs: Vec<(IpAddr, u8)>) -> AppState {
+        AppState {
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            write_pools: Arc::new(RwLock::new(HashMap::new())),
+            rpc_clients: Arc::new(RwLock::new(HashMap::new())),
+            default_chain_id: 0,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(trusted_cidrs),
+        }
+    }
+
     #[test]
     fn test_parse_cidrs() {
         let cidrs = vec![
@@ -809,5 +885,22 @@ mod tests {
             48
         ));
         assert!(!ip_in_cidr(&"2001:db8::1".parse().unwrap(), &network, 48));
+    }
+
+    #[test]
+    fn trusted_ip_defaults_to_loopback_only() {
+        let state = test_state(Vec::new());
+
+        assert!(state.is_trusted_ip(&"127.0.0.1:8080".parse().unwrap()));
+        assert!(state.is_trusted_ip(&"[::1]:8080".parse().unwrap()));
+        assert!(!state.is_trusted_ip(&"10.0.0.5:8080".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_ip_honors_configured_cidrs() {
+        let state = test_state(parse_cidrs(&["10.0.0.0/8".to_string()]));
+
+        assert!(state.is_trusted_ip(&"10.1.2.3:8080".parse().unwrap()));
+        assert!(!state.is_trusted_ip(&"192.168.1.20:8080".parse().unwrap()));
     }
 }

@@ -74,6 +74,7 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
+    let write_pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
     let rpc_clients: SharedRpcClients = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_configs: SharedClickHouseConfigs = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_engines: SharedClickHouseEngines = Arc::new(RwLock::new(HashMap::new()));
@@ -120,6 +121,10 @@ pub async fn run(args: Args) -> Result<()> {
             None => throttled_pool.pool.clone(),
         };
         pools.write().await.insert(chain.chain_id, api_pool);
+        write_pools
+            .write()
+            .await
+            .insert(chain.chain_id, throttled_pool.pool.clone());
 
         spawn_sync_engine(
             chain.clone(),
@@ -140,6 +145,7 @@ pub async fn run(args: Args) -> Result<()> {
 
             let router = api::router_shared(
                 Arc::clone(&pools),
+                Arc::clone(&write_pools),
                 Arc::clone(&rpc_clients),
                 default_chain_id,
                 broadcaster.clone(),
@@ -167,6 +173,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
+        let write_pools_for_watcher = Arc::clone(&write_pools);
         let rpc_clients_for_watcher = Arc::clone(&rpc_clients);
         let clickhouse_configs_for_watcher = Arc::clone(&clickhouse_configs);
         let broadcaster_for_watcher = broadcaster.clone();
@@ -189,6 +196,10 @@ pub async fn run(args: Args) -> Result<()> {
                             .write()
                             .await
                             .insert(event.chain.chain_id, api_pool);
+                        write_pools_for_watcher
+                            .write()
+                            .await
+                            .insert(event.chain.chain_id, throttled_pool.pool.clone());
                         rpc_clients_for_watcher.write().await.insert(
                             event.chain.chain_id,
                             Arc::new(RpcClient::new(&event.chain.rpc_url)),
@@ -211,6 +222,7 @@ pub async fn run(args: Args) -> Result<()> {
         let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
         let router = api::router_with_options(
             pools.read().await.clone(),
+            write_pools.read().await.clone(),
             rpc_clients.read().await.clone(),
             default_chain_id,
             broadcaster.clone(),

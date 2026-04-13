@@ -1,12 +1,18 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
-use alloy::primitives::{Address, U256, keccak256};
+use alloy::{
+    dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt, Specifier},
+    json_abi::{Function, JsonAbi, StateMutability},
+    primitives::{Address, U256, keccak256},
+};
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
 };
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::warn;
 
 use super::{ApiError, AppState};
 use crate::db::Pool;
@@ -66,6 +72,120 @@ pub struct ContractCreator {
     pub block_timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressLabel {
+    pub label: String,
+    pub category: Option<String>,
+    pub website: Option<String>,
+    pub notes: Option<String>,
+    pub is_official: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VerificationSummary {
+    pub contract_name: String,
+    pub language: Option<String>,
+    pub compiler_version: Option<String>,
+    pub optimization_enabled: Option<bool>,
+    pub optimization_runs: Option<i32>,
+    pub license: Option<String>,
+    pub constructor_args: Option<String>,
+    pub verified_at: chrono::DateTime<chrono::Utc>,
+    pub has_source_code: bool,
+    pub abi_function_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractVerificationDetail {
+    pub summary: VerificationSummary,
+    pub abi: Value,
+    pub source_code: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractFunctionArg {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadFunctionInfo {
+    pub name: String,
+    pub signature: String,
+    pub selector: String,
+    pub state_mutability: String,
+    pub inputs: Vec<ContractFunctionArg>,
+    pub outputs: Vec<ContractFunctionArg>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadContractValue {
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub entity_type: String,
+    pub address: Option<String>,
+    pub block_num: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub href: String,
+}
+
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    #[serde(alias = "chain_id")]
+    #[serde(rename = "chainId")]
+    pub chain_id: Option<u64>,
+    pub q: String,
+}
+
+#[derive(Deserialize)]
+pub struct LabelUpsertRequest {
+    pub label: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub website: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub is_official: bool,
+}
+
+#[derive(Deserialize)]
+pub struct VerifyContractRequest {
+    pub contract_name: String,
+    pub abi: Value,
+    #[serde(default)]
+    pub source_code: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub compiler_version: Option<String>,
+    #[serde(default)]
+    pub optimization_enabled: Option<bool>,
+    #[serde(default)]
+    pub optimization_runs: Option<i32>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub constructor_args: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Deserialize)]
+pub struct ReadContractRequest {
+    pub selector: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct AddressInspectResponse {
     pub ok: bool,
@@ -73,6 +193,8 @@ pub struct AddressInspectResponse {
     pub address: String,
     pub profile: ContractProfile,
     pub creator: Option<ContractCreator>,
+    pub label: Option<AddressLabel>,
+    pub verification: Option<VerificationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +269,331 @@ pub struct ContractMethodsResponse {
     pub methods: Vec<ContractMethodRow>,
 }
 
+#[derive(Serialize)]
+pub struct SearchResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub query: String,
+    pub results: Vec<SearchHit>,
+}
+
+#[derive(Serialize)]
+pub struct ContractVerificationResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub address: String,
+    pub label: Option<AddressLabel>,
+    pub verification: Option<ContractVerificationDetail>,
+    pub read_functions: Vec<ReadFunctionInfo>,
+}
+
+#[derive(Serialize)]
+pub struct ReadContractResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub address: String,
+    pub function: ReadFunctionInfo,
+    pub outputs: Vec<ReadContractValue>,
+}
+
+pub async fn search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let trimmed = query.q.trim().to_string();
+
+    if trimmed.is_empty() {
+        return Ok(Json(SearchResponse {
+            ok: true,
+            chain_id,
+            query: trimmed,
+            results: Vec::new(),
+        }));
+    }
+
+    let normalized = normalize_search_input(&trimmed);
+    if let Some(hit) = direct_search_hit(&normalized) {
+        return Ok(Json(SearchResponse {
+            ok: true,
+            chain_id,
+            query: trimmed,
+            results: vec![hit],
+        }));
+    }
+
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let like = format!("%{}%", trimmed.to_lowercase());
+    let rows = conn
+        .query(
+            "
+            SELECT
+                encode(addr, 'hex') AS address,
+                label,
+                subtitle,
+                entity_type,
+                rank
+            FROM (
+                SELECT
+                    address AS addr,
+                    label,
+                    COALESCE(category, '') AS subtitle,
+                    'label' AS entity_type,
+                    CASE WHEN lower(label) = $1 THEN 0 ELSE 1 END AS rank
+                FROM address_labels
+                WHERE lower(label) LIKE $2
+                   OR lower(COALESCE(category, '')) LIKE $2
+                UNION ALL
+                SELECT
+                    address AS addr,
+                    contract_name AS label,
+                    COALESCE(compiler_version, '') AS subtitle,
+                    'verified_contract' AS entity_type,
+                    CASE WHEN lower(contract_name) = $1 THEN 0 ELSE 2 END AS rank
+                FROM contract_verifications
+                WHERE lower(contract_name) LIKE $2
+                UNION ALL
+                SELECT
+                    address AS addr,
+                    COALESCE(symbol, name, encode(address, 'hex')) AS label,
+                    COALESCE(name, detected_kind) AS subtitle,
+                    'token' AS entity_type,
+                    CASE
+                        WHEN lower(COALESCE(symbol, '')) = $1 THEN 0
+                        WHEN lower(COALESCE(name, '')) = $1 THEN 1
+                        ELSE 3
+                    END AS rank
+                FROM token_metadata
+                WHERE lower(COALESCE(symbol, '')) LIKE $2
+                   OR lower(COALESCE(name, '')) LIKE $2
+            ) search_hits
+            ORDER BY rank ASC, label ASC
+            LIMIT 20
+            ",
+            &[&trimmed.to_lowercase(), &like],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to search explorer metadata: {e}")))?;
+
+    let results = rows
+        .into_iter()
+        .map(|row| {
+            let address = format!("0x{}", row.get::<_, String>("address"));
+            let entity_type = row.get::<_, String>("entity_type");
+            SearchHit {
+                entity_type: entity_type.clone(),
+                address: Some(address.clone()),
+                block_num: None,
+                tx_hash: None,
+                title: row.get("label"),
+                subtitle: optional_non_empty(row.get::<_, String>("subtitle")),
+                href: if entity_type == "token" {
+                    format!("/explore/token/{address}")
+                } else {
+                    format!("/explore/address/{address}")
+                },
+            }
+        })
+        .collect();
+
+    Ok(Json(SearchResponse {
+        ok: true,
+        chain_id,
+        query: trimmed,
+        results,
+    }))
+}
+
+pub async fn contract_verification(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainQuery>,
+) -> Result<Json<ContractVerificationResponse>, ApiError> {
+    let normalized = normalize_address(&address)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let label = load_address_label(&pool, &normalized).await?;
+    let verification = load_contract_verification(&pool, &normalized).await?;
+    let read_functions = verification
+        .as_ref()
+        .and_then(|record| parse_json_abi(&record.abi).ok())
+        .map(read_functions_from_abi)
+        .unwrap_or_default();
+
+    Ok(Json(ContractVerificationResponse {
+        ok: true,
+        chain_id,
+        address: normalized,
+        label,
+        verification,
+        read_functions,
+    }))
+}
+
+pub async fn verify_contract(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainQuery>,
+    Json(payload): Json<VerifyContractRequest>,
+) -> Result<Json<ContractVerificationResponse>, ApiError> {
+    if !state.is_trusted_ip(&addr) {
+        return Err(ApiError::Forbidden(
+            "Contract verification writes are only allowed from trusted IPs".to_string(),
+        ));
+    }
+
+    let normalized = normalize_address(&address)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_write_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    validate_contract_verification_payload(&payload)?;
+    save_contract_verification(&pool, &normalized, &payload).await?;
+
+    contract_verification(
+        State(state),
+        Path(normalized),
+        Query(ChainQuery {
+            chain_id: Some(chain_id),
+        }),
+    )
+    .await
+}
+
+pub async fn upsert_label(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainQuery>,
+    Json(payload): Json<LabelUpsertRequest>,
+) -> Result<Json<AddressInspectResponse>, ApiError> {
+    if !state.is_trusted_ip(&addr) {
+        return Err(ApiError::Forbidden(
+            "Label writes are only allowed from trusted IPs".to_string(),
+        ));
+    }
+
+    let normalized = normalize_address(&address)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_write_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    save_address_label(&pool, &normalized, &payload).await?;
+
+    inspect_address(
+        State(state),
+        Path(normalized),
+        Query(ChainQuery {
+            chain_id: Some(chain_id),
+        }),
+    )
+    .await
+}
+
+pub async fn refresh_address_metadata(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainQuery>,
+) -> Result<Json<AddressInspectResponse>, ApiError> {
+    if !state.is_trusted_ip(&addr) {
+        return Err(ApiError::Forbidden(
+            "Metadata refresh is only allowed from trusted IPs".to_string(),
+        ));
+    }
+
+    let normalized = normalize_address(&address)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let write_pool = state
+        .get_write_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let rpc = state.get_rpc(Some(chain_id)).await.ok_or_else(|| {
+        ApiError::BadRequest(format!("RPC not configured for chain_id: {chain_id}"))
+    })?;
+    let profile = inspect_contract_profile(rpc, &normalized).await;
+    let _ = upsert_token_metadata(&write_pool, &normalized, &profile).await;
+
+    inspect_address(
+        State(state),
+        Path(normalized),
+        Query(ChainQuery {
+            chain_id: Some(chain_id),
+        }),
+    )
+    .await
+}
+
+pub async fn read_contract(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainQuery>,
+    Json(payload): Json<ReadContractRequest>,
+) -> Result<Json<ReadContractResponse>, ApiError> {
+    let normalized = normalize_address(&address)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let rpc = state.get_rpc(Some(chain_id)).await.ok_or_else(|| {
+        ApiError::BadRequest(format!("RPC not configured for chain_id: {chain_id}"))
+    })?;
+    let verification = load_contract_verification(&pool, &normalized)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound("No stored contract verification exists for this address".to_string())
+        })?;
+    let abi = parse_json_abi(&verification.abi)
+        .map_err(|e| ApiError::Internal(format!("Invalid stored ABI: {e}")))?;
+    let function = find_read_function_by_selector(&abi, &payload.selector)
+        .ok_or_else(|| ApiError::BadRequest("Function selector not found in stored ABI".to_string()))?;
+    let values = coerce_read_args(&function, &payload.args)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid function arguments: {e}")))?;
+    let call_data = function
+        .abi_encode_input(&values)
+        .map_err(|e| ApiError::BadRequest(format!("Failed to ABI-encode call: {e}")))?;
+    let raw = rpc
+        .eth_call(&normalized, &format!("0x{}", hex::encode(call_data)))
+        .await
+        .map_err(|e| ApiError::QueryError(format!("eth_call failed: {e}")))?;
+    let output_bytes = decode_hex_data(&raw)
+        .ok_or_else(|| ApiError::QueryError("Invalid hex data returned from eth_call".to_string()))?;
+    let outputs = function
+        .abi_decode_output(&output_bytes)
+        .map_err(|e| ApiError::QueryError(format!("Failed to decode contract output: {e}")))?;
+
+    Ok(Json(ReadContractResponse {
+        ok: true,
+        chain_id,
+        address: normalized,
+        function: read_function_info(&function),
+        outputs: outputs
+            .into_iter()
+            .map(|value| ReadContractValue {
+                kind: value
+                    .sol_type_name()
+                    .unwrap_or_else(|| "unknown".into())
+                    .to_string(),
+                value: dyn_value_to_string(&value),
+            })
+            .collect(),
+    }))
+}
+
 pub async fn inspect_address(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -154,13 +601,21 @@ pub async fn inspect_address(
 ) -> Result<Json<AddressInspectResponse>, ApiError> {
     let normalized = normalize_address(&address)?;
     let chain_id = resolve_chain_id(&state, query.chain_id);
-    let (_, rpc) = load_pool_and_rpc(&state, chain_id).await?;
-
-    let creator = match state.get_pool(Some(chain_id)).await {
-        Some(pool) => load_contract_creator(&pool, &normalized).await?,
-        None => None,
-    };
+    let (pool, rpc) = load_pool_and_rpc(&state, chain_id).await?;
+    let creator = load_contract_creator(&pool, &normalized).await?;
+    let label = load_address_label(&pool, &normalized).await?;
+    let verification = load_contract_verification(&pool, &normalized)
+        .await?
+        .map(|detail| detail.summary);
     let profile = inspect_contract_profile(rpc, &normalized).await;
+
+    if profile.is_contract {
+        if let Some(write_pool) = state.get_write_pool(Some(chain_id)).await {
+            if let Err(error) = upsert_token_metadata(&write_pool, &normalized, &profile).await {
+                warn!(address = %normalized, error = %error, "Failed to refresh token metadata cache");
+            }
+        }
+    }
 
     Ok(Json(AddressInspectResponse {
         ok: true,
@@ -168,6 +623,8 @@ pub async fn inspect_address(
         address: normalized,
         profile,
         creator,
+        label,
+        verification,
     }))
 }
 
@@ -531,6 +988,439 @@ async fn load_contract_creator(
         block_num: row.get("block_num"),
         block_timestamp: row.get("block_timestamp"),
     }))
+}
+
+async fn load_address_label(pool: &Pool, address: &str) -> Result<Option<AddressLabel>, ApiError> {
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let address_bytes = address_bytes(address)?;
+    let row = conn
+        .query_opt(
+            "
+            SELECT label, category, website, notes, is_official
+            FROM address_labels
+            WHERE address = $1
+            LIMIT 1
+            ",
+            &[&address_bytes],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load address label: {e}")))?;
+
+    Ok(row.map(|row| AddressLabel {
+        label: row.get("label"),
+        category: row.get("category"),
+        website: row.get("website"),
+        notes: row.get("notes"),
+        is_official: row.get("is_official"),
+    }))
+}
+
+async fn save_address_label(
+    pool: &Pool,
+    address: &str,
+    payload: &LabelUpsertRequest,
+) -> Result<(), ApiError> {
+    if payload.label.trim().is_empty() {
+        return Err(ApiError::BadRequest("Label cannot be empty".to_string()));
+    }
+
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let address_bytes = address_bytes(address)?;
+    conn.execute(
+        "
+        INSERT INTO address_labels (address, label, category, website, notes, is_official, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, now())
+        ON CONFLICT (address) DO UPDATE SET
+            label = EXCLUDED.label,
+            category = EXCLUDED.category,
+            website = EXCLUDED.website,
+            notes = EXCLUDED.notes,
+            is_official = EXCLUDED.is_official,
+            updated_at = now()
+        ",
+        &[
+            &address_bytes,
+            &payload.label.trim(),
+            &payload.category,
+            &payload.website,
+            &payload.notes,
+            &payload.is_official,
+        ],
+    )
+    .await
+    .map_err(|e| ApiError::QueryError(format!("Failed to upsert label: {e}")))?;
+    Ok(())
+}
+
+async fn load_contract_verification(
+    pool: &Pool,
+    address: &str,
+) -> Result<Option<ContractVerificationDetail>, ApiError> {
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let address_bytes = address_bytes(address)?;
+    let row = conn
+        .query_opt(
+            "
+            SELECT
+                contract_name,
+                language,
+                compiler_version,
+                optimization_enabled,
+                optimization_runs,
+                license,
+                constructor_args,
+                abi,
+                source_code,
+                metadata,
+                verified_at
+            FROM contract_verifications
+            WHERE address = $1
+            LIMIT 1
+            ",
+            &[&address_bytes],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load contract verification: {e}")))?;
+
+    Ok(row.map(|row| {
+        let abi: Value = row.get("abi");
+        let source_code: Option<String> = row.get("source_code");
+        let metadata: Option<Value> = row.get("metadata");
+        let contract_name: String = row.get("contract_name");
+        ContractVerificationDetail {
+            summary: VerificationSummary {
+                contract_name,
+                language: row.get("language"),
+                compiler_version: row.get("compiler_version"),
+                optimization_enabled: row.get("optimization_enabled"),
+                optimization_runs: row.get("optimization_runs"),
+                license: row.get("license"),
+                constructor_args: row.get("constructor_args"),
+                verified_at: row.get("verified_at"),
+                has_source_code: source_code
+                    .as_ref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                abi_function_count: parse_json_abi(&abi)
+                    .map(|json_abi| json_abi.functions.values().map(Vec::len).sum())
+                    .unwrap_or(0),
+            },
+            abi,
+            source_code,
+            metadata,
+        }
+    }))
+}
+
+async fn save_contract_verification(
+    pool: &Pool,
+    address: &str,
+    payload: &VerifyContractRequest,
+) -> Result<(), ApiError> {
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let address_bytes = address_bytes(address)?;
+
+    conn.execute(
+        "
+        INSERT INTO contract_verifications (
+            address,
+            contract_name,
+            language,
+            compiler_version,
+            optimization_enabled,
+            optimization_runs,
+            license,
+            constructor_args,
+            abi,
+            source_code,
+            metadata,
+            verified_at,
+            updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+        ON CONFLICT (address) DO UPDATE SET
+            contract_name = EXCLUDED.contract_name,
+            language = EXCLUDED.language,
+            compiler_version = EXCLUDED.compiler_version,
+            optimization_enabled = EXCLUDED.optimization_enabled,
+            optimization_runs = EXCLUDED.optimization_runs,
+            license = EXCLUDED.license,
+            constructor_args = EXCLUDED.constructor_args,
+            abi = EXCLUDED.abi,
+            source_code = EXCLUDED.source_code,
+            metadata = EXCLUDED.metadata,
+            updated_at = now()
+        ",
+        &[
+            &address_bytes,
+            &payload.contract_name.trim(),
+            &payload.language,
+            &payload.compiler_version,
+            &payload.optimization_enabled,
+            &payload.optimization_runs,
+            &payload.license,
+            &payload.constructor_args,
+            &payload.abi,
+            &payload.source_code,
+            &payload.metadata,
+        ],
+    )
+    .await
+    .map_err(|e| ApiError::QueryError(format!("Failed to save contract verification: {e}")))?;
+
+    Ok(())
+}
+
+async fn upsert_token_metadata(
+    pool: &Pool,
+    address: &str,
+    profile: &ContractProfile,
+) -> Result<(), ApiError> {
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let address_bytes = address_bytes(address)?;
+    let bytecode_size = i32::try_from(profile.bytecode_size)
+        .map_err(|_| ApiError::Internal("Bytecode size overflow".to_string()))?;
+    let decimals = profile.decimals.map(i32::from);
+
+    conn.execute(
+        "
+        INSERT INTO token_metadata (
+            address,
+            detected_kind,
+            name,
+            symbol,
+            decimals,
+            total_supply,
+            bytecode_size,
+            code_hash,
+            supports_erc165,
+            supports_erc721,
+            supports_erc1155,
+            source,
+            refreshed_at,
+            updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'rpc', now(), now())
+        ON CONFLICT (address) DO UPDATE SET
+            detected_kind = EXCLUDED.detected_kind,
+            name = EXCLUDED.name,
+            symbol = EXCLUDED.symbol,
+            decimals = EXCLUDED.decimals,
+            total_supply = EXCLUDED.total_supply,
+            bytecode_size = EXCLUDED.bytecode_size,
+            code_hash = EXCLUDED.code_hash,
+            supports_erc165 = EXCLUDED.supports_erc165,
+            supports_erc721 = EXCLUDED.supports_erc721,
+            supports_erc1155 = EXCLUDED.supports_erc1155,
+            source = EXCLUDED.source,
+            refreshed_at = now(),
+            updated_at = now()
+        ",
+        &[
+            &address_bytes,
+            &profile.detected_kind,
+            &profile.name,
+            &profile.symbol,
+            &decimals,
+            &profile.total_supply,
+            &bytecode_size,
+            &profile.code_hash,
+            &profile.supports_erc165,
+            &profile.supports_erc721,
+            &profile.supports_erc1155,
+        ],
+    )
+    .await
+    .map_err(|e| ApiError::QueryError(format!("Failed to upsert token metadata: {e}")))?;
+
+    Ok(())
+}
+
+fn validate_contract_verification_payload(payload: &VerifyContractRequest) -> Result<(), ApiError> {
+    if payload.contract_name.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "contract_name cannot be empty".to_string(),
+        ));
+    }
+
+    parse_json_abi(&payload.abi)
+        .map(|_| ())
+        .map_err(|e| ApiError::BadRequest(format!("Invalid ABI JSON: {e}")))
+}
+
+fn parse_json_abi(value: &Value) -> Result<JsonAbi, serde_json::Error> {
+    serde_json::from_value(value.clone())
+}
+
+fn read_functions_from_abi(abi: JsonAbi) -> Vec<ReadFunctionInfo> {
+    abi.functions
+        .into_values()
+        .flatten()
+        .filter(|function| {
+            matches!(
+                function.state_mutability,
+                StateMutability::View | StateMutability::Pure
+            )
+        })
+        .map(|function| read_function_info(&function))
+        .collect()
+}
+
+fn read_function_info(function: &Function) -> ReadFunctionInfo {
+    ReadFunctionInfo {
+        name: function.name.clone(),
+        signature: function.signature(),
+        selector: format!("0x{}", hex::encode(function.selector())),
+        state_mutability: function.state_mutability.as_json_str().to_string(),
+        inputs: function
+            .inputs
+            .iter()
+            .map(|param| ContractFunctionArg {
+                name: param.name.clone(),
+                kind: param.selector_type().into_owned(),
+            })
+            .collect(),
+        outputs: function
+            .outputs
+            .iter()
+            .map(|param| ContractFunctionArg {
+                name: param.name.clone(),
+                kind: param.selector_type().into_owned(),
+            })
+            .collect(),
+    }
+}
+
+fn find_read_function_by_selector(abi: &JsonAbi, selector: &str) -> Option<Function> {
+    let normalized = selector.trim().trim_start_matches("0x").to_lowercase();
+    abi.functions
+        .values()
+        .flat_map(|functions| functions.iter())
+        .find(|function| {
+            matches!(
+                function.state_mutability,
+                StateMutability::View | StateMutability::Pure
+            ) && hex::encode(function.selector()) == normalized
+        })
+        .cloned()
+}
+
+fn coerce_read_args(function: &Function, args: &[String]) -> Result<Vec<DynSolValue>, String> {
+    if function.inputs.len() != args.len() {
+        return Err(format!(
+            "Expected {} arguments, received {}",
+            function.inputs.len(),
+            args.len()
+        ));
+    }
+
+    function
+        .inputs
+        .iter()
+        .zip(args.iter())
+        .map(|(param, value)| {
+            param.resolve()
+                .map_err(|e| e.to_string())?
+                .coerce_str(value)
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+fn dyn_value_to_string(value: &DynSolValue) -> String {
+    match value {
+        DynSolValue::Bool(inner) => inner.to_string(),
+        DynSolValue::Int(inner, _) => inner.to_string(),
+        DynSolValue::Uint(inner, _) => inner.to_string(),
+        DynSolValue::FixedBytes(inner, _) => format!("0x{}", hex::encode(inner)),
+        DynSolValue::Address(inner) => inner.to_string().to_ascii_lowercase(),
+        DynSolValue::Function(inner) => format!("0x{}", hex::encode(inner.as_slice())),
+        DynSolValue::Bytes(inner) => format!("0x{}", hex::encode(inner)),
+        DynSolValue::String(inner) => inner.clone(),
+        DynSolValue::Array(inner) | DynSolValue::FixedArray(inner) | DynSolValue::Tuple(inner) => {
+            let values: Vec<String> = inner.iter().map(dyn_value_to_string).collect();
+            format!("[{}]", values.join(", "))
+        }
+    }
+}
+
+fn normalize_search_input(value: &str) -> String {
+    if value.starts_with("0x") {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
+fn direct_search_hit(value: &str) -> Option<SearchHit> {
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        let block_num = i64::from_str(value).ok()?;
+        return Some(SearchHit {
+            entity_type: "block".to_string(),
+            address: None,
+            block_num: Some(block_num),
+            tx_hash: None,
+            title: format!("Block {block_num}"),
+            subtitle: None,
+            href: format!("/explore/block/{block_num}"),
+        });
+    }
+
+    let normalized = if value.starts_with("0x") {
+        value.to_ascii_lowercase()
+    } else {
+        format!("0x{}", value.to_ascii_lowercase())
+    };
+
+    if normalized.len() == 42 && Address::from_str(&normalized).is_ok() {
+        return Some(SearchHit {
+            entity_type: "address".to_string(),
+            address: Some(normalized.clone()),
+            block_num: None,
+            tx_hash: None,
+            title: normalized.clone(),
+            subtitle: Some("Address".to_string()),
+            href: format!("/explore/address/{normalized}"),
+        });
+    }
+
+    if normalized.len() == 66 && normalized[2..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(SearchHit {
+            entity_type: "tx".to_string(),
+            address: None,
+            block_num: None,
+            tx_hash: Some(normalized.clone()),
+            title: normalized.clone(),
+            subtitle: Some("Transaction".to_string()),
+            href: format!("/explore/receipt/{normalized}"),
+        });
+    }
+
+    None
+}
+
+fn optional_non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 async fn inspect_token_profile(rpc: Arc<RpcClient>, address: &str) -> ContractProfile {

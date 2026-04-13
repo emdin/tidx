@@ -28,7 +28,10 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         let pid: i32 = session.get(0);
         let user: String = session.get(1);
 
-        match conn.execute("SELECT pg_terminate_backend($1)", &[&pid]).await {
+        match conn
+            .execute("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+        {
             Ok(_) => terminated += 1,
             Err(error) => {
                 skipped += 1;
@@ -38,23 +41,36 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     }
 
     if terminated > 0 {
-        warn!(count = terminated, "Terminated stale connections before migrations");
+        warn!(
+            count = terminated,
+            "Terminated stale connections before migrations"
+        );
     }
     if skipped > 0 {
-        warn!(count = skipped, "Skipped non-terminable sessions before migrations");
+        warn!(
+            count = skipped,
+            "Skipped non-terminable sessions before migrations"
+        );
     }
 
     info!("Running schema migrations");
-    conn.batch_execute(include_str!("../../db/blocks.sql")).await?;
+    conn.batch_execute(include_str!("../../db/blocks.sql"))
+        .await?;
     conn.batch_execute(include_str!("../../db/txs.sql")).await?;
-    conn.batch_execute(include_str!("../../db/logs.sql")).await?;
-    conn.batch_execute(include_str!("../../db/receipts.sql")).await?;
-    conn.batch_execute(include_str!("../../db/sync_state.sql")).await?;
-    conn.batch_execute(include_str!("../../db/functions.sql")).await?;
+    conn.batch_execute(include_str!("../../db/logs.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/receipts.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/sync_state.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/explorer.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/functions.sql"))
+        .await?;
 
     // Load any optional extensions
-    conn.batch_execute(include_str!("../../db/extensions.sql")).await?;
+    conn.batch_execute(include_str!("../../db/extensions.sql"))
+        .await?;
 
     Ok(())
 }
-
