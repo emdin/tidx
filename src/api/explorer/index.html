@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>Explore - Igra</title>
+    <meta
+      name="description"
+      content="Explore and analyze blocks, transactions, contracts and more on Igra."
+    />
+    <meta name="theme-color" content="#191919" />
+    <link rel="stylesheet" href="/explore/assets/styles.css" />
+  </head>
+  <body data-page-mode="home">
+    <div class="app-shell">
+      <header class="site-header">
+        <div class="header-row">
+          <a class="brand" href="/explore" aria-label="Igra Explorer">
+            <img
+              class="brand-mark"
+              src="https://igralabs.com/assets/logo-usF3kbcL.png"
+              alt="Igra Labs"
+            />
+            <span class="brand-lockup">Explore</span>
+          </a>
+
+          <div class="header-search-slot" id="header-search-slot"></div>
+
+          <a class="latest-block" id="latest-block-link" href="/explore/blocks">
+            <span class="latest-block-icon" aria-hidden="true"></span>
+            <span class="latest-block-text">
+              <span class="latest-block-label">Latest block</span>
+              <span class="latest-block-value" id="latest-block-value">...</span>
+            </span>
+          </a>
+        </div>
+      </header>
+
+      <main class="page-root" id="page-root">
+        <section class="loading-panel">
+          <div class="loading-copy">Loading explorer...</div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <ul class="footer-links">
+          <li><a href="https://igralabs.com" target="_blank" rel="noopener noreferrer">About</a></li>
+          <li>
+            <a
+              href="https://igra-labs.gitbook.io/igralabs-docs/quickstart/network-info"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Docs
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/IgraLabs" target="_blank" rel="noopener noreferrer">
+              GitHub
+            </a>
+          </li>
+          <li>
+            <a href="https://igralabs.com" target="_blank" rel="noopener noreferrer">
+              igralabs.com
+            </a>
+          </li>
+        </ul>
+      </footer>
+
+      <div class="background-orbit" aria-hidden="true"></div>
+    </div>
+
+    <script>
+      window.__TIDX_DEFAULT_CHAIN_ID__ = __DEFAULT_CHAIN_ID__;
+    </script>
+    <script type="module" src="/explore/assets/app.js"></script>
+  </body>
+</html>

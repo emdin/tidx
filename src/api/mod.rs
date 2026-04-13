@@ -1,3 +1,4 @@
+mod explorer;
 mod views;
 
 use std::collections::HashMap;
@@ -171,6 +172,10 @@ fn build_router(state: AppState) -> Router<()> {
         .allow_origin(tower_http::cors::Any);
 
     Router::new()
+        .route("/explore", get(explorer::index))
+        .route("/explore/assets/app.js", get(explorer::app_js))
+        .route("/explore/assets/styles.css", get(explorer::styles_css))
+        .route("/explore/{*path}", get(explorer::index))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
