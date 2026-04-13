@@ -175,6 +175,8 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/explore", get(explorer::index))
         .route("/explore/assets/app.js", get(explorer::app_js))
         .route("/explore/assets/styles.css", get(explorer::styles_css))
+        .route("/explore/assets/favicon.svg", get(explorer::favicon_svg))
+        .route("/explore/assets/logo.png", get(explorer::logo_png))
         .route("/explore/{*path}", get(explorer::index))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
