@@ -919,7 +919,8 @@ async function renderAddressPage(address, requestedTab, page) {
           ${renderSummaryRow("Label", label?.label ? escapeHtml(label.label) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Kind", escapeHtml(kind.badge))}
           ${renderSummaryRow("Detected kind", profile?.detected_kind ? escapeHtml(profile.detected_kind.toUpperCase()) : '<span class="text-secondary">Indexed only</span>')}
-          ${renderSummaryRow("Verified source", inspect?.verification ? "Yes" : "No")}
+          ${renderSummaryRow("Verification", formatVerificationStatus(inspect?.verification?.verification_status))}
+          ${renderSummaryRow("Bytecode proof", formatBytecodeProof(inspect?.verification))}
           ${renderSummaryRow("Native balance", profile ? formatTokenAmount(profile.native_balance || "0", 18, 6) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
@@ -1194,10 +1195,16 @@ function renderContractPanel(address, kind, summary, rows, inspect, methodsPaylo
             ? `
               <div class="definition-list">
                 ${renderDefinitionItem("Contract", verification.summary.contract_name)}
+                ${renderDefinitionItem("Status", formatVerificationStatus(verification.summary.verification_status))}
+                ${renderDefinitionItem("Bytecode proof", formatBytecodeProof(verification.summary))}
                 ${renderDefinitionItem("Compiler", verification.summary.compiler_version || "-")}
                 ${renderDefinitionItem("Language", verification.summary.language || "-")}
                 ${renderDefinitionItem("License", verification.summary.license || "-")}
                 ${renderDefinitionItem("Label", label?.label || "-")}
+                ${renderDefinitionItem("On-chain code hash", verification.summary.deployed_runtime_code_hash || "-")}
+                ${renderDefinitionItem("Source imported", verification.summary.has_source_code ? "Yes" : "No")}
+                ${renderDefinitionItem("Runtime bytecode submitted", verification.summary.has_runtime_bytecode ? "Yes" : "No")}
+                ${renderDefinitionItem("Status note", verification.summary.status_reason || "-")}
                 ${renderDefinitionItem("Verified at", formatTimestamp(verification.summary.verified_at))}
               </div>
             `
@@ -1853,6 +1860,7 @@ function renderExplorerAdminPanel(address, kind, inspect, verificationPayload) {
   const summary = verification?.summary || inspect?.verification || {};
   const abiJson = verification?.abi ? JSON.stringify(verification.abi, null, 2) : "";
   const sourceCode = verification?.source_code || "";
+  const runtimeBytecode = verification?.submitted_runtime_bytecode || "";
 
   return `
     <section class="panel-card explorer-admin-panel">
@@ -1942,6 +1950,10 @@ function renderExplorerAdminPanel(address, kind, inspect, verificationPayload) {
                       </label>
                     </div>
                     <label class="field-stack">
+                      <span class="field-label">Runtime bytecode</span>
+                      <textarea class="text-area-input mono" name="runtime_bytecode" rows="6" placeholder="Paste deployed/runtime bytecode from your artifact to prove a bytecode match">${escapeHtml(runtimeBytecode)}</textarea>
+                    </label>
+                    <label class="field-stack">
                       <span class="field-label">ABI JSON</span>
                       <textarea class="text-area-input mono text-area-large" name="abi" rows="12" placeholder='[{"type":"function","name":"name",...}]'>${escapeHtml(abiJson)}</textarea>
                     </label>
@@ -2015,6 +2027,7 @@ function bindExplorerAdminForms() {
       const status = form.querySelector("[data-verify-status]");
       const contractNameField = form.querySelector("[name='contract_name']");
       const abiField = form.querySelector("[name='abi']");
+      const runtimeBytecodeField = form.querySelector("[name='runtime_bytecode']");
       const sourceCodeField = form.querySelector("[name='source_code']");
       const languageField = form.querySelector("[name='language']");
       const compilerField = form.querySelector("[name='compiler_version']");
@@ -2032,6 +2045,7 @@ function bindExplorerAdminForms() {
       const payload = {
         contract_name: contractNameField?.value.trim() || "",
         abi,
+        runtime_bytecode: optionalFieldValue(runtimeBytecodeField?.value),
         source_code: optionalFieldValue(sourceCodeField?.value),
         language: optionalFieldValue(languageField?.value),
         compiler_version: optionalFieldValue(compilerField?.value),
@@ -2135,6 +2149,35 @@ function renderReadContractResult(outputs) {
       ${outputs.map((output, index) => renderDefinitionItem(`output${index} · ${output.kind}`, output.value)).join("")}
     </div>
   `;
+}
+
+function formatVerificationStatus(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "fully_verified":
+      return "Fully verified";
+    case "bytecode_matched":
+      return "Bytecode matched";
+    case "imported":
+      return "Imported";
+    default:
+      return '<span class="text-secondary">Unverified</span>';
+  }
+}
+
+function formatBytecodeProof(summary) {
+  if (!summary) {
+    return '<span class="text-secondary">Not checked</span>';
+  }
+  if (summary.bytecode_match === true) {
+    if (summary.bytecode_match_type === "metadata_stripped") {
+      return "Metadata-stripped match";
+    }
+    return "Exact match";
+  }
+  if (summary.bytecode_match === false) {
+    return "Mismatch";
+  }
+  return '<span class="text-secondary">Not checked</span>';
 }
 
 function renderKpiCard(label, value, note) {
