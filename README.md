@@ -17,13 +17,14 @@
 
 ---
 
-**tidx** indexes [Tempo](https://tempo.xyz) chain data into a hybrid PostgreSQL + ClickHouse architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP). 
+**tidx** indexes EVM and reth-based L2 chain data into a hybrid PostgreSQL + ClickHouse architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP).
 
 ## Features
 
 - **Dual Storage** — PostgreSQL (OLTP) + ClickHouse (OLAP), written in parallel
 - **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
 - **HTTP API + CLI** — Query data via REST, SQL, or command line
+- **RPC Compatibility** — Uses `eth_getBlockReceipts` when available and falls back to batched `eth_getTransactionReceipt` for stricter L2 RPCs
 
 ## Table of Contents
 
@@ -138,8 +139,8 @@ port = 9090
 
 [[chains]]
 name = "mainnet"
-chain_id = 4217
-rpc_url = "https://rpc.tempo.xyz"
+chain_id = 1
+rpc_url = "https://your-rpc.example"
 pg_url = "postgres://user@tidx.example.com:5432/tidx_mainnet"
 pg_password_env = "TIDX_PG_PASSWORD"  # Password from environment variable
 batch_size = 100
@@ -150,10 +151,10 @@ enabled = true
 url = "http://clickhouse:8123"
 
 [[chains]]
-name = "moderato"
-chain_id = 42431
-rpc_url = "https://rpc.testnet.tempo.xyz"
-pg_url = "postgres://user@tidx.example.com:5432/tidx_moderato"
+name = "l2"
+chain_id = 42161
+rpc_url = "https://your-l2-rpc.example"
+pg_url = "postgres://user@tidx.example.com:5432/tidx_l2"
 pg_password_env = "TIDX_PG_PASSWORD"
 ```
 
@@ -488,14 +489,14 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `max_fee_per_gas` | `TEXT` | Max fee per gas |
 | `max_priority_fee_per_gas` | `TEXT` | Max priority fee |
 | `gas_used` | `INT8` | Gas consumed |
-| `nonce_key` | `BYTEA` | Nonce key (2D nonces) |
+| `nonce_key` | `BYTEA` | Reserved for chain-specific nonce metadata |
 | `nonce` | `INT8` | Nonce value |
-| `fee_token` | `BYTEA` | Fee token address |
-| `calls` | `JSONB` | Batch call data |
-| `call_count` | `INT2` | Number of calls |
-| `valid_before` | `INT8` | Validity window start |
-| `valid_after` | `INT8` | Validity window end |
-| `signature_type` | `INT2` | Signature type |
+| `fee_token` | `BYTEA` | Optional chain-specific fee token metadata |
+| `calls` | `JSONB` | Optional chain-specific call metadata |
+| `call_count` | `INT2` | Call count metadata (defaults to `1`) |
+| `valid_before` | `INT8` | Optional chain-specific validity window start |
+| `valid_after` | `INT8` | Optional chain-specific validity window end |
+| `signature_type` | `INT2` | Optional chain-specific signature metadata |
 
 ### logs
 
@@ -526,7 +527,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `cumulative_gas_used` | `INT8` | Cumulative gas in block |
 | `effective_gas_price` | `TEXT` | Actual gas price paid |
 | `status` | `INT2` | Success (1) or failure (0) |
-| `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
+| `fee_payer` | `BYTEA` | Effective fee payer identity (`from` on standard EVM chains) |
 
 ### sync_state
 
@@ -607,5 +608,4 @@ make clean             Stop services and clean
 ## Acknowledgments
 
 - [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for everything.
-
 

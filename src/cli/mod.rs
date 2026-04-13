@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "tidx")]
-#[command(about = "High-throughput Tempo blockchain indexer")]
+#[command(about = "High-throughput EVM and reth-based L2 indexer")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]

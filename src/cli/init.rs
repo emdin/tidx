@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::Args as ClapArgs;
-use dialoguer::{Input, Select};
+use dialoguer::Input;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -15,12 +15,6 @@ pub struct Args {
     pub force: bool,
 }
 
-const TEMPO_NETWORKS: &[(&str, u64, &str)] = &[
-    ("Presto (mainnet)", 4217, "https://rpc.mainnet.tempo.xyz"),
-    ("Moderato (testnet)", 42431, "https://rpc.testnet.tempo.xyz"),
-    ("Custom", 0, ""),
-];
-
 pub fn run(args: Args) -> Result<()> {
     if args.output.exists() && !args.force {
         bail!(
@@ -31,30 +25,17 @@ pub fn run(args: Args) -> Result<()> {
 
     println!("\n🔫 tidx init\n");
 
-    let network_idx = Select::new()
-        .with_prompt("Select network")
-        .items(&TEMPO_NETWORKS.iter().map(|(name, _, _)| *name).collect::<Vec<_>>())
-        .default(0)
-        .interact()?;
+    let name: String = Input::new()
+        .with_prompt("Chain name")
+        .interact_text()?;
 
-    let (name, chain_id, rpc_url) = if network_idx == TEMPO_NETWORKS.len() - 1 {
-        let name: String = Input::new()
-            .with_prompt("Chain name")
-            .interact_text()?;
+    let chain_id: u64 = Input::new()
+        .with_prompt("Chain ID")
+        .interact_text()?;
 
-        let chain_id: u64 = Input::new()
-            .with_prompt("Chain ID")
-            .interact_text()?;
-
-        let rpc_url: String = Input::new()
-            .with_prompt("RPC URL")
-            .interact_text()?;
-
-        (name, chain_id, rpc_url)
-    } else {
-        let (name, chain_id, rpc_url) = TEMPO_NETWORKS[network_idx];
-        (name.to_string(), chain_id, rpc_url.to_string())
-    };
+    let rpc_url: String = Input::new()
+        .with_prompt("RPC URL")
+        .interact_text()?;
 
     let pg_url: String = Input::new()
         .with_prompt("PostgreSQL URL")
