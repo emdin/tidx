@@ -110,7 +110,12 @@ services:
     image: grafana/grafana:latest
     ports:
       - "127.0.0.1:3000:3000"
+    command:
+      - /bin/sh
+      - -c
+      - /usr/local/bin/render-dashboards.sh && /run.sh
     environment:
+      EXPLORER_BASE_URL: ${EXPLORER_BASE_URL}
       GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
       GF_SERVER_ROOT_URL: https://${EXPLORER_DOMAIN}/grafana
@@ -120,7 +125,8 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards-src:ro
+      - ./grafana/render-dashboards.sh:/usr/local/bin/render-dashboards.sh:ro
     depends_on:
       prometheus:
         condition: service_started

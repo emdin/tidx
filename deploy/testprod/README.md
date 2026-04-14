@@ -82,6 +82,7 @@ Edit:
 Fields you must review:
 
 - `EXPLORER_DOMAIN`
+- `EXPLORER_BASE_URL`
 - `LETSENCRYPT_EMAIL`
 - `POSTGRES_PASSWORD`
 - `GRAFANA_ADMIN_PASSWORD`
@@ -119,6 +120,7 @@ docker compose logs -f caddy
 - `grafana`
   - dashboard UI on `https://explore-test.igralabs.com/grafana`
   - also bound on `127.0.0.1:3000` for direct host access
+  - renders explorer drilldown URLs from `EXPLORER_BASE_URL` at container startup
 
 ## Access
 

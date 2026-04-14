@@ -572,7 +572,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "/explore/address/${__data.fields[\"contract_raw\"]}?tab=contract",
+                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"contract_raw\"]}?tab=contract",
                     "targetBlank": true
                   }
                 ]
@@ -682,7 +682,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "/explore/token/${__data.fields[\"token_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/token/${__data.fields[\"token_raw\"]}",
                     "targetBlank": true
                   }
                 ]
@@ -768,7 +768,7 @@
                 "value": [
                   {
                     "title": "Open Token",
-                    "url": "/explore/token/${__data.fields[\"token_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/token/${__data.fields[\"token_raw\"]}",
                     "targetBlank": true
                   }
                 ]
