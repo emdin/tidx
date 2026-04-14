@@ -110,10 +110,10 @@ services:
     image: grafana/grafana:latest
     ports:
       - "127.0.0.1:3000:3000"
-    command:
+    entrypoint:
       - /bin/sh
-      - -c
-      - /usr/local/bin/render-dashboards.sh && /run.sh
+      - -lc
+      - /usr/local/bin/render-dashboards.sh && exec /run.sh
     environment:
       EXPLORER_BASE_URL: ${EXPLORER_BASE_URL}
       GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
