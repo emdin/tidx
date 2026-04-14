@@ -776,7 +776,42 @@
           },
           "unit": "locale"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "contract"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Contract",
+                    "url": "/explore/address/${__data.fields[\"contract_raw\"]}?tab=contract",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_gas"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -797,7 +832,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT concat('0x​', substring(contract, 3)) AS contract, contract AS contract_raw, sum(total_gas) AS total_gas FROM (SELECT tx_hash, any(\"to\") AS contract, max(gas_used) AS total_gas FROM receipts WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY tx_hash) GROUP BY contract ORDER BY total_gas DESC LIMIT 10",
+          "rawSql": "SELECT concat('0x​', substring(contract, 3)) AS contract, contract AS contract_raw, toUInt64(sum(total_gas)) AS total_gas FROM (SELECT tx_hash, any(\"to\") AS contract, max(gas_used) AS total_gas FROM receipts WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY tx_hash) GROUP BY contract, contract_raw ORDER BY total_gas DESC LIMIT 10",
           "refId": "A"
         }
       ],
@@ -868,6 +903,22 @@
                     "targetBlank": true
                   }
                 ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tx_count"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
               }
             ]
           }
@@ -963,6 +1014,22 @@
                     "targetBlank": true
                   }
                 ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "transfers"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
               }
             ]
           }
@@ -1130,7 +1197,42 @@
           },
           "unit": "locale"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recipient"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Recipient",
+                    "url": "/explore/address/${__data.fields[\"recipient_raw\"]}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "native_value"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -1261,6 +1363,38 @@
                     "targetBlank": true
                   }
                 ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gas_used"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "native_value"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 4
               }
             ]
           }
