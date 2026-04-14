@@ -1,19 +1,11 @@
 <svg width="608" height="351" viewBox="0 0 608 351" fill="none" xmlns="http://www.w3.org/2000/svg">
   <rect width="608" height="351" fill="#F4F1EA"/>
-  <rect x="24" y="24" width="560" height="303" rx="22" fill="#FCFBF8" stroke="#151515" stroke-width="2"/>
+  <rect x="24" y="24" width="560" height="303" rx="24" fill="#FCFBF8" stroke="#151515" stroke-width="2"/>
   <circle cx="92" cy="58" r="6" fill="#151515"/>
   <circle cx="114" cy="58" r="6" fill="#151515" fill-opacity="0.45"/>
   <circle cx="136" cy="58" r="6" fill="#151515" fill-opacity="0.18"/>
-  <rect x="72" y="102" width="134" height="30" rx="15" fill="#151515"/>
-  <text x="139" y="121" text-anchor="middle" fill="#FCFBF8" font-family="monospace" font-size="12" letter-spacing="1.2">KASPA BLOCKDAG</text>
-  <text x="72" y="196" fill="#151515" font-family="Arial, Helvetica, sans-serif" font-size="82" font-weight="700">iidx</text>
-  <text x="72" y="236" fill="#151515" fill-opacity="0.82" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700">igra indexer</text>
-  <text x="72" y="278" fill="#151515" fill-opacity="0.72" font-family="Arial, Helvetica, sans-serif" font-size="18">Explorer and analytics data plane for Igra Network</text>
-  <text x="72" y="304" fill="#151515" fill-opacity="0.72" font-family="Arial, Helvetica, sans-serif" font-size="18">PostgreSQL + ClickHouse for EVM and reth-based chains</text>
-  <rect x="404" y="112" width="132" height="132" rx="20" fill="#151515"/>
-  <path d="M441 149H499" stroke="#FCFBF8" stroke-width="8" stroke-linecap="round"/>
-  <path d="M441 177H491" stroke="#FCFBF8" stroke-width="8" stroke-linecap="round" stroke-opacity="0.8"/>
-  <path d="M441 205H479" stroke="#FCFBF8" stroke-width="8" stroke-linecap="round" stroke-opacity="0.56"/>
-  <rect x="424" y="264" width="92" height="24" rx="12" fill="#151515" fill-opacity="0.08" stroke="#151515" stroke-opacity="0.14"/>
-  <text x="470" y="280" text-anchor="middle" fill="#151515" font-family="monospace" font-size="11">IGRA / RPC / SQL</text>
+  <text x="72" y="194" fill="#151515" font-family="Arial, Helvetica, sans-serif" font-size="92" font-weight="700">iidx</text>
+  <text x="72" y="244" fill="#151515" fill-opacity="0.76" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700">igra indexer</text>
+  <rect x="72" y="274" width="170" height="26" rx="13" fill="#151515" fill-opacity="0.08" stroke="#151515" stroke-opacity="0.12"/>
+  <text x="157" y="291" text-anchor="middle" fill="#151515" font-family="monospace" font-size="11">KASPA BLOCKDAG / EVM</text>
 </svg>
