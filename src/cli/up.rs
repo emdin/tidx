@@ -220,14 +220,15 @@ pub async fn run(args: Args) -> Result<()> {
         });
     } else if config.http.enabled && default_chain_id != 0 {
         let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
-        let router = api::router_with_options(
-            pools.read().await.clone(),
-            write_pools.read().await.clone(),
-            rpc_clients.read().await.clone(),
+        let router = api::router_shared(
+            Arc::clone(&pools),
+            Arc::clone(&write_pools),
+            Arc::clone(&rpc_clients),
             default_chain_id,
             broadcaster.clone(),
-            clickhouse_configs.read().await.clone(),
-            &config.http,
+            Arc::clone(&clickhouse_configs),
+            Arc::clone(&clickhouse_engines),
+            config.http.trusted_cidrs.clone(),
         );
 
         info!(addr = %addr, "Starting HTTP API server");
