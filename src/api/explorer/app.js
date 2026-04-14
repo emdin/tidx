@@ -71,6 +71,8 @@ const KNOWN_METHODS = {
   },
 };
 
+const NATIVE_SYMBOL = "IGRA";
+
 const state = {
   chainId: Number(window.__TIDX_DEFAULT_CHAIN_ID__) || null,
   status: null,
@@ -548,8 +550,8 @@ async function renderBlockPage(blockId, page) {
           ${renderSummaryRow("Hash", renderMonoLink(`/explore/block/${block.num}`, with0x(block.hash), false))}
           ${renderSummaryRow("Parent", previousBlockHref ? renderMonoLink(previousBlockHref, with0x(block.parent_hash), false) : escapeHtml(with0x(block.parent_hash)))}
           ${renderSummaryRow("Miner", renderMonoLink(`/explore/address/${with0x(block.miner)}?tab=contract`, with0x(block.miner), false))}
-          ${renderSummaryRow("Gas used", formatNumber(block.gas_used))}
-          ${renderSummaryRow("Gas limit", formatNumber(block.gas_limit))}
+          ${renderSummaryRow("Gas used", formatGasUnits(block.gas_used))}
+          ${renderSummaryRow("Gas limit", formatGasUnits(block.gas_limit))}
         </aside>
 
         <section class="panel-card">
@@ -652,8 +654,8 @@ async function renderReceiptPage(hash) {
 
       <section class="kpi-grid">
         ${renderKpiCard("Logs", formatNumber(logRows.length), "Event rows emitted")}
-        ${renderKpiCard("Gas used", formatNumber(tx.gas_used), "Execution gas consumed")}
-        ${renderKpiCard("Fee", gasFee ? formatNumericString(gasFee) : "-", "gas_used × effective_gas_price")}
+        ${renderKpiCard("Gas used", formatGasUnits(tx.gas_used), "Execution gas consumed")}
+        ${renderKpiCard("Fee", gasFee ? formatNativeAmount(gasFee, 8) : "-", "gas_used × effective_gas_price")}
         ${renderKpiCard("Method", methodLabel || "-", selector ? selector : "No calldata selector")}
       </section>
 
@@ -668,11 +670,11 @@ async function renderReceiptPage(hash) {
           ${renderSummaryRow("Contract", tx.contract_address ? renderMonoLink(`/explore/address/${with0x(tx.contract_address)}?tab=contract`, with0x(tx.contract_address), false) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Nonce", formatNumber(tx.nonce))}
           ${renderSummaryRow("Type", formatNumber(tx.type))}
-          ${renderSummaryRow("Value", formatNumericString(tx.value || "0"))}
+          ${renderSummaryRow("Value", formatNativeAmount(tx.value || "0", 8))}
           ${renderSummaryRow("Selector", selector ? `<span class="wrap-anywhere">${escapeHtml(selector)}</span>` : '<span class="text-secondary">-</span>')}
-          ${renderSummaryRow("Gas limit", formatNumber(tx.gas_limit))}
-          ${renderSummaryRow("Gas price", tx.effective_gas_price ? formatNumericString(tx.effective_gas_price) : '<span class="text-secondary">-</span>')}
-          ${renderSummaryRow("Cumulative gas", tx.cumulative_gas_used ? formatNumber(tx.cumulative_gas_used) : '<span class="text-secondary">-</span>')}
+          ${renderSummaryRow("Gas limit", formatGasUnits(tx.gas_limit))}
+          ${renderSummaryRow("Gas price", tx.effective_gas_price ? formatGasPrice(tx.effective_gas_price) : '<span class="text-secondary">-</span>')}
+          ${renderSummaryRow("Cumulative gas", tx.cumulative_gas_used ? formatGasUnits(tx.cumulative_gas_used) : '<span class="text-secondary">-</span>')}
         </aside>
 
         <div class="panel-stack">
@@ -908,7 +910,7 @@ async function renderAddressPage(address, requestedTab, page) {
       <section class="kpi-grid">
         ${renderKpiCard("Transactions", formatNumber(summary.tx_count || 0), "Direct tx activity")}
         ${renderKpiCard("Logs", formatNumber(summary.related_logs || 0), "Logs emitted or indexed to this address")}
-        ${renderKpiCard("Native balance", profile ? formatTokenAmount(profile.native_balance || "0", 18, 6) : "-", "Latest RPC balance")}
+        ${renderKpiCard("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : "-", "Latest RPC balance")}
         ${renderKpiCard("First seen", summary.first_seen_block ? formatNumber(summary.first_seen_block) : "-", "Earliest indexed block")}
         ${renderKpiCard("Last seen", summary.last_seen_block ? formatNumber(summary.last_seen_block) : "-", "Latest indexed block")}
       </section>
@@ -921,7 +923,7 @@ async function renderAddressPage(address, requestedTab, page) {
           ${renderSummaryRow("Detected kind", profile?.detected_kind ? escapeHtml(profile.detected_kind.toUpperCase()) : '<span class="text-secondary">Indexed only</span>')}
           ${renderSummaryRow("Verification", formatVerificationStatus(inspect?.verification?.verification_status))}
           ${renderSummaryRow("Bytecode proof", formatBytecodeProof(inspect?.verification))}
-          ${renderSummaryRow("Native balance", profile ? formatTokenAmount(profile.native_balance || "0", 18, 6) : '<span class="text-secondary">-</span>')}
+          ${renderSummaryRow("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
           ${renderSummaryRow("Received", formatNumber(summary.received_count || 0))}
@@ -1044,7 +1046,7 @@ function renderBlockTransactionsTable(rows) {
           <td class="mono"><a href="/explore/receipt/${with0x(row.hash)}">${escapeHtml(shortHex(with0x(row.hash), 10))}</a></td>
           <td class="mono"><a href="/explore/address/${with0x(row.from_addr)}">${escapeHtml(shortHex(with0x(row.from_addr), 8))}</a></td>
           <td class="mono">${toAddress ? `<a href="/explore/address/${toAddress}">${escapeHtml(shortHex(toAddress, 8))}</a>` : '<span class="text-secondary">create</span>'}</td>
-          <td class="align-right mono">${formatNumericString(row.value || "0")}</td>
+          <td class="align-right mono">${formatNativeAmount(row.value || "0", 6)}</td>
           <td class="align-right mono">${formatNumber(row.gas_used)}</td>
         </tr>
       `;
@@ -1089,7 +1091,7 @@ function renderAddressTransactionsTable(rows, address) {
           <td><span class="direction-chip direction-chip-${direction.toLowerCase()}">${direction}</span></td>
           <td class="mono"><a href="/explore/receipt/${with0x(row.hash)}">${escapeHtml(shortHex(with0x(row.hash), 10))}</a></td>
           <td class="mono">${counterparty ? `<a href="/explore/address/${counterparty}">${escapeHtml(shortHex(counterparty, 8))}</a>` : '<span class="text-secondary">-</span>'}</td>
-          <td class="align-right mono">${formatNumericString(row.value || "0")}</td>
+          <td class="align-right mono">${formatNativeAmount(row.value || "0", 6)}</td>
         </tr>
       `;
     })
@@ -1350,7 +1352,7 @@ function renderPortfolioPanel(portfolio, profile) {
   return `
     <div class="panel-stack">
       <div class="kpi-grid kpi-grid-tight">
-        ${renderKpiCard("Native balance", formatTokenAmount(portfolio.native_balance || profile?.native_balance || "0", 18, 6), "Latest RPC balance")}
+        ${renderKpiCard("Native balance", formatNativeAmount(portfolio.native_balance || profile?.native_balance || "0", 6), "Latest RPC balance")}
         ${renderKpiCard("Token holdings", formatNumber(portfolio.holdings?.length || 0), "Positive balances on this page")}
         ${renderKpiCard("Account kind", profile?.detected_kind ? profile.detected_kind.toUpperCase() : "ACCOUNT", "Live bytecode classification")}
       </div>
@@ -2364,18 +2366,26 @@ function compactSql(sql) {
 }
 
 function normalizeHex(value) {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) {
+  const sanitized = sanitizeHexInput(value);
+  if (!sanitized) {
     return "";
   }
-  return trimmed.startsWith("0x") ? trimmed.toLowerCase() : `0x${trimmed.toLowerCase()}`;
+  return sanitized.startsWith("0x") ? sanitized.toLowerCase() : `0x${sanitized.toLowerCase()}`;
 }
 
 function with0x(value) {
-  if (!value) {
+  const sanitized = sanitizeHexInput(value);
+  if (!sanitized) {
     return "";
   }
-  return value.startsWith("0x") ? value.toLowerCase() : `0x${String(value).toLowerCase()}`;
+  return sanitized.startsWith("0x") ? sanitized.toLowerCase() : `0x${sanitized.toLowerCase()}`;
+}
+
+function sanitizeHexInput(value) {
+  return String(value || "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .trim()
+    .replace(/^["']+|["']+$/g, "");
 }
 
 function isHex(value, bytes) {
@@ -2426,6 +2436,21 @@ function formatNumericString(value) {
     parts.unshift(digits.slice(Math.max(0, index - 3), index));
   }
   return `${negative ? "-" : ""}${parts.join(",")}`;
+}
+
+function formatNativeAmount(value, precision = 6) {
+  const formatted = formatTokenAmount(value, 18, precision);
+  return formatted === "-" ? formatted : `${formatted} ${NATIVE_SYMBOL}`;
+}
+
+function formatGasPrice(value, precision = 4) {
+  const formatted = formatTokenAmount(value, 9, precision);
+  return formatted === "-" ? formatted : `${formatted} Gwei`;
+}
+
+function formatGasUnits(value) {
+  const formatted = formatNumber(value);
+  return formatted === "-" ? formatted : `${formatted} gas`;
 }
 
 function multiplyNumericStrings(left, right) {

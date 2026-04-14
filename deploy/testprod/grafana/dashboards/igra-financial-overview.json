@@ -43,7 +43,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"contract_raw\"]}",
+                    "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"contract_raw\"]}?tab=contract",
                     "targetBlank": true
                   }
                 ]
@@ -277,7 +277,7 @@
           "refId": "A"
         }
       ],
-      "title": "Native Value Sent (24h)",
+      "title": "Native Value Sent (24h, IGRA)",
       "type": "stat"
     },
     {
@@ -455,7 +455,7 @@
           "refId": "A"
         }
       ],
-      "title": "Daily Native Value Sent",
+      "title": "Daily Native Value Sent (IGRA)",
       "type": "timeseries"
     },
     {
@@ -940,7 +940,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"token_raw\"]}",
+                    "url": "https://stage-roman.igralabs.com/explore/token/${__data.fields[\"token_raw\"]}",
                     "targetBlank": true
                   }
                 ]
@@ -1152,7 +1152,7 @@
           }
         }
       ],
-      "title": "Top Native Value Recipients (7d)",
+      "title": "Top Native Value Recipients (7d, IGRA)",
       "type": "table"
     },
     {
@@ -1362,7 +1362,7 @@
                 "value": [
                   {
                     "title": "Open Contract",
-                    "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"deployed_contract_raw\"]}",
+                    "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"deployed_contract_raw\"]}?tab=contract",
                     "targetBlank": true
                   }
                 ]
