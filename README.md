@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/banner-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset=".github/banner-light.svg">
-    <img alt="tidx" src=".github/banner-light.svg" width="100%">
+    <img alt="iidx" src=".github/banner-light.svg" width="100%">
   </picture>
 </p>
 
