@@ -759,7 +759,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT contract, sum(total_gas) AS total_gas FROM (SELECT tx_hash, any(\"to\") AS contract, max(gas_used) AS total_gas FROM receipts WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY tx_hash) GROUP BY contract ORDER BY total_gas DESC LIMIT 10",
+          "rawSql": "SELECT concat('0x​', substring(contract, 3)) AS contract, sum(total_gas) AS total_gas FROM (SELECT tx_hash, any(\"to\") AS contract, max(gas_used) AS total_gas FROM receipts WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY tx_hash) GROUP BY contract ORDER BY total_gas DESC LIMIT 10",
           "refId": "A"
         }
       ],
@@ -819,7 +819,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT \"from\" AS sender, uniqExact(hash) AS tx_count FROM txs WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY sender ORDER BY tx_count DESC LIMIT 10",
+          "rawSql": "SELECT concat('0x​', substring(\"from\", 3)) AS sender, uniqExact(hash) AS tx_count FROM txs WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY sender ORDER BY tx_count DESC LIMIT 10",
           "refId": "A"
         }
       ],
@@ -879,7 +879,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT address AS token, uniqExact(concat(tx_hash, ':', toString(log_idx))) AS transfers FROM logs WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY token ORDER BY transfers DESC LIMIT 10",
+          "rawSql": "SELECT concat('0x​', substring(address, 3)) AS token, uniqExact(concat(tx_hash, ':', toString(log_idx))) AS transfers FROM logs WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY token ORDER BY transfers DESC LIMIT 10",
           "refId": "A"
         }
       ],
@@ -1008,7 +1008,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT recipient, round(sum(native_value), 2) AS native_value FROM (SELECT hash, any(\"to\") AS recipient, max(toFloat64(value)) / 1e18 AS native_value FROM txs WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY hash) GROUP BY recipient ORDER BY native_value DESC LIMIT 10",
+          "rawSql": "SELECT concat('0x​', substring(recipient, 3)) AS recipient, round(sum(native_value), 2) AS native_value FROM (SELECT hash, any(\"to\") AS recipient, max(toFloat64(value)) / 1e18 AS native_value FROM txs WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY hash) GROUP BY recipient ORDER BY native_value DESC LIMIT 10",
           "refId": "A"
         }
       ],
@@ -1053,7 +1053,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT max(block_num) AS block_num, hash, any(\"from\") AS sender, any(\"to\") AS recipient, round(max(toFloat64(value)) / 1e18, 4) AS native_value, max(gas_used) AS gas_used FROM txs WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY hash ORDER BY native_value DESC LIMIT 20",
+          "rawSql": "SELECT max(block_num) AS block_num, hash, concat('0x​', substring(any(\"from\"), 3)) AS sender, concat('0x​', substring(any(\"to\"), 3)) AS recipient, round(max(toFloat64(value)) / 1e18, 4) AS native_value, max(gas_used) AS gas_used FROM txs WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY hash ORDER BY native_value DESC LIMIT 20",
           "refId": "A"
         }
       ],
@@ -1098,7 +1098,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT max(block_num) AS block_num, tx_hash, any(contract_address) AS deployed_contract, any(\"from\") AS deployer FROM receipts WHERE contract_address IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY tx_hash ORDER BY block_num DESC LIMIT 20",
+          "rawSql": "SELECT max(block_num) AS block_num, tx_hash, concat('0x​', substring(any(contract_address), 3)) AS deployed_contract, concat('0x​', substring(any(\"from\"), 3)) AS deployer FROM receipts WHERE contract_address IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY tx_hash ORDER BY block_num DESC LIMIT 20",
           "refId": "A"
         }
       ],

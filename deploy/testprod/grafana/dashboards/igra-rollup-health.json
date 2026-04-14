@@ -105,7 +105,7 @@
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 10,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT miner AS producer, uniqExact(num) AS blocks FROM blocks WHERE timestamp >= now() - INTERVAL 7 DAY GROUP BY producer ORDER BY blocks DESC LIMIT 10", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(miner, 3)) AS producer, uniqExact(num) AS blocks FROM blocks WHERE timestamp >= now() - INTERVAL 7 DAY GROUP BY producer ORDER BY blocks DESC LIMIT 10", "refId": "A" } ],
       "title": "Top Producers By Blocks (7d)",
       "type": "table"
     },
@@ -125,7 +125,7 @@
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 12,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT num, timestamp, miner, gas_used, gas_limit, round(100.0 * toFloat64(gas_used) / greatest(toFloat64(gas_limit), 1.0), 4) AS gas_utilization_pct FROM blocks ORDER BY num DESC LIMIT 20", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT num, timestamp, concat('0x​', substring(miner, 3)) AS miner, gas_used, gas_limit, round(100.0 * toFloat64(gas_used) / greatest(toFloat64(gas_limit), 1.0), 4) AS gas_utilization_pct FROM blocks ORDER BY num DESC LIMIT 20", "refId": "A" } ],
       "title": "Recent Blocks",
       "type": "table"
     }
