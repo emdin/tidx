@@ -322,7 +322,8 @@ async function renderHomePage() {
 
   const latest = state.status?.synced_num ?? state.status?.tip_num ?? null;
   const lag = Math.max(Number(state.status?.lag || 0), 0);
-  const syncRate = state.status?.sync_rate ? `${formatRate(state.status.sync_rate)} blk/s` : null;
+  const liveRate = preferredSyncRate(state.status);
+  const syncRate = liveRate ? `${formatRate(liveRate)} blk/s` : null;
   const chainLabel = formatChainId(state.chainId);
 
   const statusParts = [
@@ -2666,7 +2667,29 @@ function formatRate(value) {
   if (!Number.isFinite(num)) {
     return String(value ?? "-");
   }
+  if (num > 0 && num < 0.1) {
+    return "<0.1";
+  }
   return num.toFixed(num >= 100 ? 0 : 1);
+}
+
+function preferredSyncRate(status) {
+  const postgresRate = Number(status?.postgres?.rate);
+  if (Number.isFinite(postgresRate) && postgresRate > 0) {
+    return postgresRate;
+  }
+
+  const clickhouseRate = Number(status?.clickhouse?.rate);
+  if (Number.isFinite(clickhouseRate) && clickhouseRate > 0) {
+    return clickhouseRate;
+  }
+
+  const syncRate = Number(status?.sync_rate);
+  if (Number.isFinite(syncRate) && syncRate > 0) {
+    return syncRate;
+  }
+
+  return null;
 }
 
 function parsePositiveInt(value, fallback) {
