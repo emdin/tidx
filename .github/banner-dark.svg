@@ -1,21 +1,19 @@
 <svg width="608" height="351" viewBox="0 0 608 351" fill="none" xmlns="http://www.w3.org/2000/svg">
   <rect width="608" height="351" fill="#090909"/>
-  <rect x="24" y="24" width="560" height="303" rx="18" fill="#111111" stroke="#F5F3EE" stroke-opacity="0.18" stroke-width="2"/>
-  <path d="M72 83H536" stroke="#F5F3EE" stroke-opacity="0.14" stroke-width="2"/>
-  <path d="M72 268H536" stroke="#F5F3EE" stroke-opacity="0.14" stroke-width="2"/>
-  <circle cx="92" cy="54" r="7" fill="#F5F3EE"/>
-  <circle cx="116" cy="54" r="7" fill="#F5F3EE" fill-opacity="0.55"/>
-  <circle cx="140" cy="54" r="7" fill="#F5F3EE" fill-opacity="0.25"/>
-  <rect x="72" y="110" width="128" height="28" rx="14" fill="#F5F3EE"/>
-  <text x="136" y="129" text-anchor="middle" fill="#111111" font-family="SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace" font-size="12" letter-spacing="1.6">KASPA BLOCKDAG</text>
-  <text x="72" y="196" fill="#F5F3EE" font-family="Inter, Arial, sans-serif" font-size="86" font-weight="700" letter-spacing="-3.2">iidx</text>
-  <text x="72" y="236" fill="#F5F3EE" fill-opacity="0.84" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="500" letter-spacing="-0.6">igra indexer</text>
-  <text x="72" y="295" fill="#F5F3EE" fill-opacity="0.72" font-family="Inter, Arial, sans-serif" font-size="19">Explorer, analytics, and investigator data plane for Igra Network.</text>
-  <text x="72" y="319" fill="#F5F3EE" fill-opacity="0.72" font-family="Inter, Arial, sans-serif" font-size="19">PostgreSQL + ClickHouse for EVM and reth-based chains.</text>
-  <rect x="404" y="118" width="132" height="116" rx="18" fill="#F5F3EE"/>
-  <path d="M444 151H497" stroke="#111111" stroke-width="8" stroke-linecap="round"/>
-  <path d="M444 177H490" stroke="#111111" stroke-opacity="0.82" stroke-width="8" stroke-linecap="round"/>
-  <path d="M444 203H478" stroke="#111111" stroke-opacity="0.64" stroke-width="8" stroke-linecap="round"/>
-  <rect x="423" y="255" width="94" height="24" rx="12" fill="#F5F3EE" fill-opacity="0.08" stroke="#F5F3EE" stroke-opacity="0.16"/>
-  <text x="470" y="272" text-anchor="middle" fill="#F5F3EE" font-family="SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace" font-size="11" letter-spacing="1.2">IGRA / RPC / SQL</text>
+  <rect x="24" y="24" width="560" height="303" rx="22" fill="#111111" stroke="#F5F3EE" stroke-opacity="0.16" stroke-width="2"/>
+  <circle cx="92" cy="58" r="6" fill="#F5F3EE"/>
+  <circle cx="114" cy="58" r="6" fill="#F5F3EE" fill-opacity="0.45"/>
+  <circle cx="136" cy="58" r="6" fill="#F5F3EE" fill-opacity="0.18"/>
+  <rect x="72" y="102" width="134" height="30" rx="15" fill="#F5F3EE"/>
+  <text x="139" y="121" text-anchor="middle" fill="#111111" font-family="monospace" font-size="12" letter-spacing="1.2">KASPA BLOCKDAG</text>
+  <text x="72" y="196" fill="#F5F3EE" font-family="Arial, Helvetica, sans-serif" font-size="82" font-weight="700">iidx</text>
+  <text x="72" y="236" fill="#F5F3EE" fill-opacity="0.84" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700">igra indexer</text>
+  <text x="72" y="278" fill="#F5F3EE" fill-opacity="0.72" font-family="Arial, Helvetica, sans-serif" font-size="18">Explorer and analytics data plane for Igra Network</text>
+  <text x="72" y="304" fill="#F5F3EE" fill-opacity="0.72" font-family="Arial, Helvetica, sans-serif" font-size="18">PostgreSQL + ClickHouse for EVM and reth-based chains</text>
+  <rect x="404" y="112" width="132" height="132" rx="20" fill="#F5F3EE"/>
+  <path d="M441 149H499" stroke="#111111" stroke-width="8" stroke-linecap="round"/>
+  <path d="M441 177H491" stroke="#111111" stroke-width="8" stroke-linecap="round" stroke-opacity="0.8"/>
+  <path d="M441 205H479" stroke="#111111" stroke-width="8" stroke-linecap="round" stroke-opacity="0.56"/>
+  <rect x="424" y="264" width="92" height="24" rx="12" fill="#F5F3EE" fill-opacity="0.08" stroke="#F5F3EE" stroke-opacity="0.14"/>
+  <text x="470" y="280" text-anchor="middle" fill="#F5F3EE" font-family="monospace" font-size="11">IGRA / RPC / SQL</text>
 </svg>
