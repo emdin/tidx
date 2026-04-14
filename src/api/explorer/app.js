@@ -2382,11 +2382,20 @@ function with0x(value) {
 }
 
 function sanitizeHexInput(value) {
-  const input = String(value || "")
-    .normalize("NFKC")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .trim()
-    .replace(/^["']+|["']+$/g, "");
+  let input = String(value || "").trim().replace(/^["']+|["']+$/g, "");
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      const decoded = decodeURIComponent(input);
+      if (decoded === input) {
+        break;
+      }
+      input = decoded;
+    } catch {
+      break;
+    }
+  }
+
+  input = input.normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
 
   if (!input) {
     return "";
