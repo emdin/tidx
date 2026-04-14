@@ -30,7 +30,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"sender_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -714,7 +714,7 @@
                 "value": [
                   {
                     "title": "Open Sender",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"sender_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]

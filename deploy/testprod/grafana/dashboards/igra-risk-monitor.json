@@ -604,7 +604,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"sender_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -714,7 +714,7 @@
                 "value": [
                   {
                     "title": "Open In Explorer",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"deployer_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -800,7 +800,7 @@
                 "value": [
                   {
                     "title": "Open Deployer",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"deployer_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -914,7 +914,7 @@
                 "value": [
                   {
                     "title": "Open Receipt",
-                    "url": "__EXPLORER_BASE_URL__/receipt/${__data.fields[\"hash_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/receipt/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -932,7 +932,7 @@
                 "value": [
                   {
                     "title": "Open Sender",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"sender_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -950,7 +950,7 @@
                 "value": [
                   {
                     "title": "Open Recipient",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"recipient_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -1056,7 +1056,7 @@
                 "value": [
                   {
                     "title": "Open Receipt",
-                    "url": "__EXPLORER_BASE_URL__/receipt/${__data.fields[\"tx_hash_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/receipt/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
@@ -1074,7 +1074,7 @@
                 "value": [
                   {
                     "title": "Open Contract",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"deployed_contract_raw\"]}?tab=contract",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}?tab=contract",
                     "targetBlank": true
                   }
                 ]
@@ -1092,7 +1092,7 @@
                 "value": [
                   {
                     "title": "Open Deployer",
-                    "url": "__EXPLORER_BASE_URL__/address/${__data.fields[\"deployer_raw\"]}",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
                     "targetBlank": true
                   }
                 ]
