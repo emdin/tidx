@@ -101,7 +101,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisLabel": "", "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "producer" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"producer_raw\"]}", "targetBlank": true } ] } ] } ] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisLabel": "", "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "producer" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"producer_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 10,
       "options": { "showHeader": true },
@@ -122,7 +122,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "miner" }, "properties": [ { "id": "links", "value": [ { "title": "Open Miner", "url": "/explore/address/${__data.fields[\"miner_raw\"]}", "targetBlank": true } ] } ] } ] },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "https://stage-roman.igralabs.com/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "miner" }, "properties": [ { "id": "links", "value": [ { "title": "Open Miner", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"miner_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 12,
       "options": { "showHeader": true },
