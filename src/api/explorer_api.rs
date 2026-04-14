@@ -549,6 +549,31 @@ pub struct TokensResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ContractListItem {
+    pub address: String,
+    pub detected_kind: String,
+    pub label: Option<String>,
+    pub is_official: bool,
+    pub contract_name: String,
+    pub verification_status: String,
+    pub compiler_version: Option<String>,
+    pub verified_at: chrono::DateTime<chrono::Utc>,
+    pub has_source_code: bool,
+    pub bytecode_match: Option<bool>,
+    pub symbol: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ContractsResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub page: i64,
+    pub limit: i64,
+    pub contracts: Vec<ContractListItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ContractMethodRow {
     pub selector: String,
     pub method_label: String,
@@ -947,6 +972,81 @@ pub async fn tokens(
         page,
         limit,
         tokens,
+    }))
+}
+
+pub async fn contracts(
+    State(state): State<AppState>,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<ContractsResponse>, ApiError> {
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let limit = query.limit.unwrap_or(25).clamp(1, 50);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+
+    let rows = conn
+        .query(
+            "
+            SELECT
+                encode(cv.address, 'hex') AS address,
+                COALESCE(tm.detected_kind, 'contract') AS detected_kind,
+                al.label,
+                COALESCE(al.is_official, FALSE) AS is_official,
+                cv.contract_name,
+                cv.verification_status,
+                cv.compiler_version,
+                cv.verified_at,
+                (cv.source_code IS NOT NULL AND btrim(cv.source_code) <> '') AS has_source_code,
+                cv.bytecode_match,
+                tm.symbol,
+                tm.name
+            FROM contract_verifications cv
+            LEFT JOIN address_labels al ON al.address = cv.address
+            LEFT JOIN token_metadata tm ON tm.address = cv.address
+            ORDER BY
+                CASE WHEN COALESCE(al.is_official, FALSE) THEN 0 ELSE 1 END,
+                cv.verified_at DESC,
+                cv.contract_name ASC
+            LIMIT $1
+            OFFSET $2
+            ",
+            &[&limit, &offset],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load verified contract list: {e}")))?;
+
+    let contracts = rows
+        .into_iter()
+        .map(|row| ContractListItem {
+            address: format!("0x{}", row.get::<_, String>("address")),
+            detected_kind: row.get("detected_kind"),
+            label: row.get("label"),
+            is_official: row.get("is_official"),
+            contract_name: row.get("contract_name"),
+            verification_status: row.get("verification_status"),
+            compiler_version: row.get("compiler_version"),
+            verified_at: row.get("verified_at"),
+            has_source_code: row.get("has_source_code"),
+            bytecode_match: row.get("bytecode_match"),
+            symbol: row.get("symbol"),
+            name: row.get("name"),
+        })
+        .collect();
+
+    Ok(Json(ContractsResponse {
+        ok: true,
+        chain_id,
+        page,
+        limit,
+        contracts,
     }))
 }
 

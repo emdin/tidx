@@ -237,6 +237,7 @@ fn build_router(state: AppState) -> Router<()> {
             get(explorer_api::admin_capabilities),
         )
         .route("/explore/api/search", get(explorer_api::search))
+        .route("/explore/api/contracts", get(explorer_api::contracts))
         .route("/explore/api/tokens", get(explorer_api::tokens))
         .route(
             "/explore/api/address/{address}/inspect",

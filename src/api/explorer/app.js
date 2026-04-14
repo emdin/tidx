@@ -160,6 +160,7 @@ function shouldAutoRefreshRoute(route, previousSynced, nextSynced) {
     case "home":
       return true;
     case "blocks":
+    case "contracts":
     case "tokens":
       return route.page === 1;
     case "address":
@@ -219,6 +220,9 @@ function currentRoute() {
   if (parts[0] === "blocks") {
     return { name: "blocks", page, params };
   }
+  if (parts[0] === "contracts") {
+    return { name: "contracts", page, params };
+  }
   if (parts[0] === "search") {
     return { name: "search", query: params.get("q") || "", page: 1, params };
   }
@@ -275,6 +279,9 @@ async function renderRoute(_options = {}) {
       return;
     case "blocks":
       await renderBlocksPage(route.page);
+      return;
+    case "contracts":
+      await renderContractsPage(route.page);
       return;
     case "search":
       await renderSearchResultsPage(route.query);
@@ -355,6 +362,7 @@ async function renderHomePage() {
           ${renderPillLink("Contract", contractHref, icons.contract)}
           ${renderPillLink("Receipt", receiptHref, icons.receipt)}
           ${renderPillLink("Blocks", "/explore/blocks", icons.blocks)}
+          ${renderPillLink("Contracts", "/explore/contracts", icons.contract)}
           ${renderPillLink("Tokens", "/explore/tokens", icons.tokens)}
         </section>
       </div>
@@ -998,6 +1006,42 @@ async function renderTokensPage(page) {
           ${renderTokensTable(tokenRows)}
         </div>
         ${renderPagination("/explore/tokens", page, tokenRows.length === PAGE_SIZE)}
+      </section>
+    </section>
+  `;
+}
+
+async function renderContractsPage(page) {
+  setDocumentTitle("Contracts · Igra Explorer");
+  const payload = await fetchExplorerJson(
+    `/explore/api/contracts?chainId=${encodeURIComponent(state.chainId)}&page=${page}&limit=${PAGE_SIZE}`,
+  );
+  const contractRows = Array.isArray(payload?.contracts) ? payload.contracts : [];
+
+  elements.pageRoot.innerHTML = `
+    <section class="content-page">
+      <header class="page-header">
+        <div class="badge-row">
+          <span class="status-pill">Verified</span>
+          <span class="muted-badge">Imported from canonical Igra Blockscout</span>
+        </div>
+        <div>
+          <h1 class="page-heading">Contracts</h1>
+          <p class="page-subheading">Verified contracts with stored ABI and source available to the explorer.</p>
+        </div>
+      </header>
+
+      <section class="panel-card">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Verified contract directory</div>
+            <div class="panel-subtitle">Legacy and newly verified contracts imported from explorer.igralabs.com</div>
+          </div>
+        </div>
+        <div class="panel-body table-wrap">
+          ${renderContractsTable(contractRows)}
+        </div>
+        ${renderPagination("/explore/contracts", page, contractRows.length === PAGE_SIZE)}
       </section>
     </section>
   `;
@@ -1788,6 +1832,59 @@ function renderPortfolioTable(rows) {
             <th class="align-right">Balance</th>
             <th class="align-right">Inbound</th>
             <th class="align-right">Last block</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderContractsTable(rows) {
+  if (!rows.length) {
+    return '<div class="empty-state">No verified contracts have been imported yet.</div>';
+  }
+
+  const body = rows
+    .map((row) => {
+      const href = row.detected_kind === "token"
+        ? `/explore/token/${row.address}`
+        : `/explore/address/${row.address}?tab=contract`;
+      const primary = row.symbol || row.name || row.label || row.contract_name || shortHex(row.address, 8);
+      const profile = row.label || (row.detected_kind === "token" ? "Token" : "Contract");
+      const proof = row.bytecode_match === true ? "Matched" : row.bytecode_match === false ? "Mismatch" : "Metadata";
+
+      return `
+        <tr>
+          <td>
+            <div class="table-primary-cell"><a href="${href}">${escapeHtml(primary)}</a></div>
+            <div class="table-secondary-cell mono">${escapeHtml(shortHex(row.address, 8))}</div>
+          </td>
+          <td>${escapeHtml(row.contract_name || "-")}</td>
+          <td>${escapeHtml(profile)}</td>
+          <td>${escapeHtml(formatVerificationStatus(row.verification_status))}</td>
+          <td>${escapeHtml(proof)}</td>
+          <td>${escapeHtml(row.compiler_version || "-")}</td>
+          <td>${row.has_source_code ? "Yes" : "No"}</td>
+          <td>${escapeHtml(formatRelativeTime(row.verified_at))}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Address</th>
+            <th>Contract</th>
+            <th>Profile</th>
+            <th>Status</th>
+            <th>Proof</th>
+            <th>Compiler</th>
+            <th>Source</th>
+            <th>Imported</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>
