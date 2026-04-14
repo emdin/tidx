@@ -748,15 +748,7 @@
       },
       "id": 10,
       "options": {
-        "legend": {
-          "displayMode": "hidden",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "showHeader": true
       },
       "targets": [
         {
@@ -772,7 +764,7 @@
         }
       ],
       "title": "Top Contracts By Gas (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": {
@@ -816,15 +808,7 @@
       },
       "id": 11,
       "options": {
-        "legend": {
-          "displayMode": "hidden",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "showHeader": true
       },
       "targets": [
         {
@@ -840,7 +824,7 @@
         }
       ],
       "title": "Top Senders (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": {
@@ -884,15 +868,7 @@
       },
       "id": 12,
       "options": {
-        "legend": {
-          "displayMode": "hidden",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "showHeader": true
       },
       "targets": [
         {
@@ -908,7 +884,7 @@
         }
       ],
       "title": "Top Token Transfer Contracts (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": {
@@ -1021,15 +997,7 @@
       },
       "id": 14,
       "options": {
-        "legend": {
-          "displayMode": "hidden",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "showHeader": true
       },
       "targets": [
         {
@@ -1045,7 +1013,7 @@
         }
       ],
       "title": "Top Native Value Recipients (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": {

@@ -92,10 +92,10 @@
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 9,
-      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "options": { "showHeader": true },
       "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT \"to\" AS contract, uniqExact(hash) AS tx_count FROM txs WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY contract ORDER BY tx_count DESC LIMIT 10", "refId": "A" } ],
       "title": "Top Contracts By Calls (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
@@ -112,10 +112,10 @@
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 11,
-      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "options": { "showHeader": true },
       "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT address AS token, uniqExact(concat(tx_hash, ':', toString(log_idx))) AS transfers FROM logs WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY token ORDER BY transfers DESC LIMIT 10", "refId": "A" } ],
       "title": "Top Token Transfer Contracts (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },

@@ -92,10 +92,10 @@
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 9,
-      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "options": { "showHeader": true },
       "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT \"from\" AS sender, uniqExactIf(tx_hash, status = 0) AS failed_txs FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY sender ORDER BY failed_txs DESC LIMIT 10", "refId": "A" } ],
       "title": "Top Failed Senders (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
@@ -112,10 +112,10 @@
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 11,
-      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "options": { "showHeader": true },
       "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT \"from\" AS deployer, uniqExactIf(tx_hash, contract_address IS NOT NULL) AS deployments FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY deployer ORDER BY deployments DESC LIMIT 10", "refId": "A" } ],
       "title": "Top Deployers (7d)",
-      "type": "barchart"
+      "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
