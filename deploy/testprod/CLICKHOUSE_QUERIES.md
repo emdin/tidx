@@ -1,9 +1,9 @@
 # ClickHouse Query Pack
 
-Use this pattern against the deployed explorer API:
+Base endpoint:
 
 ```bash
-curl "https://stage-roman.igralabs.com/query?chainId=38833&engine=clickhouse&sql=YOUR_SQL"
+https://stage-roman.igralabs.com/query
 ```
 
 Notes:
@@ -11,6 +11,7 @@ Notes:
 - In ClickHouse here, hashes and addresses are stored as `0x...` strings.
 - For public use, keep result sizes bounded with `LIMIT`.
 - Replace `0xYOUR_ADDRESS` or `0xYOUR_CONTRACT` where needed.
+- The `curl` examples use `--data-urlencode @- <<'EOF'` so you can copy them directly without worrying about shell escaping.
 
 ## Top 20 Useful Queries
 
@@ -23,6 +24,18 @@ ORDER BY num DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT num, hash, timestamp, gas_used
+FROM blocks
+ORDER BY num DESC
+LIMIT 20
+EOF
+```
+
 ### 2. Latest 20 transactions
 
 ```sql
@@ -30,6 +43,18 @@ SELECT block_num, idx, hash, `from`, `to`, gas_used
 FROM txs
 ORDER BY block_num DESC, idx DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT block_num, idx, hash, `from`, `to`, gas_used
+FROM txs
+ORDER BY block_num DESC, idx DESC
+LIMIT 20
+EOF
 ```
 
 ### 3. Latest 20 receipts
@@ -41,6 +66,18 @@ ORDER BY block_num DESC, tx_idx DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT block_num, tx_idx, tx_hash, status, gas_used
+FROM receipts
+ORDER BY block_num DESC, tx_idx DESC
+LIMIT 20
+EOF
+```
+
 ### 4. Latest 20 logs
 
 ```sql
@@ -48,6 +85,18 @@ SELECT block_num, log_idx, tx_hash, address, topic0
 FROM logs
 ORDER BY block_num DESC, log_idx DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT block_num, log_idx, tx_hash, address, topic0
+FROM logs
+ORDER BY block_num DESC, log_idx DESC
+LIMIT 20
+EOF
 ```
 
 ### 5. Basic chain totals
@@ -60,6 +109,19 @@ SELECT
   (SELECT count() FROM logs) AS logs
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT
+  (SELECT count() FROM blocks) AS blocks,
+  (SELECT count() FROM txs) AS txs,
+  (SELECT count() FROM receipts) AS receipts,
+  (SELECT count() FROM logs) AS logs
+EOF
+```
+
 ### 6. Daily transactions
 
 ```sql
@@ -68,6 +130,19 @@ FROM txs
 GROUP BY day
 ORDER BY day DESC
 LIMIT 30
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT toDate(block_timestamp) AS day, count() AS txs
+FROM txs
+GROUP BY day
+ORDER BY day DESC
+LIMIT 30
+EOF
 ```
 
 ### 7. Daily successful vs failed transactions
@@ -83,6 +158,22 @@ ORDER BY day DESC
 LIMIT 30
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT
+  toDate(block_timestamp) AS day,
+  countIf(status = 1) AS success_txs,
+  countIf(status = 0) AS failed_txs
+FROM receipts
+GROUP BY day
+ORDER BY day DESC
+LIMIT 30
+EOF
+```
+
 ### 8. Hourly TPS approximation
 
 ```sql
@@ -96,6 +187,22 @@ ORDER BY hour DESC
 LIMIT 48
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT
+  toStartOfHour(block_timestamp) AS hour,
+  count() AS txs,
+  round(count() / 3600, 4) AS avg_tps
+FROM txs
+GROUP BY hour
+ORDER BY hour DESC
+LIMIT 48
+EOF
+```
+
 ### 9. Top senders
 
 ```sql
@@ -104,6 +211,19 @@ FROM txs
 GROUP BY `from`
 ORDER BY tx_count DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT `from`, count() AS tx_count
+FROM txs
+GROUP BY `from`
+ORDER BY tx_count DESC
+LIMIT 20
+EOF
 ```
 
 ### 10. Top recipients or contracts by transaction count
@@ -117,6 +237,20 @@ ORDER BY tx_count DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT `to`, count() AS tx_count
+FROM txs
+WHERE `to` IS NOT NULL
+GROUP BY `to`
+ORDER BY tx_count DESC
+LIMIT 20
+EOF
+```
+
 ### 11. Top contracts by emitted logs
 
 ```sql
@@ -125,6 +259,19 @@ FROM logs
 GROUP BY address
 ORDER BY log_count DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT address, count() AS log_count
+FROM logs
+GROUP BY address
+ORDER BY log_count DESC
+LIMIT 20
+EOF
 ```
 
 ### 12. Top event signatures
@@ -138,6 +285,20 @@ ORDER BY log_count DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT topic0, count() AS log_count
+FROM logs
+WHERE topic0 IS NOT NULL
+GROUP BY topic0
+ORDER BY log_count DESC
+LIMIT 20
+EOF
+```
+
 ### 13. Top method selectors
 
 ```sql
@@ -147,6 +308,20 @@ WHERE length(input) >= 10
 GROUP BY selector
 ORDER BY tx_count DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT substring(input, 1, 10) AS selector, count() AS tx_count
+FROM txs
+WHERE length(input) >= 10
+GROUP BY selector
+ORDER BY tx_count DESC
+LIMIT 20
+EOF
 ```
 
 ### 14. Recent contract deployments
@@ -159,6 +334,19 @@ ORDER BY block_num DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT block_num, tx_hash, contract_address, `from`
+FROM receipts
+WHERE contract_address IS NOT NULL
+ORDER BY block_num DESC
+LIMIT 20
+EOF
+```
+
 ### 15. Biggest gas users
 
 ```sql
@@ -166,6 +354,18 @@ SELECT block_num, tx_hash, gas_used, `from`, `to`
 FROM receipts
 ORDER BY gas_used DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT block_num, tx_hash, gas_used, `from`, `to`
+FROM receipts
+ORDER BY gas_used DESC
+LIMIT 20
+EOF
 ```
 
 ### 16. Contracts with highest total gas consumed
@@ -177,6 +377,20 @@ WHERE `to` IS NOT NULL
 GROUP BY `to`
 ORDER BY total_gas DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT `to`, sum(gas_used) AS total_gas, count() AS tx_count
+FROM receipts
+WHERE `to` IS NOT NULL
+GROUP BY `to`
+ORDER BY total_gas DESC
+LIMIT 20
+EOF
 ```
 
 ### 17. Most active addresses in the last 24h
@@ -201,6 +415,31 @@ ORDER BY appearances DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT address, count() AS appearances
+FROM
+(
+  SELECT `from` AS address
+  FROM txs
+  WHERE block_timestamp >= now() - INTERVAL 1 DAY
+
+  UNION ALL
+
+  SELECT `to` AS address
+  FROM txs
+  WHERE `to` IS NOT NULL
+    AND block_timestamp >= now() - INTERVAL 1 DAY
+)
+GROUP BY address
+ORDER BY appearances DESC
+LIMIT 20
+EOF
+```
+
 ### 18. ERC-20 style transfer-heavy contracts
 
 ```sql
@@ -210,6 +449,20 @@ WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3
 GROUP BY address
 ORDER BY transfers DESC
 LIMIT 20
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT address, count() AS transfers
+FROM logs
+WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+GROUP BY address
+ORDER BY transfers DESC
+LIMIT 20
+EOF
 ```
 
 ### 19. ERC-20 style approval-heavy contracts
@@ -223,6 +476,20 @@ ORDER BY approvals DESC
 LIMIT 20
 ```
 
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT address, count() AS approvals
+FROM logs
+WHERE topic0 = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'
+GROUP BY address
+ORDER BY approvals DESC
+LIMIT 20
+EOF
+```
+
 ### 20. Address activity drilldown
 
 ```sql
@@ -232,6 +499,20 @@ WHERE `from` = '0xYOUR_ADDRESS'
    OR `to` = '0xYOUR_ADDRESS'
 ORDER BY block_num DESC, idx DESC
 LIMIT 100
+```
+
+```bash
+curl --get 'https://stage-roman.igralabs.com/query' \
+  --data-urlencode 'chainId=38833' \
+  --data-urlencode 'engine=clickhouse' \
+  --data-urlencode @- <<'EOF'
+sql=SELECT block_num, idx, hash, `from`, `to`, value, gas_used
+FROM txs
+WHERE `from` = '0xYOUR_ADDRESS'
+   OR `to` = '0xYOUR_ADDRESS'
+ORDER BY block_num DESC, idx DESC
+LIMIT 100
+EOF
 ```
 
 ## Recommended First Queries
