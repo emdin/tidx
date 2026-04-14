@@ -1,8 +1,10 @@
 use axum::{
-    extract::State,
+    extract::{OriginalUri, State},
+    http::HeaderMap,
     http::header,
     response::{Html, IntoResponse, Response},
 };
+use tracing::info;
 
 use super::AppState;
 
@@ -12,14 +14,33 @@ const STYLES_CSS: &str = include_str!("explorer/styles.css");
 const FAVICON_SVG: &str = include_str!("explorer/favicon.svg");
 const LOGO_PNG: &[u8] = include_bytes!("explorer/logo.png");
 
-pub async fn index(State(state): State<AppState>) -> Html<String> {
+pub async fn index(
+    State(state): State<AppState>,
+    uri: OriginalUri,
+    headers: HeaderMap,
+) -> Html<String> {
+    let path = uri.path();
+    if path.starts_with("/explore/address/")
+        || path.starts_with("/explore/token/")
+        || path.starts_with("/explore/receipt/")
+        || path.starts_with("/explore/block/")
+    {
+        let referer = headers
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-");
+        info!(path = %path, referer = %referer, "Explorer route request");
+    }
     let html = INDEX_HTML.replace("__DEFAULT_CHAIN_ID__", &state.default_chain_id.to_string());
     Html(html)
 }
 
 pub async fn app_js() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         APP_JS,
     )
         .into_response()
@@ -42,9 +63,5 @@ pub async fn favicon_svg() -> Response {
 }
 
 pub async fn logo_png() -> Response {
-    (
-        [(header::CONTENT_TYPE, "image/png")],
-        LOGO_PNG,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "image/png")], LOGO_PNG).into_response()
 }
