@@ -1959,17 +1959,20 @@ fn decode_function_arguments(
         .inputs
         .iter()
         .zip(values.iter())
-        .map(|(param, value)| decoded_argument(
-            if param.name.is_empty() {
-                "arg".to_string()
-            } else {
-                param.name.clone()
-            },
-            param.selector_type().into_owned(),
-            value,
-            false,
-            None,
-        ))
+        .enumerate()
+        .map(|(index, (param, value))| {
+            decoded_argument(
+                if param.name.is_empty() {
+                    format!("arg{index}")
+                } else {
+                    param.name.clone()
+                },
+                param.selector_type().into_owned(),
+                value,
+                false,
+                None,
+            )
+        })
         .collect())
 }
 
@@ -1992,7 +1995,8 @@ fn decode_event_arguments(
     Ok(event
         .inputs
         .iter()
-        .map(|param| {
+        .enumerate()
+        .map(|(index, param)| {
             let value = if param.indexed {
                 indexed_values
                     .next()
@@ -2012,7 +2016,7 @@ fn decode_event_arguments(
             };
             decoded_argument(
                 if param.name.is_empty() {
-                    "arg".to_string()
+                    format!("arg{index}")
                 } else {
                     param.name.clone()
                 },
