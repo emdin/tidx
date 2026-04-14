@@ -89,17 +89,18 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "sender" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"sender_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 9,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(\"from\", 3)) AS sender, uniqExactIf(tx_hash, status = 0) AS failed_txs FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY sender ORDER BY failed_txs DESC LIMIT 10", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(\"from\", 3)) AS sender, \"from\" AS sender_raw, uniqExactIf(tx_hash, status = 0) AS failed_txs FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY sender, sender_raw ORDER BY failed_txs DESC LIMIT 10", "refId": "A" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "sender_raw": true }, "indexByName": { "sender": 0, "failed_txs": 1, "sender_raw": 2 }, "renameByName": {} } } ],
       "title": "Top Failed Senders (7d)",
       "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "deployer" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"deployer_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
       "id": 10,
       "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -113,27 +114,30 @@
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 11,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(\"from\", 3)) AS deployer, uniqExactIf(tx_hash, contract_address IS NOT NULL) AS deployments FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY deployer ORDER BY deployments DESC LIMIT 10", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(\"from\", 3)) AS deployer, \"from\" AS deployer_raw, uniqExactIf(tx_hash, contract_address IS NOT NULL) AS deployments FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY deployer, deployer_raw ORDER BY deployments DESC LIMIT 10", "refId": "A" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "deployer_raw": true }, "indexByName": { "deployer": 0, "deployments": 1, "deployer_raw": 2 }, "renameByName": {} } } ],
       "title": "Top Deployers (7d)",
       "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "block_num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "hash" }, "properties": [ { "id": "links", "value": [ { "title": "Open Receipt", "url": "/explore/receipt/${__data.fields[\"hash_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "sender" }, "properties": [ { "id": "links", "value": [ { "title": "Open Sender", "url": "/explore/address/${__data.fields[\"sender_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "recipient" }, "properties": [ { "id": "links", "value": [ { "title": "Open Recipient", "url": "/explore/address/${__data.fields[\"recipient_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 28 },
       "id": 12,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT max(block_num) AS block_num, hash, concat('0x​', substring(any(\"from\"), 3)) AS sender, concat('0x​', substring(any(\"to\"), 3)) AS recipient, round(max(toFloat64(value)) / 1e18, 4) AS native_value, max(gas_used) AS gas_used FROM txs WHERE block_timestamp >= now() - INTERVAL 1 DAY GROUP BY hash ORDER BY native_value DESC LIMIT 20", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT block_num, concat('0x​', substring(hash_raw, 3)) AS hash, hash_raw, concat('0x​', substring(sender_raw, 3)) AS sender, sender_raw, concat('0x​', substring(recipient_raw, 3)) AS recipient, recipient_raw, native_value, gas_used FROM (SELECT max(block_num) AS block_num, hash_raw, any(sender_raw) AS sender_raw, any(recipient_raw) AS recipient_raw, round(max(toFloat64(value)) / 1e18, 4) AS native_value, max(gas_used) AS gas_used FROM (SELECT block_num, hash AS hash_raw, \"from\" AS sender_raw, \"to\" AS recipient_raw, value, gas_used, block_timestamp FROM txs WHERE block_timestamp >= now() - INTERVAL 1 DAY) GROUP BY hash_raw ORDER BY native_value DESC LIMIT 20)", "refId": "A" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "hash_raw": true, "sender_raw": true, "recipient_raw": true }, "indexByName": { "block_num": 0, "hash": 1, "sender": 2, "recipient": 3, "native_value": 4, "gas_used": 5, "hash_raw": 6, "sender_raw": 7, "recipient_raw": 8 }, "renameByName": {} } } ],
       "title": "Largest Native Transfers (24h)",
       "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "block_num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "tx_hash" }, "properties": [ { "id": "links", "value": [ { "title": "Open Receipt", "url": "/explore/receipt/${__data.fields[\"tx_hash_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "deployed_contract" }, "properties": [ { "id": "links", "value": [ { "title": "Open Contract", "url": "/explore/address/${__data.fields[\"deployed_contract_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "deployer" }, "properties": [ { "id": "links", "value": [ { "title": "Open Deployer", "url": "/explore/address/${__data.fields[\"deployer_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 28 },
       "id": 13,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT max(block_num) AS block_num, tx_hash, concat('0x​', substring(any(contract_address), 3)) AS deployed_contract, concat('0x​', substring(any(\"from\"), 3)) AS deployer FROM receipts WHERE contract_address IS NOT NULL AND block_timestamp >= now() - INTERVAL 1 DAY GROUP BY tx_hash ORDER BY block_num DESC LIMIT 20", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT block_num, concat('0x​', substring(tx_hash_raw, 3)) AS tx_hash, tx_hash_raw, concat('0x​', substring(deployed_contract_raw, 3)) AS deployed_contract, deployed_contract_raw, concat('0x​', substring(deployer_raw, 3)) AS deployer, deployer_raw FROM (SELECT max(block_num) AS block_num, tx_hash_raw, any(deployed_contract_raw) AS deployed_contract_raw, any(deployer_raw) AS deployer_raw FROM (SELECT block_num, tx_hash AS tx_hash_raw, contract_address AS deployed_contract_raw, \"from\" AS deployer_raw, block_timestamp FROM receipts WHERE contract_address IS NOT NULL AND block_timestamp >= now() - INTERVAL 1 DAY) GROUP BY tx_hash_raw ORDER BY block_num DESC LIMIT 20)", "refId": "A" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "tx_hash_raw": true, "deployed_contract_raw": true, "deployer_raw": true }, "indexByName": { "block_num": 0, "tx_hash": 1, "deployed_contract": 2, "deployer": 3, "tx_hash_raw": 4, "deployed_contract_raw": 5, "deployer_raw": 6 }, "renameByName": {} } } ],
       "title": "Recent Deployments (24h)",
       "type": "table"
     }

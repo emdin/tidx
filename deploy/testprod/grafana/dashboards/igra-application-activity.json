@@ -89,17 +89,18 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "contract" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"contract_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 9,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(\"to\", 3)) AS contract, uniqExact(hash) AS tx_count FROM txs WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY contract ORDER BY tx_count DESC LIMIT 10", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(\"to\", 3)) AS contract, \"to\" AS contract_raw, uniqExact(hash) AS tx_count FROM txs WHERE \"to\" IS NOT NULL AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY contract, contract_raw ORDER BY tx_count DESC LIMIT 10", "refId": "A" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "contract_raw": true }, "indexByName": { "contract": 0, "tx_count": 1, "contract_raw": 2 }, "renameByName": {} } } ],
       "title": "Top Contracts By Calls (7d)",
       "type": "table"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "token" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"token_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
       "id": 10,
       "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -113,7 +114,8 @@
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 11,
       "options": { "showHeader": true },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(address, 3)) AS token, uniqExact(concat(tx_hash, ':', toString(log_idx))) AS transfers FROM logs WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY token ORDER BY transfers DESC LIMIT 10", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(address, 3)) AS token, address AS token_raw, uniqExact(concat(tx_hash, ':', toString(log_idx))) AS transfers FROM logs WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND block_timestamp >= now() - INTERVAL 7 DAY GROUP BY token, token_raw ORDER BY transfers DESC LIMIT 10", "refId": "A" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "token_raw": true }, "indexByName": { "token": 0, "transfers": 1, "token_raw": 2 }, "renameByName": {} } } ],
       "title": "Top Token Transfer Contracts (7d)",
       "type": "table"
     },
