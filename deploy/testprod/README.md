@@ -7,7 +7,7 @@ This bundle deploys a single-host `igra` test-prod environment with:
 - `postgres` for primary chain data
 - `clickhouse` for OLAP / analytics queries
 - `prometheus` for scraping metrics
-- `grafana` for dashboards, bound to `127.0.0.1` by default
+- `grafana` for dashboards, also exposed at `/grafana`
 
 It is intentionally opinionated:
 
@@ -117,7 +117,8 @@ docker compose logs -f caddy
 - `prometheus`
   - scrapes `/metrics` from `tidx`
 - `grafana`
-  - dashboard UI on `127.0.0.1:3000`
+  - dashboard UI on `https://explore-test.igralabs.com/grafana`
+  - also bound on `127.0.0.1:3000` for direct host access
 
 ## Access
 
@@ -128,7 +129,10 @@ Public explorer:
 
 Grafana:
 
+- public route: `https://explore-test.igralabs.com/grafana`
 - local on the host: `http://127.0.0.1:3000`
+- login user: `admin`
+- password: the `GRAFANA_ADMIN_PASSWORD` value from `.env`
 - or via SSH tunnel:
 
 ```bash
@@ -138,6 +142,13 @@ ssh -L 3000:127.0.0.1:3000 user@your-server
 Prometheus:
 
 - local on the host: `http://127.0.0.1:9091`
+
+Provisioned Grafana resources:
+
+- `ClickHouse` datasource pointed at the internal `clickhouse:8123`
+- `Prometheus` datasource pointed at `prometheus:9090`
+- `Igra ClickHouse Analytics` dashboard
+- `Igra Investigator Workbench` dashboard
 
 ## Explorer Admin Writes
 
@@ -222,3 +233,4 @@ docker compose logs -f tidx
 - add Cloudflare proxy after direct DNS-only validation succeeds
 - add HTTP basic auth in [Caddyfile](/Users/user/Source/igra/tidx/deploy/testprod/Caddyfile:1) if you want the explorer private during test-prod
 - move Grafana behind a second authenticated reverse-proxy route if you want remote dashboards without SSH tunneling
+- create separate Grafana users instead of sharing the initial admin password

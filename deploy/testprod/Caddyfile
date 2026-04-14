@@ -17,6 +17,9 @@
 
 {$EXPLORER_DOMAIN} {
 	encode gzip zstd
+	handle /grafana* {
+		reverse_proxy grafana:3000
+	}
 	redir / /explore
 	reverse_proxy tidx:8080
 }
