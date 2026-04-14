@@ -839,6 +839,50 @@ body[data-page-mode="home"] .header-search-slot {
   word-break: break-word;
 }
 
+.code-block-source {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.015), transparent 42%),
+    #111416;
+}
+
+.source-highlight {
+  display: block;
+  color: #e7e1d6;
+  white-space: inherit;
+}
+
+.source-highlight .tok-comment {
+  color: #7f8b83;
+}
+
+.source-highlight .tok-string {
+  color: #d8b26e;
+}
+
+.source-highlight .tok-number {
+  color: #d38859;
+}
+
+.source-highlight .tok-keyword {
+  color: #8cc0ff;
+}
+
+.source-highlight .tok-type {
+  color: #7dd4b0;
+}
+
+.source-highlight .tok-builtin {
+  color: #f2a7a7;
+}
+
+.source-highlight .tok-function {
+  color: #f6d06b;
+}
+
+.source-highlight .tok-entity {
+  color: #b7a8ff;
+}
+
 .empty-mini {
   padding: 16px;
   color: var(--color-secondary);

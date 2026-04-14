@@ -72,6 +72,30 @@ const KNOWN_METHODS = {
 };
 
 const NATIVE_SYMBOL = "IGRA";
+const SOLIDITY_KEYWORDS = new Set([
+  "abstract", "anonymous", "as", "assembly", "break", "calldata", "catch", "constant",
+  "constructor", "continue", "contract", "delete", "do", "else", "emit", "enum", "error",
+  "event", "external", "fallback", "for", "from", "function", "if", "immutable", "import",
+  "indexed", "interface", "internal", "is", "library", "mapping", "memory", "modifier",
+  "new", "override", "payable", "pragma", "private", "public", "pure", "receive", "return",
+  "returns", "revert", "storage", "struct", "try", "type", "unchecked", "using", "view",
+  "virtual", "while",
+]);
+const SOLIDITY_BUILTINS = new Set([
+  "address", "block", "bytes", "false", "msg", "now", "super", "this", "true", "tx",
+]);
+const SOLIDITY_DECLARATION_HINTS = {
+  contract: "tok-entity",
+  enum: "tok-entity",
+  error: "tok-function",
+  event: "tok-function",
+  function: "tok-function",
+  interface: "tok-entity",
+  library: "tok-entity",
+  modifier: "tok-function",
+  struct: "tok-entity",
+  type: "tok-entity",
+};
 
 const state = {
   chainId: Number(window.__TIDX_DEFAULT_CHAIN_ID__) || null,
@@ -1290,7 +1314,7 @@ function renderContractPanel(address, kind, summary, rows, inspect, methodsPaylo
           ? `
             <section class="subpanel-card">
               <div class="subpanel-title">Source code</div>
-              <pre class="code-block mono">${escapeHtml(verification.source_code)}</pre>
+              ${renderHighlightedSourceCode(verification.source_code, verification.summary.language)}
             </section>
           `
           : ""
@@ -2305,6 +2329,158 @@ function renderReadContractResult(outputs) {
       ${outputs.map((output, index) => renderDefinitionItem(`output${index} · ${output.kind}`, output.value)).join("")}
     </div>
   `;
+}
+
+function renderHighlightedSourceCode(sourceCode, language) {
+  const normalizedLanguage = String(language || "").trim().toLowerCase();
+  const highlighted =
+    normalizedLanguage === "solidity"
+      ? highlightSoliditySource(sourceCode || "")
+      : escapeHtml(sourceCode || "");
+
+  return `
+    <pre class="code-block code-block-source mono">
+      <code class="source-highlight" data-language="${escapeHtml(normalizedLanguage || "text")}">${highlighted}</code>
+    </pre>
+  `;
+}
+
+function highlightSoliditySource(source) {
+  let index = 0;
+  let output = "";
+  let pendingDeclarationClass = null;
+
+  while (index < source.length) {
+    const current = source[index];
+    const next = source[index + 1];
+
+    if (current === "/" && next === "/") {
+      const end = source.indexOf("\n", index);
+      const token = end === -1 ? source.slice(index) : source.slice(index, end);
+      output += wrapSourceToken("tok-comment", token);
+      index += token.length;
+      continue;
+    }
+
+    if (current === "/" && next === "*") {
+      const end = source.indexOf("*/", index + 2);
+      const token = end === -1 ? source.slice(index) : source.slice(index, end + 2);
+      output += wrapSourceToken("tok-comment", token);
+      index += token.length;
+      continue;
+    }
+
+    if (current === '"' || current === "'") {
+      const token = readQuotedToken(source, index, current);
+      output += wrapSourceToken("tok-string", token);
+      index += token.length;
+      continue;
+    }
+
+    if (current === "0" && (next === "x" || next === "X")) {
+      const token = readWhile(source, index, (char) => /[0-9a-fA-FxX]/.test(char));
+      output += wrapSourceToken("tok-number", token);
+      index += token.length;
+      continue;
+    }
+
+    if (/[0-9]/.test(current)) {
+      const token = readWhile(source, index, (char) => /[0-9_]/.test(char));
+      output += wrapSourceToken("tok-number", token);
+      index += token.length;
+      continue;
+    }
+
+    if (/[A-Za-z_$]/.test(current)) {
+      const token = readWhile(source, index, (char) => /[A-Za-z0-9_$]/.test(char));
+      const nextClass = classifySolidityIdentifier(token, pendingDeclarationClass);
+      output += nextClass ? wrapSourceToken(nextClass.className, token) : escapeHtml(token);
+      pendingDeclarationClass = nextClass?.nextDeclarationClass || null;
+      index += token.length;
+      continue;
+    }
+
+    if (!/\s/.test(current) && pendingDeclarationClass && current !== ".") {
+      pendingDeclarationClass = null;
+    }
+
+    output += escapeHtml(current);
+    index += 1;
+  }
+
+  return output;
+}
+
+function classifySolidityIdentifier(token, pendingDeclarationClass) {
+  if (pendingDeclarationClass && !SOLIDITY_KEYWORDS.has(token)) {
+    return {
+      className: pendingDeclarationClass,
+      nextDeclarationClass: null,
+    };
+  }
+
+  if (SOLIDITY_KEYWORDS.has(token)) {
+    return {
+      className: "tok-keyword",
+      nextDeclarationClass: SOLIDITY_DECLARATION_HINTS[token] || null,
+    };
+  }
+
+  if (SOLIDITY_BUILTINS.has(token)) {
+    return {
+      className: "tok-builtin",
+      nextDeclarationClass: null,
+    };
+  }
+
+  if (isSolidityType(token)) {
+    return {
+      className: "tok-type",
+      nextDeclarationClass: null,
+    };
+  }
+
+  return null;
+}
+
+function isSolidityType(token) {
+  return (
+    token === "bool"
+    || token === "string"
+    || token === "byte"
+    || token === "bytes"
+    || token === "address"
+    || /^u?int(?:8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256)?$/.test(token)
+    || /^bytes(?:[1-9]|1[0-9]|2[0-9]|3[0-2])$/.test(token)
+  );
+}
+
+function readQuotedToken(source, start, quote) {
+  let index = start + 1;
+  while (index < source.length) {
+    const current = source[index];
+    if (current === "\\") {
+      index += 2;
+      continue;
+    }
+    index += 1;
+    if (current === quote) {
+      break;
+    }
+  }
+  return source.slice(start, index);
+}
+
+function readWhile(source, start, predicate) {
+  let index = start;
+  while (index < source.length && predicate(source[index])) {
+    index += 1;
+  }
+  return source.slice(start, index);
+}
+
+function wrapSourceToken(className, value) {
+  return `<span class="${className}">${escapeHtml(value)}</span>`;
 }
 
 function formatVerificationStatus(status) {
