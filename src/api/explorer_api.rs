@@ -1,9 +1,14 @@
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+};
 
 use alloy::{
-    dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt, Specifier},
-    json_abi::{Function, JsonAbi, StateMutability},
-    primitives::{Address, U256, keccak256},
+    dyn_abi::{DynSolValue, EventExt, FunctionExt, JsonAbiExt, Specifier},
+    json_abi::{Event, Function, JsonAbi, StateMutability},
+    primitives::{Address, B256, U256, keccak256},
 };
 use axum::{
     Json,
@@ -35,6 +40,236 @@ const VERIFICATION_STATUS_FULLY_VERIFIED: &str = "fully_verified";
 const BYTECODE_MATCH_TYPE_EXACT: &str = "exact";
 const BYTECODE_MATCH_TYPE_METADATA_STRIPPED: &str = "metadata_stripped";
 const BYTECODE_MATCH_TYPE_MISMATCH: &str = "mismatch";
+const DECODE_SOURCE_VERIFIED_ABI: &str = "verified_abi";
+const DECODE_SOURCE_SIGNATURE_REGISTRY: &str = "signature_registry";
+const DECODE_SOURCE_UNKNOWN: &str = "unknown";
+
+const FUNCTION_SIGNATURES: &[(&str, &str, &str)] = &[
+    ("name()", "token", "erc20"),
+    ("symbol()", "token", "erc20"),
+    ("decimals()", "token", "erc20"),
+    ("totalSupply()", "token", "erc20"),
+    ("balanceOf(address)", "token", "erc20"),
+    ("allowance(address,address)", "token", "erc20"),
+    ("approve(address,uint256)", "token", "erc20"),
+    ("transfer(address,uint256)", "token", "erc20"),
+    ("transferFrom(address,address,uint256)", "token", "erc20"),
+    ("increaseAllowance(address,uint256)", "token", "erc20"),
+    ("decreaseAllowance(address,uint256)", "token", "erc20"),
+    ("mint(address,uint256)", "token", "erc20"),
+    ("burn(uint256)", "token", "erc20"),
+    ("burnFrom(address,uint256)", "token", "erc20"),
+    ("permit(address,address,uint256,uint256,uint8,bytes32,bytes32)", "permit", "eip2612"),
+    ("ownerOf(uint256)", "nft", "erc721"),
+    ("getApproved(uint256)", "nft", "erc721"),
+    ("setApprovalForAll(address,bool)", "nft", "erc721"),
+    ("isApprovedForAll(address,address)", "nft", "erc721"),
+    ("safeTransferFrom(address,address,uint256)", "nft", "erc721"),
+    ("safeTransferFrom(address,address,uint256,bytes)", "nft", "erc721"),
+    ("tokenURI(uint256)", "nft", "erc721"),
+    ("uri(uint256)", "nft", "erc1155"),
+    ("balanceOf(address,uint256)", "nft", "erc1155"),
+    ("balanceOfBatch(address[],uint256[])", "nft", "erc1155"),
+    ("safeTransferFrom(address,address,uint256,uint256,bytes)", "nft", "erc1155"),
+    (
+        "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+        "nft",
+        "erc1155",
+    ),
+    ("setApprovalForAll(address,bool)", "nft", "erc1155"),
+    ("permit(address,((address,uint160,uint48,uint48),address,uint256),bytes)", "permit", "permit2"),
+    (
+        "permit(address,((address,uint160,uint48,uint48)[],address,uint256),bytes)",
+        "permit",
+        "permit2",
+    ),
+    ("multicall(bytes[])", "multicall", "multicall"),
+    ("multicall(uint256,bytes[])", "multicall", "multicall"),
+    ("aggregate((address,bytes)[])", "multicall", "multicall2"),
+    ("tryAggregate(bool,(address,bytes)[])", "multicall", "multicall2"),
+    (
+        "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    (
+        "swapExactETHForTokens(uint256,address[],address,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    (
+        "swapExactTokensForETH(uint256,uint256,address[],address,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    (
+        "swapTokensForExactTokens(uint256,uint256,address[],address,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    (
+        "addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    (
+        "removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    (
+        "exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))",
+        "dex",
+        "uniswap_v3",
+    ),
+    ("exactInput((bytes,address,uint256,uint256,uint256))", "dex", "uniswap_v3"),
+    (
+        "exactOutputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))",
+        "dex",
+        "uniswap_v3",
+    ),
+    ("exactOutput((bytes,address,uint256,uint256,uint256))", "dex", "uniswap_v3"),
+    ("propose(address[],uint256[],bytes[],string)", "governance", "governor"),
+    ("queue(address[],uint256[],bytes[],bytes32)", "governance", "governor"),
+    ("execute(address[],uint256[],bytes[],bytes32)", "governance", "governor"),
+    ("cancel(address[],uint256[],bytes[],bytes32)", "governance", "governor"),
+    ("castVote(uint256,uint8)", "governance", "governor"),
+    ("castVoteWithReason(uint256,uint8,string)", "governance", "governor"),
+    ("schedule(address,uint256,bytes,bytes32,bytes32,uint256)", "governance", "timelock"),
+    ("execute(address,uint256,bytes,bytes32,bytes32)", "governance", "timelock"),
+    ("grantRole(bytes32,address)", "access_control", "openzeppelin"),
+    ("revokeRole(bytes32,address)", "access_control", "openzeppelin"),
+    ("renounceRole(bytes32,address)", "access_control", "openzeppelin"),
+    ("transferOwnership(address)", "access_control", "ownable"),
+    ("acceptOwnership()", "access_control", "ownable2step"),
+    ("pause()", "access_control", "pausable"),
+    ("unpause()", "access_control", "pausable"),
+    ("submitTransaction(address,uint256,bytes)", "multisig", "gnosis_safe"),
+    ("confirmTransaction(uint256)", "multisig", "gnosis_safe"),
+    ("executeTransaction(uint256)", "multisig", "gnosis_safe"),
+    ("deposit(address,uint256)", "bridge", "generic_bridge"),
+    ("depositETH(address,uint32,bytes)", "bridge", "op_stack"),
+    ("bridgeETH(uint32,bytes)", "bridge", "op_stack"),
+    ("bridgeERC20(address,address,uint256,uint32,bytes)", "bridge", "op_stack"),
+    (
+        "finalizeDeposit(address,address,address,address,uint256,bytes)",
+        "bridge",
+        "op_stack",
+    ),
+    (
+        "finalizeWithdrawal(address,address,address,address,uint256,bytes)",
+        "bridge",
+        "op_stack",
+    ),
+    ("withdraw(uint256)", "bridge", "generic_bridge"),
+    ("sendMessage(address,bytes,uint32)", "bridge", "cross_domain_messenger"),
+    ("relayMessage(uint256,address,address,uint256,uint256,bytes)", "bridge", "cross_domain_messenger"),
+    ("claim(bytes32)", "bridge", "generic_bridge"),
+    ("stake(uint256)", "staking", "igra"),
+    ("unstake(uint256)", "staking", "igra"),
+    ("claimRewards()", "staking", "igra"),
+    ("delegate(address)", "governance", "igra"),
+    ("undelegate(address)", "governance", "igra"),
+    ("submitBatch(bytes32,uint256)", "rollup", "igra"),
+    ("finalizeBatch(bytes32)", "rollup", "igra"),
+    ("settleBlock(bytes32,uint256)", "rollup", "igra"),
+    ("attest(bytes32)", "rollup", "igra"),
+];
+
+const EVENT_SIGNATURES: &[(&str, &str, &str)] = &[
+    ("Transfer(address indexed from,address indexed to,uint256 value)", "token", "erc20"),
+    ("Approval(address indexed owner,address indexed spender,uint256 value)", "token", "erc20"),
+    ("Transfer(address indexed from,address indexed to,uint256 indexed tokenId)", "nft", "erc721"),
+    ("Approval(address indexed owner,address indexed approved,uint256 indexed tokenId)", "nft", "erc721"),
+    ("ApprovalForAll(address indexed owner,address indexed operator,bool approved)", "nft", "erc721"),
+    (
+        "TransferSingle(address indexed operator,address indexed from,address indexed to,uint256 id,uint256 value)",
+        "nft",
+        "erc1155",
+    ),
+    (
+        "TransferBatch(address indexed operator,address indexed from,address indexed to,uint256[] ids,uint256[] values)",
+        "nft",
+        "erc1155",
+    ),
+    ("ApprovalForAll(address indexed account,address indexed operator,bool approved)", "nft", "erc1155"),
+    ("URI(string value,uint256 indexed id)", "nft", "erc1155"),
+    ("OwnershipTransferred(address indexed previousOwner,address indexed newOwner)", "access_control", "ownable"),
+    ("RoleGranted(bytes32 indexed role,address indexed account,address indexed sender)", "access_control", "openzeppelin"),
+    ("RoleRevoked(bytes32 indexed role,address indexed account,address indexed sender)", "access_control", "openzeppelin"),
+    ("Paused(address account)", "access_control", "pausable"),
+    ("Unpaused(address account)", "access_control", "pausable"),
+    (
+        "ProposalCreated(uint256 proposalId,address proposer,address[] targets,uint256[] values,string[] signatures,bytes[] calldatas,uint256 startBlock,uint256 endBlock,string description)",
+        "governance",
+        "governor",
+    ),
+    ("ProposalExecuted(uint256 proposalId)", "governance", "governor"),
+    ("ProposalCanceled(uint256 proposalId)", "governance", "governor"),
+    (
+        "VoteCast(address indexed voter,uint256 proposalId,uint8 support,uint256 weight,string reason)",
+        "governance",
+        "governor",
+    ),
+    (
+        "CallScheduled(bytes32 indexed id,uint256 indexed index,address target,uint256 value,bytes data,bytes32 predecessor,uint256 delay)",
+        "governance",
+        "timelock",
+    ),
+    (
+        "CallExecuted(bytes32 indexed id,uint256 indexed index,address target,uint256 value,bytes data)",
+        "governance",
+        "timelock",
+    ),
+    ("ExecutionSuccess(bytes32 txHash,uint256 payment)", "multisig", "gnosis_safe"),
+    ("ExecutionFailure(bytes32 txHash,uint256 payment)", "multisig", "gnosis_safe"),
+    ("AddedOwner(address owner)", "multisig", "gnosis_safe"),
+    ("RemovedOwner(address owner)", "multisig", "gnosis_safe"),
+    ("ChangedThreshold(uint256 threshold)", "multisig", "gnosis_safe"),
+    (
+        "PairCreated(address indexed token0,address indexed token1,address pair,uint256)",
+        "dex",
+        "uniswap_v2",
+    ),
+    ("Swap(address indexed sender,uint256,uint256,uint256,uint256,address indexed to)", "dex", "uniswap_v2"),
+    ("Mint(address indexed sender,uint256 amount0,uint256 amount1)", "dex", "uniswap_v2"),
+    ("Burn(address indexed sender,uint256 amount0,uint256 amount1,address indexed to)", "dex", "uniswap_v2"),
+    ("Sync(uint112 reserve0,uint112 reserve1)", "dex", "uniswap_v2"),
+    (
+        "PoolCreated(address indexed token0,address indexed token1,uint24 indexed fee,int24 tickSpacing,address pool)",
+        "dex",
+        "uniswap_v3",
+    ),
+    (
+        "IncreaseLiquidity(uint256 indexed tokenId,uint128 liquidity,uint256 amount0,uint256 amount1)",
+        "dex",
+        "uniswap_v3",
+    ),
+    (
+        "DecreaseLiquidity(uint256 indexed tokenId,uint128 liquidity,uint256 amount0,uint256 amount1)",
+        "dex",
+        "uniswap_v3",
+    ),
+    (
+        "Collect(uint256 indexed tokenId,address recipient,uint256 amount0,uint256 amount1)",
+        "dex",
+        "uniswap_v3",
+    ),
+    ("DepositInitiated(address indexed from,address indexed to,uint256 amount)", "bridge", "generic_bridge"),
+    ("WithdrawalInitiated(address indexed from,address indexed to,uint256 amount)", "bridge", "generic_bridge"),
+    ("WithdrawalFinalized(address indexed from,address indexed to,uint256 amount)", "bridge", "generic_bridge"),
+    ("MessagePassed(uint256 indexed nonce,address indexed sender,address indexed target,uint256 value,uint256 gasLimit,bytes data,bytes32 withdrawalHash)", "bridge", "op_stack"),
+    ("SentMessage(address indexed target,address sender,bytes message,uint256 messageNonce,uint256 gasLimit)", "bridge", "cross_domain_messenger"),
+    ("RelayedMessage(bytes32 indexed msgHash)", "bridge", "cross_domain_messenger"),
+    ("FailedRelayedMessage(bytes32 indexed msgHash)", "bridge", "cross_domain_messenger"),
+    ("Staked(address indexed account,uint256 amount)", "staking", "igra"),
+    ("Unstaked(address indexed account,uint256 amount)", "staking", "igra"),
+    ("RewardsClaimed(address indexed account,uint256 amount)", "staking", "igra"),
+    ("BatchSubmitted(bytes32 indexed batchHash,uint256 indexed batchNum)", "rollup", "igra"),
+    ("BatchFinalized(bytes32 indexed batchHash,uint256 indexed batchNum)", "rollup", "igra"),
+    ("BlockSettled(bytes32 indexed blockHash,uint256 indexed blockNum)", "rollup", "igra"),
+    ("Attested(bytes32 indexed attestationHash,address indexed validator)", "rollup", "igra"),
+];
 
 #[derive(Deserialize)]
 pub struct ChainQuery {
@@ -316,6 +551,13 @@ pub struct TokensResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ContractMethodRow {
     pub selector: String,
+    pub method_label: String,
+    pub signature: Option<String>,
+    pub decode_source: String,
+    pub confidence: String,
+    pub protocol_family: Option<String>,
+    pub protocol_pack: Option<String>,
+    pub alternatives: Vec<String>,
     pub call_count: i64,
     pub success_count: i64,
     pub failure_count: i64,
@@ -328,6 +570,57 @@ pub struct ContractMethodsResponse {
     pub chain_id: u64,
     pub address: String,
     pub methods: Vec<ContractMethodRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedAbiArgument {
+    pub name: String,
+    pub kind: String,
+    pub value: String,
+    pub display: String,
+    pub href: Option<String>,
+    pub indexed: bool,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedCallInfo {
+    pub selector: Option<String>,
+    pub label: String,
+    pub signature: Option<String>,
+    pub decode_source: String,
+    pub confidence: String,
+    pub protocol_family: Option<String>,
+    pub protocol_pack: Option<String>,
+    pub alternatives: Vec<String>,
+    pub notes: Vec<String>,
+    pub args: Vec<DecodedAbiArgument>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedLogInfo {
+    pub log_idx: i32,
+    pub address: String,
+    pub topic0: Option<String>,
+    pub label: String,
+    pub signature: Option<String>,
+    pub decode_source: String,
+    pub confidence: String,
+    pub protocol_family: Option<String>,
+    pub protocol_pack: Option<String>,
+    pub alternatives: Vec<String>,
+    pub notes: Vec<String>,
+    pub args: Vec<DecodedAbiArgument>,
+}
+
+#[derive(Serialize)]
+pub struct ReceiptDecodeResponse {
+    pub ok: bool,
+    pub chain_id: u64,
+    pub tx_hash: String,
+    pub contract_address: Option<String>,
+    pub call: Option<DecodedCallInfo>,
+    pub logs: Vec<DecodedLogInfo>,
 }
 
 #[derive(Serialize)]
@@ -380,6 +673,51 @@ struct VerificationAssessment {
 pub struct AdminCapabilitiesResponse {
     pub ok: bool,
     pub can_write_metadata: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReceiptTxRecord {
+    hash: String,
+    selector: Option<String>,
+    input_data: Option<String>,
+    to_addr: Option<String>,
+    contract_address: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReceiptLogRecord {
+    log_idx: i32,
+    address: String,
+    topic0: Option<String>,
+    topic1: Option<String>,
+    topic2: Option<String>,
+    topic3: Option<String>,
+    data: String,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryFunction {
+    function: Function,
+    family: &'static str,
+    pack: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryEvent {
+    event: Event,
+    family: &'static str,
+    pack: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct SelectorResolution {
+    method_label: String,
+    signature: Option<String>,
+    decode_source: String,
+    confidence: String,
+    protocol_family: Option<String>,
+    protocol_pack: Option<String>,
+    alternatives: Vec<String>,
 }
 
 pub async fn admin_capabilities(
@@ -805,6 +1143,66 @@ pub async fn read_contract(
     }))
 }
 
+pub async fn decode_receipt(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    Query(query): Query<ChainQuery>,
+) -> Result<Json<ReceiptDecodeResponse>, ApiError> {
+    let normalized_hash = normalize_tx_hash(&hash)?;
+    let chain_id = resolve_chain_id(&state, query.chain_id);
+    let pool = state
+        .get_pool(Some(chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
+    let (tx, logs) = load_receipt_decode_records(&pool, &normalized_hash).await?;
+    let tx = tx.ok_or_else(|| {
+        ApiError::NotFound("Receipt decode target was not found in the local index".to_string())
+    })?;
+    let contract_address = tx
+        .to_addr
+        .clone()
+        .or_else(|| tx.contract_address.clone());
+    let verification = if let Some(address) = contract_address.as_deref() {
+        load_contract_verification(&pool, address).await?
+    } else {
+        None
+    };
+    let call = decode_call_details(
+        tx.selector.as_deref(),
+        tx.input_data.as_deref(),
+        verification.as_ref(),
+    );
+
+    let mut verification_index = HashMap::new();
+    for address in logs
+        .iter()
+        .map(|row| row.address.clone())
+        .collect::<BTreeSet<_>>()
+    {
+        let record = load_contract_verification(&pool, &address).await?;
+        verification_index.insert(address, record);
+    }
+
+    let decoded_logs = logs
+        .iter()
+        .map(|row| {
+            let verification = verification_index
+                .get(&row.address)
+                .and_then(|record| record.as_ref());
+            decode_log_details(row, verification)
+        })
+        .collect();
+
+    Ok(Json(ReceiptDecodeResponse {
+        ok: true,
+        chain_id,
+        tx_hash: tx.hash,
+        contract_address,
+        call,
+        logs: decoded_logs,
+    }))
+}
+
 pub async fn inspect_address(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -1224,15 +1622,27 @@ pub async fn contract_methods(
         )
         .await
         .map_err(|e| ApiError::QueryError(format!("Failed to load contract methods: {e}")))?;
+    let verification = load_contract_verification(&pool, &normalized).await?;
 
     let methods = rows
         .into_iter()
-        .map(|row| ContractMethodRow {
-            selector: format!("0x{}", row.get::<_, String>("selector")),
-            call_count: row.get("call_count"),
-            success_count: row.get("success_count"),
-            failure_count: row.get("failure_count"),
-            last_block: row.get("last_block"),
+        .map(|row| {
+            let selector = format!("0x{}", row.get::<_, String>("selector"));
+            let resolution = resolve_selector(selector.as_str(), verification.as_ref());
+            ContractMethodRow {
+                selector,
+                method_label: resolution.method_label,
+                signature: resolution.signature,
+                decode_source: resolution.decode_source,
+                confidence: resolution.confidence,
+                protocol_family: resolution.protocol_family,
+                protocol_pack: resolution.protocol_pack,
+                alternatives: resolution.alternatives,
+                call_count: row.get("call_count"),
+                success_count: row.get("success_count"),
+                failure_count: row.get("failure_count"),
+                last_block: row.get("last_block"),
+            }
         })
         .collect();
 
@@ -1242,6 +1652,500 @@ pub async fn contract_methods(
         address: normalized,
         methods,
     }))
+}
+
+async fn load_receipt_decode_records(
+    pool: &Pool,
+    tx_hash: &str,
+) -> Result<(Option<ReceiptTxRecord>, Vec<ReceiptLogRecord>), ApiError> {
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to get DB connection: {e}")))?;
+    let tx_bytes = tx_hash_bytes(tx_hash)?;
+
+    let tx_row = conn
+        .query_opt(
+            "
+            SELECT
+                encode(txs.hash, 'hex') AS hash,
+                CASE
+                    WHEN octet_length(txs.input) >= 4 THEN encode(substring(txs.input FROM 1 FOR 4), 'hex')
+                    ELSE NULL
+                END AS selector,
+                encode(txs.input, 'hex') AS input_data,
+                encode(txs.\"to\", 'hex') AS to_addr,
+                encode(receipts.contract_address, 'hex') AS contract_address
+            FROM txs
+            LEFT JOIN receipts ON receipts.tx_hash = txs.hash
+            WHERE txs.hash = $1
+            LIMIT 1
+            ",
+            &[&tx_bytes],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load tx decode target: {e}")))?;
+
+    let tx = tx_row.map(|row| ReceiptTxRecord {
+        hash: format!("0x{}", row.get::<_, String>("hash")),
+        selector: row
+            .get::<_, Option<String>>("selector")
+            .map(|value| format!("0x{value}")),
+        input_data: row
+            .get::<_, Option<String>>("input_data")
+            .map(|value| format!("0x{value}")),
+        to_addr: row
+            .get::<_, Option<String>>("to_addr")
+            .map(|value| format!("0x{value}")),
+        contract_address: row
+            .get::<_, Option<String>>("contract_address")
+            .map(|value| format!("0x{value}")),
+    });
+
+    let logs = conn
+        .query(
+            "
+            SELECT
+                log_idx,
+                encode(address, 'hex') AS address,
+                encode(topic0, 'hex') AS topic0,
+                encode(topic1, 'hex') AS topic1,
+                encode(topic2, 'hex') AS topic2,
+                encode(topic3, 'hex') AS topic3,
+                encode(data, 'hex') AS data
+            FROM logs
+            WHERE tx_hash = $1
+            ORDER BY log_idx ASC
+            ",
+            &[&tx_bytes],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to load receipt logs for decode: {e}")))?;
+
+    Ok((
+        tx,
+        logs.into_iter()
+            .map(|row| ReceiptLogRecord {
+                log_idx: row.get("log_idx"),
+                address: format!("0x{}", row.get::<_, String>("address")),
+                topic0: row
+                    .get::<_, Option<String>>("topic0")
+                    .map(|value| format!("0x{value}")),
+                topic1: row
+                    .get::<_, Option<String>>("topic1")
+                    .map(|value| format!("0x{value}")),
+                topic2: row
+                    .get::<_, Option<String>>("topic2")
+                    .map(|value| format!("0x{value}")),
+                topic3: row
+                    .get::<_, Option<String>>("topic3")
+                    .map(|value| format!("0x{value}")),
+                data: format!("0x{}", row.get::<_, String>("data")),
+            })
+            .collect(),
+    ))
+}
+
+fn resolve_selector(selector: &str, verification: Option<&ContractVerificationDetail>) -> SelectorResolution {
+    if let Some(abi) = verification
+        .and_then(|record| parse_json_abi(&record.abi).ok())
+        && let Some(function) = find_function_by_selector(&abi, selector)
+    {
+        return SelectorResolution {
+            method_label: function.signature(),
+            signature: Some(function.signature()),
+            decode_source: DECODE_SOURCE_VERIFIED_ABI.to_string(),
+            confidence: "exact".to_string(),
+            protocol_family: Some("verified".to_string()),
+            protocol_pack: verification
+                .map(|record| record.summary.contract_name.clone())
+                .filter(|value| !value.trim().is_empty()),
+            alternatives: Vec::new(),
+        };
+    }
+
+    let matches = registry_function_matches(selector);
+    if let Some(primary) = matches.first() {
+        let signature = primary.function.signature();
+        return SelectorResolution {
+            method_label: format!("Likely {}", signature),
+            signature: Some(signature),
+            decode_source: DECODE_SOURCE_SIGNATURE_REGISTRY.to_string(),
+            confidence: if matches.len() > 1 {
+                "likely".to_string()
+            } else {
+                "high".to_string()
+            },
+            protocol_family: Some(primary.family.to_string()),
+            protocol_pack: Some(primary.pack.to_string()),
+            alternatives: matches
+                .iter()
+                .skip(1)
+                .map(|item| item.function.signature())
+                .collect(),
+        };
+    }
+
+    SelectorResolution {
+        method_label: "Unknown".to_string(),
+        signature: None,
+        decode_source: DECODE_SOURCE_UNKNOWN.to_string(),
+        confidence: "none".to_string(),
+        protocol_family: None,
+        protocol_pack: None,
+        alternatives: Vec::new(),
+    }
+}
+
+fn decode_call_details(
+    selector: Option<&str>,
+    input_data: Option<&str>,
+    verification: Option<&ContractVerificationDetail>,
+) -> Option<DecodedCallInfo> {
+    let selector = selector.map(normalize_hex_string)?;
+    let input_data = input_data.map(normalize_hex_string)?;
+    let input_bytes = decode_hex_data(&input_data)?;
+    if input_bytes.len() < 4 {
+        return None;
+    }
+    let payload = &input_bytes[4..];
+
+    if let Some(abi) = verification
+        .and_then(|record| parse_json_abi(&record.abi).ok())
+        && let Some(function) = find_function_by_selector(&abi, &selector)
+    {
+        let signature = function.signature();
+        let args = decode_function_arguments(&function, payload).unwrap_or_default();
+        let notes = if payload.is_empty() && !function.inputs.is_empty() {
+            vec!["Calldata payload was empty for a non-empty ABI signature".to_string()]
+        } else {
+            Vec::new()
+        };
+        return Some(DecodedCallInfo {
+            selector: Some(selector),
+            label: signature.clone(),
+            signature: Some(signature),
+            decode_source: DECODE_SOURCE_VERIFIED_ABI.to_string(),
+            confidence: "exact".to_string(),
+            protocol_family: Some("verified".to_string()),
+            protocol_pack: verification
+                .map(|record| record.summary.contract_name.clone())
+                .filter(|value| !value.trim().is_empty()),
+            alternatives: Vec::new(),
+            notes,
+            args,
+        });
+    }
+
+    let matches = registry_function_matches(&selector);
+    let primary = matches.first()?;
+    let signature = primary.function.signature();
+    let args = decode_function_arguments(&primary.function, payload).unwrap_or_default();
+    let mut notes = Vec::new();
+    if matches.len() > 1 {
+        notes.push("Multiple selector matches exist in the local signature registry.".to_string());
+    }
+    Some(DecodedCallInfo {
+        selector: Some(selector),
+        label: format!("Likely {}", signature),
+        signature: Some(signature),
+        decode_source: DECODE_SOURCE_SIGNATURE_REGISTRY.to_string(),
+        confidence: if matches.len() > 1 {
+            "likely".to_string()
+        } else {
+            "high".to_string()
+        },
+        protocol_family: Some(primary.family.to_string()),
+        protocol_pack: Some(primary.pack.to_string()),
+        alternatives: matches
+            .iter()
+            .skip(1)
+            .map(|item| item.function.signature())
+            .collect(),
+        notes,
+        args,
+    })
+}
+
+fn decode_log_details(
+    log: &ReceiptLogRecord,
+    verification: Option<&ContractVerificationDetail>,
+) -> DecodedLogInfo {
+    let topic0 = log.topic0.as_ref().map(|value| normalize_hex_string(value));
+
+    if let Some(abi) = verification.and_then(|record| parse_json_abi(&record.abi).ok())
+        && let Some(primary) = find_events_by_topic0(&abi, topic0.as_deref()).into_iter().next()
+    {
+        if let Ok(args) = decode_event_arguments(&primary, log) {
+            return DecodedLogInfo {
+                log_idx: log.log_idx,
+                address: log.address.clone(),
+                topic0,
+                label: primary.name.clone(),
+                signature: Some(primary.signature()),
+                decode_source: DECODE_SOURCE_VERIFIED_ABI.to_string(),
+                confidence: "exact".to_string(),
+                protocol_family: Some("verified".to_string()),
+                protocol_pack: verification
+                    .map(|record| record.summary.contract_name.clone())
+                    .filter(|value| !value.trim().is_empty()),
+                alternatives: Vec::new(),
+                notes: Vec::new(),
+                args,
+            };
+        }
+    }
+
+    let matches = registry_event_matches(topic0.as_deref());
+    if let Some(primary) = matches.first()
+        && let Ok(args) = decode_event_arguments(&primary.event, log)
+    {
+        let mut notes = Vec::new();
+        if matches.len() > 1 {
+            notes.push("Multiple topic matches exist in the local event registry.".to_string());
+        }
+        return DecodedLogInfo {
+            log_idx: log.log_idx,
+            address: log.address.clone(),
+            topic0,
+            label: if matches.len() > 1 {
+                format!("Likely {}", primary.event.name)
+            } else {
+                primary.event.name.clone()
+            },
+            signature: Some(primary.event.signature()),
+            decode_source: DECODE_SOURCE_SIGNATURE_REGISTRY.to_string(),
+            confidence: if matches.len() > 1 {
+                "likely".to_string()
+            } else {
+                "high".to_string()
+            },
+            protocol_family: Some(primary.family.to_string()),
+            protocol_pack: Some(primary.pack.to_string()),
+            alternatives: matches
+                .iter()
+                .skip(1)
+                .map(|item| item.event.signature())
+                .collect(),
+            notes,
+            args,
+        };
+    }
+
+    DecodedLogInfo {
+        log_idx: log.log_idx,
+        address: log.address.clone(),
+        topic0,
+        label: "Unknown".to_string(),
+        signature: None,
+        decode_source: DECODE_SOURCE_UNKNOWN.to_string(),
+        confidence: "none".to_string(),
+        protocol_family: None,
+        protocol_pack: None,
+        alternatives: Vec::new(),
+        notes: Vec::new(),
+        args: Vec::new(),
+    }
+}
+
+fn decode_function_arguments(
+    function: &Function,
+    payload: &[u8],
+) -> Result<Vec<DecodedAbiArgument>, String> {
+    let values = function
+        .abi_decode_input(payload)
+        .map_err(|error| error.to_string())?;
+    Ok(function
+        .inputs
+        .iter()
+        .zip(values.iter())
+        .map(|(param, value)| decoded_argument(
+            if param.name.is_empty() {
+                "arg".to_string()
+            } else {
+                param.name.clone()
+            },
+            param.selector_type().into_owned(),
+            value,
+            false,
+            None,
+        ))
+        .collect())
+}
+
+fn decode_event_arguments(
+    event: &Event,
+    log: &ReceiptLogRecord,
+) -> Result<Vec<DecodedAbiArgument>, String> {
+    let topics = [log.topic0.as_deref(), log.topic1.as_deref(), log.topic2.as_deref(), log.topic3.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(topic_hex_to_b256)
+        .collect::<Result<Vec<_>, _>>()?;
+    let data = decode_hex_data(&log.data).unwrap_or_default();
+    let decoded = event
+        .decode_log_parts(topics, &data)
+        .map_err(|error| error.to_string())?;
+    let mut indexed_values = decoded.indexed.iter();
+    let mut body_values = decoded.body.iter();
+
+    Ok(event
+        .inputs
+        .iter()
+        .map(|param| {
+            let value = if param.indexed {
+                indexed_values
+                    .next()
+                    .expect("indexed event values should align with ABI inputs")
+            } else {
+                body_values
+                    .next()
+                    .expect("event body values should align with ABI inputs")
+            };
+            let note = if param.indexed && is_dynamic_sol_type(&param.ty) {
+                Some(
+                    "Indexed dynamic values are represented by their topic hash per the ABI spec."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            decoded_argument(
+                if param.name.is_empty() {
+                    "arg".to_string()
+                } else {
+                    param.name.clone()
+                },
+                param.ty.clone(),
+                value,
+                param.indexed,
+                note,
+            )
+        })
+        .collect())
+}
+
+fn decoded_argument(
+    name: String,
+    kind: String,
+    value: &DynSolValue,
+    indexed: bool,
+    note: Option<String>,
+) -> DecodedAbiArgument {
+    let raw = dyn_value_to_string(value);
+    let href = match value {
+        DynSolValue::Address(address) => Some(format!(
+            "/explore/address/{}",
+            address.to_string().to_ascii_lowercase()
+        )),
+        _ => None,
+    };
+    DecodedAbiArgument {
+        name,
+        kind,
+        value: raw.clone(),
+        display: raw,
+        href,
+        indexed,
+        note,
+    }
+}
+
+fn registry_function_matches(selector: &str) -> Vec<&'static RegistryFunction> {
+    let normalized = normalize_hex_string(selector);
+    function_registry()
+        .iter()
+        .filter(|item| format!("0x{}", hex::encode(item.function.selector())) == normalized)
+        .collect()
+}
+
+fn registry_event_matches(topic0: Option<&str>) -> Vec<&'static RegistryEvent> {
+    let Some(topic0) = topic0.map(normalize_hex_string) else {
+        return Vec::new();
+    };
+    event_registry()
+        .iter()
+        .filter(|item| format!("0x{}", hex::encode(item.event.selector())) == topic0)
+        .collect()
+}
+
+fn function_registry() -> &'static Vec<RegistryFunction> {
+    static REGISTRY: OnceLock<Vec<RegistryFunction>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        FUNCTION_SIGNATURES
+            .iter()
+            .filter_map(|(signature, family, pack)| {
+                Function::parse(signature).ok().map(|function| RegistryFunction {
+                    function,
+                    family,
+                    pack,
+                })
+            })
+            .collect()
+    })
+}
+
+fn event_registry() -> &'static Vec<RegistryEvent> {
+    static REGISTRY: OnceLock<Vec<RegistryEvent>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        EVENT_SIGNATURES
+            .iter()
+            .filter_map(|(signature, family, pack)| {
+                Event::parse(signature).ok().map(|event| RegistryEvent {
+                    event,
+                    family,
+                    pack,
+                })
+            })
+            .collect()
+    })
+}
+
+fn find_function_by_selector(abi: &JsonAbi, selector: &str) -> Option<Function> {
+    let normalized = selector.trim().trim_start_matches("0x").to_lowercase();
+    abi.functions
+        .values()
+        .flat_map(|functions| functions.iter())
+        .find(|function| hex::encode(function.selector()) == normalized)
+        .cloned()
+}
+
+fn find_events_by_topic0(abi: &JsonAbi, topic0: Option<&str>) -> Vec<Event> {
+    let Some(normalized) = topic0.map(|value| value.trim().trim_start_matches("0x").to_lowercase())
+    else {
+        return Vec::new();
+    };
+    abi.events
+        .values()
+        .flat_map(|events| events.iter())
+        .filter(|event| hex::encode(event.selector()) == normalized)
+        .cloned()
+        .collect()
+}
+
+fn topic_hex_to_b256(value: &str) -> Result<B256, String> {
+    let bytes = decode_hex_data(value).ok_or_else(|| "Invalid topic hex".to_string())?;
+    if bytes.len() != 32 {
+        return Err("Topic must be 32 bytes".to_string());
+    }
+    Ok(B256::from_slice(&bytes))
+}
+
+fn normalize_hex_string(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with("0x") {
+        trimmed.to_ascii_lowercase()
+    } else {
+        format!("0x{}", trimmed.to_ascii_lowercase())
+    }
+}
+
+fn is_dynamic_sol_type(kind: &str) -> bool {
+    let trimmed = kind.trim();
+    trimmed == "string"
+        || trimmed == "bytes"
+        || trimmed.ends_with("[]")
+        || trimmed.starts_with('(')
 }
 
 fn resolve_chain_id(state: &AppState, chain_id: Option<u64>) -> u64 {
@@ -2123,9 +3027,29 @@ fn normalize_address(value: &str) -> Result<String, ApiError> {
         .map_err(|_| ApiError::BadRequest("Invalid address.".to_string()))
 }
 
+fn normalize_tx_hash(value: &str) -> Result<String, ApiError> {
+    let candidate = value.trim();
+    let with_prefix = if candidate.starts_with("0x") {
+        candidate.to_ascii_lowercase()
+    } else {
+        format!("0x{}", candidate.to_ascii_lowercase())
+    };
+    let body = with_prefix.trim_start_matches("0x");
+    if body.len() == 64 && body.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Ok(format!("0x{body}"))
+    } else {
+        Err(ApiError::BadRequest("Invalid transaction hash.".to_string()))
+    }
+}
+
 fn address_bytes(address: &str) -> Result<Vec<u8>, ApiError> {
     hex::decode(address.trim_start_matches("0x"))
         .map_err(|_| ApiError::BadRequest("Invalid address.".to_string()))
+}
+
+fn tx_hash_bytes(tx_hash: &str) -> Result<Vec<u8>, ApiError> {
+    hex::decode(tx_hash.trim_start_matches("0x"))
+        .map_err(|_| ApiError::BadRequest("Invalid transaction hash.".to_string()))
 }
 
 fn padded_address_topic(address: &str) -> Result<Vec<u8>, ApiError> {

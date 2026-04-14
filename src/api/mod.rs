@@ -282,6 +282,10 @@ fn build_router(state: AppState) -> Router<()> {
             "/explore/api/contract/{address}/read",
             post(explorer_api::read_contract),
         )
+        .route(
+            "/explore/api/receipt/{hash}/decode",
+            get(explorer_api::decode_receipt),
+        )
         .route("/explore/{*path}", get(explorer::index))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
