@@ -583,7 +583,7 @@ async function renderReceiptPage(hash) {
   }
 
   const body = hexBody(hash);
-  const [txRows, logRows] = await Promise.all([
+  const [txRows, logRows, decodePayload] = await Promise.all([
     runQuery(`
       SELECT
         txs.block_num,
@@ -625,6 +625,9 @@ async function renderReceiptPage(hash) {
       ORDER BY log_idx ASC
       LIMIT 250
     `),
+    tryFetchExplorerJson(
+      `/explore/api/receipt/${hash}/decode?chainId=${encodeURIComponent(state.chainId)}`,
+    ),
   ]);
 
   const tx = txRows[0];
@@ -633,20 +636,13 @@ async function renderReceiptPage(hash) {
     return;
   }
 
-  const verificationAddress = tx.to_addr ? with0x(tx.to_addr) : tx.contract_address ? with0x(tx.contract_address) : null;
-  const verificationPayload = verificationAddress
-    ? await tryFetchExplorerJson(
-        `/explore/api/contract/${verificationAddress}/verification?chainId=${encodeURIComponent(state.chainId)}`,
-      )
-    : null;
-
   setDocumentTitle(`Receipt ${shortHex(hash)} · Igra Explorer`);
 
   const statusKind = tx.status === null ? "pending" : Number(tx.status) === 1 ? "success" : "failed";
   const gasFee = multiplyNumericStrings(tx.gas_used, tx.effective_gas_price);
-  const decodedInput = decodeCallData(tx.input_data);
-  const selector = tx.selector ? with0x(tx.selector) : decodedInput?.selector || null;
-  const methodLabel = resolveMethodLabel(selector, verificationPayload, decodedInput);
+  const decodedInput = decodePayload?.call || decodeCallData(tx.input_data);
+  const selector = decodedInput?.selector || (tx.selector ? with0x(tx.selector) : null);
+  const methodLabel = decodedInput?.label || methodName(selector);
   const inputLength = tx.input_data ? Math.max(0, tx.input_data.length / 2) : 0;
 
   elements.pageRoot.innerHTML = `
@@ -708,7 +704,7 @@ async function renderReceiptPage(hash) {
               </div>
             </div>
             <div class="panel-body table-wrap">
-              ${renderLogsTable(logRows)}
+              ${renderLogsTable(logRows, decodePayload?.logs || [])}
             </div>
           </section>
         </div>
@@ -1416,24 +1412,35 @@ function renderTokensTable(rows) {
   `;
 }
 
-function renderLogsTable(rows) {
+function renderLogsTable(rows, decodedLogs = []) {
   if (!rows.length) {
     return '<div class="empty-state">No logs recorded for this receipt.</div>';
   }
 
+  const decodedByIndex = new Map(
+    (Array.isArray(decodedLogs) ? decodedLogs : []).map((entry) => [Number(entry.log_idx), entry]),
+  );
+
   const body = rows
-    .map(
-      (row) => `
+    .map((row) => {
+      const decoded = decodedByIndex.get(Number(row.log_idx)) || null;
+      const eventLabel = decoded?.label || eventName(row.topic0);
+      const eventSignature = decoded?.signature || null;
+      const decodedSummary = renderDecodedArgsPreview(decoded);
+      return `
         <tr>
           <td class="mono">${formatNumber(row.log_idx)}</td>
           <td class="mono"><a href="/explore/address/${with0x(row.address)}?tab=contract">${escapeHtml(shortHex(with0x(row.address), 8))}</a></td>
-          <td>${escapeHtml(eventName(row.topic0))}</td>
-          <td class="mono">${row.topic1 ? escapeHtml(shortHex(with0x(row.topic1), 10)) : '<span class="text-secondary">-</span>'}</td>
-          <td class="mono">${row.topic2 ? escapeHtml(shortHex(with0x(row.topic2), 10)) : '<span class="text-secondary">-</span>'}</td>
+          <td>
+            <div class="table-primary-cell">${escapeHtml(eventLabel)}</div>
+            <div class="table-secondary-cell mono">${escapeHtml(eventSignature || with0x(row.topic0) || "-")}</div>
+          </td>
+          <td>${decodedSummary}</td>
+          <td>${renderDecodeSourceInline(decoded)}</td>
           <td class="align-right mono">${formatNumber(row.data_length || 0)}</td>
         </tr>
-      `,
-    )
+      `;
+    })
     .join("");
 
   return `
@@ -1444,8 +1451,8 @@ function renderLogsTable(rows) {
             <th>Index</th>
             <th>Address</th>
             <th>Event</th>
-            <th>Topic1</th>
-            <th>Topic2</th>
+            <th>Decoded</th>
+            <th>Source</th>
             <th class="align-right">Data bytes</th>
           </tr>
         </thead>
@@ -1536,16 +1543,53 @@ function renderReadContractPanel(address, functions) {
 function renderInputPanel(inputData, decodedInput) {
   const rawInput = with0x(inputData);
   const decodedRows = decodedInput?.args || [];
+  const sourceMeta = decodedInput?.decode_source
+    ? `
+      <section class="subpanel-card">
+        <div class="subpanel-title">Decoder</div>
+        <div class="definition-list">
+          ${renderDefinitionItem("Source", escapeHtml(humanizeDecodeSource(decodedInput.decode_source)))}
+          ${renderDefinitionItem("Confidence", escapeHtml(decodedInput.confidence || "-"))}
+          ${renderDefinitionItem("Family", escapeHtml(decodedInput.protocol_family || "-"))}
+          ${renderDefinitionItem("Pack", escapeHtml(decodedInput.protocol_pack || "-"))}
+          ${
+            Array.isArray(decodedInput.alternatives) && decodedInput.alternatives.length
+              ? renderDefinitionItem("Alternatives", escapeHtml(decodedInput.alternatives.join(" · ")))
+              : ""
+          }
+          ${
+            Array.isArray(decodedInput.notes) && decodedInput.notes.length
+              ? renderDefinitionItem("Notes", escapeHtml(decodedInput.notes.join(" ")))
+              : ""
+          }
+        </div>
+      </section>
+    `
+    : "";
 
   return `
     <div class="panel-stack panel-stack-tight">
+      ${sourceMeta}
       ${
         decodedRows.length
           ? `
             <section class="subpanel-card">
               <div class="subpanel-title">Decoded arguments</div>
               <div class="definition-list">
-                ${decodedRows.map((arg) => renderDefinitionItem(`${arg.label} · ${arg.type}`, arg.href ? renderMonoLink(arg.href, arg.display || arg.value, false) : arg.display || arg.value)).join("")}
+                ${decodedRows
+                  .map((arg, index) => {
+                    const label = arg.name || arg.label || `arg${index}`;
+                    const kind = arg.kind || arg.type || "unknown";
+                    const value = arg.href
+                      ? renderMonoLink(arg.href, arg.display || arg.value, false)
+                      : escapeHtml(arg.display || arg.value || "-");
+                    const note = arg.note ? `<div class="table-secondary-cell">${escapeHtml(arg.note)}</div>` : "";
+                    return renderDefinitionItem(
+                      `${label} · ${kind}${arg.indexed ? " · indexed" : ""}`,
+                      `<span>${value}</span>${note}`,
+                    );
+                  })
+                  .join("")}
               </div>
             </section>
           `
@@ -1573,7 +1617,10 @@ function renderContractMethodsTable(rows, verificationPayload) {
     .map(
       (row) => `
         <tr>
-          <td class="mono">${escapeHtml(resolveMethodLabel(row.selector, verificationPayload) || "Unknown")}</td>
+          <td>
+            <div class="table-primary-cell mono">${escapeHtml(row.method_label || resolveMethodLabel(row.selector, verificationPayload) || "Unknown")}</div>
+            <div class="table-secondary-cell">${escapeHtml(humanizeDecodeSource(row.decode_source || "unknown"))}${row.protocol_pack ? ` · ${escapeHtml(row.protocol_pack)}` : ""}</div>
+          </td>
           <td class="mono">${escapeHtml(row.selector)}</td>
           <td class="align-right mono">${formatNumber(row.call_count || 0)}</td>
           <td class="align-right mono">${formatNumber(row.success_count || 0)}</td>
@@ -2306,6 +2353,53 @@ function methodName(selector) {
     return "No selector";
   }
   return KNOWN_METHODS[normalized]?.label || "Unknown";
+}
+
+function humanizeDecodeSource(value) {
+  switch (String(value || "")) {
+    case "verified_abi":
+      return "Verified ABI";
+    case "signature_registry":
+      return "Signature registry";
+    default:
+      return "Unknown";
+  }
+}
+
+function renderDecodedArgsPreview(decoded) {
+  if (!decoded) {
+    return '<span class="text-secondary">No decoder</span>';
+  }
+
+  const args = Array.isArray(decoded.args) ? decoded.args : [];
+  if (!args.length) {
+    return '<span class="text-secondary">No decoded args</span>';
+  }
+
+  const preview = args
+    .slice(0, 2)
+    .map((arg, index) => {
+      const label = arg.name || arg.label || `arg${index}`;
+      return `${label}=${arg.display || arg.value || "-"}`;
+    })
+    .join(" · ");
+  const suffix = args.length > 2 ? ` +${args.length - 2} more` : "";
+  return `<span class="mono wrap-anywhere">${escapeHtml(`${preview}${suffix}`)}</span>`;
+}
+
+function renderDecodeSourceInline(decoded) {
+  if (!decoded) {
+    return '<span class="text-secondary">Unknown</span>';
+  }
+
+  const parts = [humanizeDecodeSource(decoded.decode_source)];
+  if (decoded.protocol_family) {
+    parts.push(decoded.protocol_family);
+  }
+  if (decoded.protocol_pack) {
+    parts.push(decoded.protocol_pack);
+  }
+  return escapeHtml(parts.join(" · "));
 }
 
 function selectorSignature(selector, verificationPayload) {
