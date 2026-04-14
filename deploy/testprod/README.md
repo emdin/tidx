@@ -149,7 +149,10 @@ Provisioned Grafana resources:
 - `Prometheus` datasource pointed at `prometheus:9090`
 - `Igra ClickHouse Analytics` dashboard
 - `Igra Financial Overview` dashboard
+- `Igra Rollup Health` dashboard
+- `Igra Application Activity` dashboard
 - `Igra Investigator Workbench` dashboard
+- `Igra Risk Monitor` dashboard
 
 ## Explorer Admin Writes
 

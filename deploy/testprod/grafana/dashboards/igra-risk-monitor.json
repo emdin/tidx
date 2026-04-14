@@ -1,0 +1,153 @@
+{
+  "annotations": { "list": [] },
+  "description": "Operational and security monitoring dashboard for Igra. Tracks failed transactions, deployment bursts, large native transfers, and abnormal sender/selector concentrations.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 200 }, { "color": "red", "value": 500 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT uniqExactIf(tx_hash, status = 0) AS failed_txs_24h FROM receipts WHERE block_timestamp >= now() - INTERVAL 1 DAY", "refId": "A" } ],
+      "title": "Failed Txs (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 60 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT uniqExactIf(tx_hash, contract_address IS NOT NULL) AS deployments_24h FROM receipts WHERE block_timestamp >= now() - INTERVAL 1 DAY", "refId": "A" } ],
+      "title": "Deployments (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 100 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT countIf(native_value >= 1000) AS whale_native_txs_24h FROM (SELECT hash, max(toFloat64(value)) / 1e18 AS native_value FROM txs WHERE block_timestamp >= now() - INTERVAL 1 DAY GROUP BY hash)", "refId": "A" } ],
+      "title": "Large Native Transfers (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 10 }, { "color": "red", "value": 25 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT uniqExactIf(\"from\", status = 0) AS distinct_failed_senders_24h FROM receipts WHERE block_timestamp >= now() - INTERVAL 1 DAY", "refId": "A" } ],
+      "title": "Distinct Failed Senders (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 1, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT toDate(block_timestamp) AS time, uniqExactIf(tx_hash, status = 0) AS failed_txs FROM receipts WHERE block_timestamp >= now() - INTERVAL 30 DAY GROUP BY time ORDER BY time", "refId": "A" } ],
+      "title": "Daily Failed Transactions (30d)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 65, "lineWidth": 1, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT toDate(block_timestamp) AS time, uniqExactIf(tx_hash, contract_address IS NOT NULL) AS deployments FROM receipts WHERE block_timestamp >= now() - INTERVAL 30 DAY GROUP BY time ORDER BY time", "refId": "A" } ],
+      "title": "Daily Deployments (30d)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 18, "lineWidth": 2, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT time, countIf(native_value >= 1000) AS whale_native_txs FROM (SELECT toDate(block_timestamp) AS time, hash, max(toFloat64(value)) / 1e18 AS native_value FROM txs WHERE block_timestamp >= now() - INTERVAL 30 DAY GROUP BY time, hash) GROUP BY time ORDER BY time", "refId": "A" } ],
+      "title": "Daily Large Native Transfers (30d)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 18, "lineWidth": 2, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT toDate(block_timestamp) AS time, uniqExactIf(\"from\", status = 0) AS failed_senders FROM receipts WHERE block_timestamp >= now() - INTERVAL 30 DAY GROUP BY time ORDER BY time", "refId": "A" } ],
+      "title": "Daily Distinct Failed Senders (30d)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT \"from\" AS sender, uniqExactIf(tx_hash, status = 0) AS failed_txs FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY sender ORDER BY failed_txs DESC LIMIT 10", "refId": "A" } ],
+      "title": "Top Failed Senders (7d)",
+      "type": "barchart"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT substring(txs.input, 1, 10) AS selector, uniqExact(txs.hash) AS failed_txs FROM txs INNER JOIN receipts ON txs.hash = receipts.tx_hash WHERE receipts.status = 0 AND txs.block_timestamp >= now() - INTERVAL 7 DAY GROUP BY selector ORDER BY failed_txs DESC LIMIT 10", "refId": "A" } ],
+      "title": "Top Failed Selectors (7d)",
+      "type": "barchart"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT \"from\" AS deployer, uniqExactIf(tx_hash, contract_address IS NOT NULL) AS deployments FROM receipts WHERE block_timestamp >= now() - INTERVAL 7 DAY GROUP BY deployer ORDER BY deployments DESC LIMIT 10", "refId": "A" } ],
+      "title": "Top Deployers (7d)",
+      "type": "barchart"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 28 },
+      "id": 12,
+      "options": { "showHeader": true },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT max(block_num) AS block_num, hash, any(\"from\") AS sender, any(\"to\") AS recipient, round(max(toFloat64(value)) / 1e18, 4) AS native_value, max(gas_used) AS gas_used FROM txs WHERE block_timestamp >= now() - INTERVAL 1 DAY GROUP BY hash ORDER BY native_value DESC LIMIT 20", "refId": "A" } ],
+      "title": "Largest Native Transfers (24h)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 28 },
+      "id": 13,
+      "options": { "showHeader": true },
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT max(block_num) AS block_num, tx_hash, any(contract_address) AS deployed_contract, any(\"from\") AS deployer FROM receipts WHERE contract_address IS NOT NULL AND block_timestamp >= now() - INTERVAL 1 DAY GROUP BY tx_hash ORDER BY block_num DESC LIMIT 20", "refId": "A" } ],
+      "title": "Recent Deployments (24h)",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [ "igra", "clickhouse", "risk", "security" ],
+  "templating": { "list": [] },
+  "time": { "from": "now-30d", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Igra Risk Monitor",
+  "uid": "igra-risk-monitor",
+  "version": 1,
+  "weekStart": ""
+}
