@@ -247,7 +247,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT substring(input, 1, 10) AS selector, count() AS calls FROM txs WHERE `to` = '$contract_address' AND length(input) >= 10 GROUP BY selector ORDER BY calls DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, calls FROM (SELECT substring(input, 1, 10) AS selector_raw, count() AS calls FROM txs WHERE `to` = '$contract_address' AND length(input) >= 10 GROUP BY selector_raw ORDER BY calls DESC LIMIT 20)",
           "refId": "A"
         }
       ],
@@ -282,7 +282,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT substring(txs.input, 1, 10) AS selector, count() AS failed_calls FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE txs.`to` = '$contract_address' AND receipts.status = 0 AND length(txs.input) >= 10 GROUP BY selector ORDER BY failed_calls DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, failed_calls FROM (SELECT substring(txs.input, 1, 10) AS selector_raw, count() AS failed_calls FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE txs.`to` = '$contract_address' AND receipts.status = 0 AND length(txs.input) >= 10 GROUP BY selector_raw ORDER BY failed_calls DESC LIMIT 20)",
           "refId": "A"
         }
       ],
@@ -352,7 +352,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT receipts.block_num, receipts.tx_hash, receipts.gas_used, txs.`from`, substring(txs.input, 1, 10) AS selector FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE txs.`to` = '$contract_address' ORDER BY receipts.gas_used DESC LIMIT 20",
+          "rawSql": "SELECT receipts.block_num, receipts.tx_hash, receipts.gas_used, txs.`from`, concat('0x​', substring(substring(txs.input, 1, 10), 3)) AS selector FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE txs.`to` = '$contract_address' ORDER BY receipts.gas_used DESC LIMIT 20",
           "refId": "A"
         }
       ],

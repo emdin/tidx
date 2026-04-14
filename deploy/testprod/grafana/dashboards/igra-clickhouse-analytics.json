@@ -456,7 +456,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT substring(input, 1, 10) AS selector, count() AS tx_count FROM txs WHERE length(input) >= 10 GROUP BY selector ORDER BY tx_count DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, tx_count FROM (SELECT substring(input, 1, 10) AS selector_raw, count() AS tx_count FROM txs WHERE length(input) >= 10 GROUP BY selector_raw ORDER BY tx_count DESC LIMIT 20)",
           "refId": "A"
         }
       ],

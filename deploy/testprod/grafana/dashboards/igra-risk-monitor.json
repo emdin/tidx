@@ -104,7 +104,7 @@
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
       "id": 10,
       "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
-      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT substring(txs.input, 1, 10) AS selector, uniqExact(txs.hash) AS failed_txs FROM txs INNER JOIN receipts ON txs.hash = receipts.tx_hash WHERE receipts.status = 0 AND txs.block_timestamp >= now() - INTERVAL 7 DAY GROUP BY selector ORDER BY failed_txs DESC LIMIT 10", "refId": "A" } ],
+      "targets": [ { "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" }, "editorType": "sql", "format": 1, "queryType": "table", "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, failed_txs FROM (SELECT substring(txs.input, 1, 10) AS selector_raw, uniqExact(txs.hash) AS failed_txs FROM txs INNER JOIN receipts ON txs.hash = receipts.tx_hash WHERE receipts.status = 0 AND txs.block_timestamp >= now() - INTERVAL 7 DAY GROUP BY selector_raw ORDER BY failed_txs DESC LIMIT 10)", "refId": "A" } ],
       "title": "Top Failed Selectors (7d)",
       "type": "barchart"
     },
