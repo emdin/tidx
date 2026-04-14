@@ -4,6 +4,7 @@ This bundle deploys a single-host `igra` test-prod environment with:
 
 - `caddy` for public TLS termination
 - `tidx` from your local `igra` branch/image
+- `blockscout-importer` to keep verified contracts synced from the public Igra Blockscout
 - `postgres` for primary chain data
 - `clickhouse` for OLAP / analytics queries
 - `prometheus` for scraping metrics
@@ -84,6 +85,8 @@ Fields you must review:
 - `EXPLORER_DOMAIN`
 - `EXPLORER_BASE_URL`
 - `LETSENCRYPT_EMAIL`
+- `BLOCKSCOUT_SOURCE_URL`
+- `BLOCKSCOUT_IMPORT_INTERVAL_SECONDS`
 - `POSTGRES_PASSWORD`
 - `GRAFANA_ADMIN_PASSWORD`
 - `trusted_cidrs`
@@ -115,6 +118,10 @@ docker compose logs -f caddy
   - OLAP store for large scans and analytical queries
 - `tidx`
   - indexer + explorer API + explorer frontend
+- `blockscout-importer`
+  - runs `tidx import-blockscout` on a loop against `https://explorer.igralabs.com`
+  - imports historical verified contracts on first run
+  - keeps newly verified contracts synced into the local explorer after that
 - `prometheus`
   - scrapes `/metrics` from `tidx`
 - `grafana`
@@ -181,6 +188,9 @@ If you leave `trusted_cidrs` empty, only loopback is trusted.
 - Your RPC currently blocks `eth_getBlockReceipts`.
   - `tidx` will fall back to batched `eth_getTransactionReceipt`.
   - This works, but it is slower than block-level receipt fetching.
+- Verified contract source and ABI are imported from the canonical Igra Blockscout.
+  - The first importer run backfills old verified contracts.
+  - Later runs skip already imported contracts and only pick up new ones.
 - ClickHouse is enabled in this bundle because you asked for the whole package.
   - The explorer can run without it, but analytics and heavier scans benefit from it.
 
@@ -192,6 +202,12 @@ After startup:
 curl https://explore-test.igralabs.com/health
 curl https://explore-test.igralabs.com/status
 curl "https://explore-test.igralabs.com/explore/api/tokens?chainId=38833&limit=5"
+```
+
+Blockscout importer logs:
+
+```bash
+docker compose logs -f blockscout-importer
 ```
 
 If DNS is not ready yet, run the same checks locally on the server with:

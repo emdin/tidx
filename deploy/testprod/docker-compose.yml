@@ -91,6 +91,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  blockscout-importer:
+    image: ${TIDX_IMAGE}
+    entrypoint:
+      - /bin/sh
+      - /usr/local/bin/run-blockscout-import.sh
+    volumes:
+      - ./run-blockscout-import.sh:/usr/local/bin/run-blockscout-import.sh:ro
+    environment:
+      BLOCKSCOUT_LOCAL_URL: http://tidx:8080
+      BLOCKSCOUT_SOURCE_URL: ${BLOCKSCOUT_SOURCE_URL:-https://explorer.igralabs.com}
+      BLOCKSCOUT_CHAIN_ID: ${BLOCKSCOUT_CHAIN_ID:-38833}
+      BLOCKSCOUT_IMPORT_INTERVAL_SECONDS: ${BLOCKSCOUT_IMPORT_INTERVAL_SECONDS:-900}
+      RUST_LOG: ${RUST_LOG}
+      RUST_LOG_FORMAT: ${RUST_LOG_FORMAT}
+    depends_on:
+      tidx:
+        condition: service_started
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     ports:
