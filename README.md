@@ -7,47 +7,85 @@
 </p>
 
 <p align="center">
+  <a href="https://igralabs.com">Website</a> •
+  <a href="https://igra-labs.gitbook.io/igralabs-docs">Docs</a> •
+  <a href="https://explorer.igralabs.com">Explorer</a> •
   <a href="#quickstart">Quickstart</a> •
   <a href="#installation">Installation</a> •
   <a href="#configuration">Configuration</a> •
-  <a href="#cli-reference">CLI</a> •
   <a href="#http-api">API</a> •
-  <a href="#query-cookbook">Queries</a>
+  <a href="#sync-architecture">Sync</a>
 </p>
 
 ---
 
-**tidx** indexes EVM and reth-based L2 chain data into a hybrid PostgreSQL + ClickHouse architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP).
+**tidx** is the chain data indexer behind the Igra explorer and analytics stack. It ingests blocks, transactions, receipts, logs, token activity, and contract metadata from Igra Network and other EVM / reth-based chains into PostgreSQL and ClickHouse for fast serving and deep analytics.
+
+Igra Network is positioned by Igra Labs as an Ethereum-compatible programmable layer on Kaspa BlockDAG, combining Ethereum's flexibility with Bitcoin-grade proof-of-work security. In practice, `tidx` is the data plane that makes that chain operable: explorer pages, Grafana dashboards, token analytics, investigator workflows, and chain monitoring all sit on top of it.
 
 ## Features
 
-- **Dual Storage** — PostgreSQL (OLTP) + ClickHouse (OLAP), written in parallel
-- **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
-- **HTTP API + CLI** — Query data via REST, SQL, or command line
+- **Igra-first indexing** — Built to serve explorer, dashboard, and investigation workloads for Igra Network
+- **Dual Storage** — PostgreSQL for transactional lookups, ClickHouse for analytics and large scans
+- **Explorer + API Surface** — One binary serves sync, SQL API, explorer routes, metrics, and admin metadata endpoints
 - **RPC Compatibility** — Uses `eth_getBlockReceipts` when available and falls back to batched `eth_getTransactionReceipt` for stricter L2 RPCs
+- **Reorg-aware sync** — Validates canonical history and repairs orphaned segments when the upstream chain reorgs
+- **Lazy decoding** — Query decoded events or calldata by ABI signature without pre-registering contracts
+- **Operational visibility** — Prometheus, Grafana, ClickHouse dashboards, and investigator query packs are included in-repo
 
 ## Table of Contents
 
+- [Igra Context](#igra-context)
 - [Quickstart](#quickstart)
 - [Overview](#overview)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [CLI](#cli)
 - [HTTP API](#http-api)
-- [Database Schema](#database-schema)
+- [Schemas](#schemas)
 - [Sync Architecture](#sync-architecture)
 - [Development](#development)
 - [License](#license)
 
+## Igra Context
+
+Igra Labs describes Igra Network as a programmable layer on Kaspa BlockDAG. The public site and docs emphasize a few ideas that matter directly to this indexer:
+
+- **EVM compatibility** — explorer, contract, token, and wallet flows need to look and feel familiar to Ethereum users
+- **Proof-of-work / BlockDAG context** — indexing must tolerate non-trivial chain reorg behavior, which is why this fork leans on reorg validation and recovery
+- **IgReth execution client** — the stack is designed for reth-based execution, but remains usable against generic EVM RPC endpoints
+- **Operator-grade visibility** — public explorer pages are only part of the story; the same indexed data powers dashboards, financial views, and security investigations
+
+Official Igra links:
+
+- Website: <https://igralabs.com>
+- Docs: <https://igra-labs.gitbook.io/igralabs-docs>
+- Explorer: <https://explorer.igralabs.com>
+- Governance: <https://governance.igralabs.com>
+
 ## Quickstart
 
 ```bash
-curl -L https://tidx.vercel.app/docker | bash
+git clone https://github.com/reshmem/tidx.git
+cd tidx
+git checkout igra
+
+# create a config from scratch or copy deploy/testprod/config.toml
+cargo run -- init --output config.toml
+
+# start the indexer + HTTP API + explorer
+cargo run -- up --config ./config.toml
 ```
 
 ## Overview
 
-The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `engine` query parameter to choose which backend to query:
+At Igra, `tidx` is meant to sit between the chain RPC and everything user-facing:
+
+- the explorer reads recent blocks, transactions, receipts, logs, labels, and contract metadata
+- Grafana uses ClickHouse for rankings, trend charts, and investigator drilldowns
+- operations use `/status`, Prometheus metrics, and PostgreSQL sync state to monitor lag and gaps
+
+The sync engine writes to PostgreSQL and ClickHouse in parallel. Use the `engine` query parameter to choose which backend to query:
 
 ```
                                               ┌─────────────────────┐
@@ -106,15 +144,23 @@ curl "https://tidx.example.com/query \
 ### Docker
 
 ```bash
-docker pull ghcr.io/tempoxyz/tidx:latest
-docker run -v $(pwd)/config.toml:/config.toml ghcr.io/tempoxyz/tidx up
+git clone https://github.com/reshmem/tidx.git
+cd tidx
+git checkout igra
+docker build -t reshmem/tidx:igra .
+
+docker run \
+  -v "$(pwd)/config.toml:/config.toml" \
+  reshmem/tidx:igra \
+  up --config /config.toml
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/tempoxyz/tidx
+git clone https://github.com/reshmem/tidx.git
 cd tidx
+git checkout igra
 cargo build --release
 ```
 
@@ -608,4 +654,4 @@ make clean             Stop services and clean
 ## Acknowledgments
 
 - [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for everything.
-
+- Thanks to the Tempo team for sharing the original project and making this fork practical to build on.
