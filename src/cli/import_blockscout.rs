@@ -66,7 +66,7 @@ struct BlockscoutSourceEntry {
     #[serde(rename = "Address")]
     address: String,
     #[serde(rename = "CompilerSettings", default)]
-    compiler_settings: Option<String>,
+    compiler_settings: Option<Value>,
     #[serde(rename = "CompilerVersion", default)]
     compiler_version: Option<String>,
     #[serde(rename = "ContractName", default)]
@@ -76,11 +76,11 @@ struct BlockscoutSourceEntry {
     #[serde(rename = "FileName", default)]
     file_name: Option<String>,
     #[serde(rename = "IsProxy", default)]
-    is_proxy: Option<String>,
+    is_proxy: Option<Value>,
     #[serde(rename = "OptimizationRuns", default)]
-    optimization_runs: Option<String>,
+    optimization_runs: Option<Value>,
     #[serde(rename = "OptimizationUsed", default)]
-    optimization_used: Option<String>,
+    optimization_used: Option<Value>,
     #[serde(rename = "SourceCode", default)]
     source_code: Option<String>,
 }
@@ -257,11 +257,14 @@ async fn import_one(
         source_code,
         language: Some("Solidity".to_string()),
         compiler_version: source_entry.compiler_version.clone(),
-        optimization_enabled: parse_boolish(source_entry.optimization_used.as_deref()),
+        optimization_enabled: source_entry
+            .optimization_used
+            .as_ref()
+            .and_then(parse_boolish_value),
         optimization_runs: source_entry
             .optimization_runs
-            .as_deref()
-            .and_then(|value| value.parse::<i32>().ok()),
+            .as_ref()
+            .and_then(parse_i32_value),
         license: None,
         constructor_args: None,
         metadata: Some(json!({
@@ -269,10 +272,7 @@ async fn import_one(
             "source_explorer": args.source_url.trim_end_matches('/'),
             "imported_address": address,
             "blockscout": source_entry,
-            "compiler_settings": source_entry
-                .compiler_settings
-                .as_deref()
-                .and_then(parse_jsonish),
+            "compiler_settings": source_entry.compiler_settings.clone(),
         })),
     };
 
@@ -370,20 +370,25 @@ fn compose_source_code(entry: &BlockscoutSourceEntry) -> Option<String> {
     }
 }
 
-fn parse_boolish(value: Option<&str>) -> Option<bool> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Some(true),
-        "0" | "false" | "no" => Some(false),
+fn parse_boolish_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(inner) => Some(*inner),
+        Value::Number(inner) => inner.as_i64().map(|number| number != 0),
+        Value::String(inner) => match inner.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn parse_jsonish(value: &str) -> Option<Value> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
+fn parse_i32_value(value: &Value) -> Option<i32> {
+    match value {
+        Value::Number(inner) => inner.as_i64().and_then(|number| i32::try_from(number).ok()),
+        Value::String(inner) => inner.trim().parse::<i32>().ok(),
+        _ => None,
     }
-    serde_json::from_str(trimmed).ok()
 }
 
 fn normalize_address(value: &str) -> Result<String> {
