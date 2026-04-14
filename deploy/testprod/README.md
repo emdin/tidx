@@ -148,6 +148,7 @@ Provisioned Grafana resources:
 - `ClickHouse` datasource pointed at the internal `clickhouse:8123`
 - `Prometheus` datasource pointed at `prometheus:9090`
 - `Igra ClickHouse Analytics` dashboard
+- `Igra Financial Overview` dashboard
 - `Igra Investigator Workbench` dashboard
 
 ## Explorer Admin Writes
