@@ -345,7 +345,15 @@ pub struct ContractVerificationResponse {
     pub address: String,
     pub label: Option<AddressLabel>,
     pub verification: Option<ContractVerificationDetail>,
+    pub functions: Vec<AbiFunctionSignature>,
     pub read_functions: Vec<ReadFunctionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AbiFunctionSignature {
+    pub name: String,
+    pub signature: String,
+    pub selector: String,
 }
 
 #[derive(Serialize)]
@@ -617,6 +625,11 @@ pub async fn contract_verification(
         .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {chain_id}")))?;
     let label = load_address_label(&pool, &normalized).await?;
     let verification = load_contract_verification(&pool, &normalized).await?;
+    let functions = verification
+        .as_ref()
+        .and_then(|record| parse_json_abi(&record.abi).ok())
+        .map(all_functions_from_abi)
+        .unwrap_or_default();
     let read_functions = verification
         .as_ref()
         .and_then(|record| parse_json_abi(&record.abi).ok())
@@ -629,6 +642,7 @@ pub async fn contract_verification(
         address: normalized,
         label,
         verification,
+        functions,
         read_functions,
     }))
 }
@@ -1739,6 +1753,22 @@ fn read_functions_from_abi(abi: JsonAbi) -> Vec<ReadFunctionInfo> {
         })
         .map(|function| read_function_info(&function))
         .collect()
+}
+
+fn all_functions_from_abi(abi: JsonAbi) -> Vec<AbiFunctionSignature> {
+    let mut functions: Vec<_> = abi
+        .functions
+        .into_values()
+        .flatten()
+        .map(|function| AbiFunctionSignature {
+            name: function.name.clone(),
+            signature: function.signature(),
+            selector: format!("0x{}", hex::encode(function.selector())),
+        })
+        .collect();
+
+    functions.sort_by(|left, right| left.signature.cmp(&right.signature));
+    functions
 }
 
 fn read_function_info(function: &Function) -> ReadFunctionInfo {

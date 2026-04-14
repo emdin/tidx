@@ -630,13 +630,20 @@ async function renderReceiptPage(hash) {
     return;
   }
 
+  const verificationAddress = tx.to_addr ? with0x(tx.to_addr) : tx.contract_address ? with0x(tx.contract_address) : null;
+  const verificationPayload = verificationAddress
+    ? await tryFetchExplorerJson(
+        `/explore/api/contract/${verificationAddress}/verification?chainId=${encodeURIComponent(state.chainId)}`,
+      )
+    : null;
+
   setDocumentTitle(`Receipt ${shortHex(hash)} · Igra Explorer`);
 
   const statusKind = tx.status === null ? "pending" : Number(tx.status) === 1 ? "success" : "failed";
   const gasFee = multiplyNumericStrings(tx.gas_used, tx.effective_gas_price);
   const decodedInput = decodeCallData(tx.input_data);
   const selector = tx.selector ? with0x(tx.selector) : decodedInput?.selector || null;
-  const methodLabel = decodedInput?.label || methodName(selector);
+  const methodLabel = resolveMethodLabel(selector, verificationPayload, decodedInput);
   const inputLength = tx.input_data ? Math.max(0, tx.input_data.length / 2) : 0;
 
   elements.pageRoot.innerHTML = `
@@ -1247,7 +1254,7 @@ function renderContractPanel(address, kind, summary, rows, inspect, methodsPaylo
       }
       <section class="subpanel-card">
         <div class="subpanel-title">Top methods</div>
-        ${renderContractMethodsTable(methods)}
+        ${renderContractMethodsTable(methods, verificationPayload)}
       </section>
       <div class="table-wrap">
         <table class="data-table">
@@ -1554,7 +1561,7 @@ function renderInputPanel(inputData, decodedInput) {
   `;
 }
 
-function renderContractMethodsTable(rows) {
+function renderContractMethodsTable(rows, verificationPayload) {
   if (!rows.length) {
     return '<div class="empty-mini">No method selectors have been indexed for this contract yet.</div>';
   }
@@ -1563,7 +1570,7 @@ function renderContractMethodsTable(rows) {
     .map(
       (row) => `
         <tr>
-          <td class="mono">${escapeHtml(methodName(row.selector))}</td>
+          <td class="mono">${escapeHtml(resolveMethodLabel(row.selector, verificationPayload) || "Unknown")}</td>
           <td class="mono">${escapeHtml(row.selector)}</td>
           <td class="align-right mono">${formatNumber(row.call_count || 0)}</td>
           <td class="align-right mono">${formatNumber(row.success_count || 0)}</td>
@@ -2295,7 +2302,30 @@ function methodName(selector) {
   if (!normalized) {
     return "No selector";
   }
-  return KNOWN_METHODS[normalized]?.label || normalized;
+  return KNOWN_METHODS[normalized]?.label || "Unknown";
+}
+
+function selectorSignature(selector, verificationPayload) {
+  const normalized = with0x(selector);
+  if (!normalized) {
+    return null;
+  }
+
+  const functions = Array.isArray(verificationPayload?.functions) ? verificationPayload.functions : [];
+  const match = functions.find((fn) => with0x(fn.selector) === normalized);
+  return match?.signature || null;
+}
+
+function resolveMethodLabel(selector, verificationPayload, decodedInput) {
+  const normalized = with0x(selector);
+  if (!normalized) {
+    return null;
+  }
+
+  return selectorSignature(normalized, verificationPayload)
+    || decodedInput?.label
+    || KNOWN_METHODS[normalized]?.label
+    || "Unknown";
 }
 
 function setDocumentTitle(title) {
@@ -2522,7 +2552,7 @@ function decodeCallData(inputData) {
   const slots = body.match(/.{1,64}/g) || [];
 
   if (!spec) {
-    return { selector, label: selector, args: [] };
+    return { selector, label: null, args: [] };
   }
 
   const args = spec.args.map((arg, index) => decodeInputArg(arg, slots[index]));
