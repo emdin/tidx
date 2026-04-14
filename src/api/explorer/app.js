@@ -323,9 +323,10 @@ async function renderHomePage() {
   const latest = state.status?.synced_num ?? state.status?.tip_num ?? null;
   const lag = Math.max(Number(state.status?.lag || 0), 0);
   const syncRate = state.status?.sync_rate ? `${formatRate(state.status.sync_rate)} blk/s` : null;
+  const chainLabel = formatChainId(state.chainId);
 
   const statusParts = [
-    `Chain ${formatNumber(state.chainId || 0)}`,
+    `Chain ${chainLabel}`,
     latest ? `synced to block ${formatNumber(latest)}` : null,
     lag > 0 ? `${formatNumber(lag)} lag` : null,
     syncRate,
@@ -381,13 +382,14 @@ async function renderBlocksPage(page) {
   `);
 
   const latest = state.status?.synced_num ?? state.status?.tip_num ?? 0;
+  const chainLabel = formatChainId(state.chainId);
 
   elements.pageRoot.innerHTML = `
     <section class="content-page">
       <header class="page-header">
         <div class="badge-row">
           <span class="status-pill">Live</span>
-          <span class="muted-badge mono">Chain ${formatNumber(state.chainId || 0)}</span>
+          <span class="muted-badge mono">Chain ${chainLabel}</span>
           <span class="muted-badge mono">Head ${formatNumber(latest)}</span>
         </div>
         <div>
@@ -2466,6 +2468,15 @@ function formatNumber(value) {
     return String(value ?? "-");
   }
   return new Intl.NumberFormat("en-US").format(num);
+}
+
+function formatChainId(value) {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+
+  const raw = String(value).trim();
+  return /^\d+$/.test(raw) ? raw : formatNumber(raw);
 }
 
 function formatNumericString(value) {
