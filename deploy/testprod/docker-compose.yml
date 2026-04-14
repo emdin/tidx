@@ -1,6 +1,9 @@
 services:
   caddy:
     image: caddy:2.8-alpine
+    environment:
+      EXPLORER_DOMAIN: ${EXPLORER_DOMAIN}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
     ports:
       - "80:80"
       - "443:443"
