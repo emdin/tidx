@@ -1,0 +1,49 @@
+groups:
+  - name: tidx_sync
+    rules:
+      - alert: TidxSyncLagHigh
+        expr: tidx_sync_lag_blocks > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sync lag high on chain {{ $labels.chain_id }}"
+          description: "PostgreSQL is {{ $value }} blocks behind chain head"
+
+      - alert: TidxSyncLagCritical
+        expr: tidx_sync_lag_blocks > 100
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sync lag critical on chain {{ $labels.chain_id }}"
+          description: "PostgreSQL is {{ $value }} blocks behind chain head"
+
+      - alert: TidxSyncStalled
+        expr: tidx_sync_blocks_per_second == 0 and tidx_sync_lag_blocks > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sync stalled on chain {{ $labels.chain_id }}"
+          description: "No blocks synced in 5 minutes while lag remains positive"
+
+  - name: tidx_rpc
+    rules:
+      - alert: TidxRPCErrorRate
+        expr: rate(tidx_rpc_requests_total{success="false"}[5m]) / rate(tidx_rpc_requests_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High RPC error rate for {{ $labels.method }}"
+          description: "{{ $value | printf \"%.1f\" }}% of RPC requests are failing"
+
+      - alert: TidxRPCLatencyHigh
+        expr: histogram_quantile(0.99, rate(tidx_rpc_request_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High RPC latency for {{ $labels.method }}"
+          description: "p99 RPC latency is {{ $value | printf \"%.1f\" }}s"

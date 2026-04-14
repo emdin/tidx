@@ -1,0 +1,224 @@
+# Test-Prod Deployment Bundle
+
+This bundle deploys a single-host `igra` test-prod environment with:
+
+- `caddy` for public TLS termination
+- `tidx` from your local `igra` branch/image
+- `postgres` for primary chain data
+- `clickhouse` for OLAP / analytics queries
+- `prometheus` for scraping metrics
+- `grafana` for dashboards, bound to `127.0.0.1` by default
+
+It is intentionally opinionated:
+
+- only the explorer is public
+- PostgreSQL, ClickHouse, Prometheus, and Grafana are not public by default
+- admin explorer writes stay limited to `trusted_cidrs` from [config.toml](/Users/user/Source/igra/tidx/deploy/testprod/config.toml:1)
+
+## Recommended Host
+
+- Ubuntu 24.04
+- 8 vCPU
+- 32 GB RAM
+- 500 GB NVMe SSD
+- static public IPv4
+
+This is appropriate for a first serious `test-prod` environment. Increase disk first if you expect long retention and active ClickHouse usage.
+
+## DNS And Domain
+
+Create one public DNS record:
+
+- `A explore-test.igralabs.com -> <your server public IP>`
+
+Recommended DNS settings:
+
+- TTL: `300`
+- if you use Cloudflare, start with `DNS only`, not proxied
+
+Caddy will automatically request and renew the TLS certificate for `explore-test.igralabs.com` once:
+
+1. DNS resolves to the server
+2. ports `80` and `443` are reachable from the internet
+
+You do not need to provision certificates manually.
+
+## Firewall
+
+Open only:
+
+- `80/tcp`
+- `443/tcp`
+- `22/tcp` from office/VPN IPs only
+
+Do not open:
+
+- `5432`
+- `8123`
+- `9000`
+- `8080`
+- `9090`
+- `3000`
+
+The compose file keeps those services internal or bound to localhost only.
+
+## First Boot
+
+From the repo root on the target server:
+
+```bash
+git clone https://github.com/reshmem/tidx.git
+cd tidx
+git checkout igra
+cd deploy/testprod
+cp .env.example .env
+```
+
+Edit:
+
+- [.env.example](/Users/user/Source/igra/tidx/deploy/testprod/.env.example:1) copied to `.env`
+- [config.toml](/Users/user/Source/igra/tidx/deploy/testprod/config.toml:1)
+
+Fields you must review:
+
+- `EXPLORER_DOMAIN`
+- `LETSENCRYPT_EMAIL`
+- `POSTGRES_PASSWORD`
+- `GRAFANA_ADMIN_PASSWORD`
+- `trusted_cidrs`
+- `rpc_url` if your test-prod RPC endpoint changes
+
+Build and start:
+
+```bash
+docker compose build tidx
+docker compose up -d
+```
+
+Watch startup:
+
+```bash
+docker compose logs -f tidx
+docker compose logs -f caddy
+```
+
+## What Each Service Does
+
+- `caddy`
+  - serves `https://explore-test.igralabs.com`
+  - terminates TLS
+  - proxies traffic to `tidx:8080`
+- `postgres`
+  - primary OLTP store for blocks, txs, receipts, logs, explorer metadata
+- `clickhouse`
+  - OLAP store for large scans and analytical queries
+- `tidx`
+  - indexer + explorer API + explorer frontend
+- `prometheus`
+  - scrapes `/metrics` from `tidx`
+- `grafana`
+  - dashboard UI on `127.0.0.1:3000`
+
+## Access
+
+Public explorer:
+
+- `https://explore-test.igralabs.com`
+- the domain root redirects to `/explore`
+
+Grafana:
+
+- local on the host: `http://127.0.0.1:3000`
+- or via SSH tunnel:
+
+```bash
+ssh -L 3000:127.0.0.1:3000 user@your-server
+```
+
+Prometheus:
+
+- local on the host: `http://127.0.0.1:9091`
+
+## Explorer Admin Writes
+
+The explorer admin panel for:
+
+- labels
+- metadata refresh
+- contract verification imports
+
+is allowed only from `trusted_cidrs`.
+
+If you use Tailscale, a common setting is:
+
+```toml
+trusted_cidrs = ["100.64.0.0/10"]
+```
+
+If you leave `trusted_cidrs` empty, only loopback is trusted.
+
+## Runtime Notes
+
+- Keep `trust_rpc = false` for now.
+  - During local testing on April 13, 2026, the `igra` chain showed reorg handling in the live sync logs.
+- Your RPC currently blocks `eth_getBlockReceipts`.
+  - `tidx` will fall back to batched `eth_getTransactionReceipt`.
+  - This works, but it is slower than block-level receipt fetching.
+- ClickHouse is enabled in this bundle because you asked for the whole package.
+  - The explorer can run without it, but analytics and heavier scans benefit from it.
+
+## Smoke Checks
+
+After startup:
+
+```bash
+curl https://explore-test.igralabs.com/health
+curl https://explore-test.igralabs.com/status
+curl "https://explore-test.igralabs.com/explore/api/tokens?chainId=38833&limit=5"
+```
+
+If DNS is not ready yet, run the same checks locally on the server with:
+
+```bash
+curl http://127.0.0.1/health
+```
+
+or:
+
+```bash
+docker compose exec caddy wget -qO- http://tidx:8080/health
+```
+
+## Backups
+
+Minimum backup policy:
+
+- daily PostgreSQL logical dump
+- daily VM or disk snapshot
+- weekly ClickHouse volume snapshot
+
+PostgreSQL matters most. ClickHouse can be rebuilt from reindexing if necessary, but that takes time.
+
+## Upgrade Flow
+
+When you want to deploy a newer `igra` branch:
+
+```bash
+git pull
+git checkout igra
+cd deploy/testprod
+docker compose build tidx
+docker compose up -d tidx
+```
+
+Watch:
+
+```bash
+docker compose logs -f tidx
+```
+
+## Optional Hardening
+
+- add Cloudflare proxy after direct DNS-only validation succeeds
+- add HTTP basic auth in [Caddyfile](/Users/user/Source/igra/tidx/deploy/testprod/Caddyfile:1) if you want the explorer private during test-prod
+- move Grafana behind a second authenticated reverse-proxy route if you want remote dashboards without SSH tunneling

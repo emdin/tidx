@@ -1,0 +1,22 @@
+{
+	email {$LETSENCRYPT_EMAIL}
+}
+
+# Optional private staging gate:
+# Uncomment the block below and replace the hash if you want HTTP basic auth.
+# Generate a hash with:
+#   docker run --rm caddy:2.8-alpine caddy hash-password --plaintext 'your-password'
+#
+# {$EXPLORER_DOMAIN} {
+# 	basicauth {
+# 		staging $2a$14$replace_me_with_a_real_bcrypt_hash
+# 	}
+# 	encode gzip zstd
+# 	reverse_proxy tidx:8080
+# }
+
+{$EXPLORER_DOMAIN} {
+	encode gzip zstd
+	redir / /explore
+	reverse_proxy tidx:8080
+}

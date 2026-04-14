@@ -1,0 +1,31 @@
+[http]
+enabled = true
+port = 8080
+bind = "0.0.0.0"
+
+# Replace this with your company VPN / Tailscale CIDR so explorer admin writes
+# are allowed only from trusted networks. With an empty list, only loopback is trusted.
+trusted_cidrs = ["100.64.0.0/10"]
+
+[prometheus]
+enabled = true
+port = 9090
+
+[[chains]]
+name = "igra"
+chain_id = 38833
+rpc_url = "https://rpc.igralabs.com:8545"
+pg_url = "postgres://tidx@postgres:5432/tidx_igra"
+pg_password_env = "POSTGRES_PASSWORD"
+backfill = true
+backfill_first = false
+batch_size = 100
+concurrency = 6
+
+# Keep false unless your devops team decides the RPC should be treated as authoritative.
+trust_rpc = false
+
+[chains.clickhouse]
+enabled = true
+url = "http://clickhouse:8123"
+database = "tidx_38833"
