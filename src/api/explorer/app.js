@@ -2382,10 +2382,19 @@ function with0x(value) {
 }
 
 function sanitizeHexInput(value) {
-  return String(value || "")
+  const input = String(value || "")
+    .normalize("NFKC")
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .trim()
     .replace(/^["']+|["']+$/g, "");
+
+  if (!input) {
+    return "";
+  }
+
+  const hasPrefix = /^0x/i.test(input);
+  const body = (hasPrefix ? input.slice(2) : input).replace(/[^0-9a-fA-F]/g, "");
+  return hasPrefix ? `0x${body}` : body;
 }
 
 function isHex(value, bytes) {
