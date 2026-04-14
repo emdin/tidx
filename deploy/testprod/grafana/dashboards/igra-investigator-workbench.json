@@ -15,8 +15,29 @@
         "uid": "clickhouse-igra"
       },
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "/explore/address/${__data.fields[\"sender_raw\"]}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -702,8 +723,24 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT txs.`from`, count() AS failed_txs FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE receipts.status = 0 GROUP BY txs.`from` ORDER BY failed_txs DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(txs.`from`, 3)) AS sender, txs.`from` AS sender_raw, count() AS failed_txs FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE receipts.status = 0 GROUP BY sender, sender_raw ORDER BY failed_txs DESC LIMIT 20",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "sender_raw": true
+            },
+            "indexByName": {
+              "sender": 0,
+              "failed_txs": 1,
+              "sender_raw": 2
+            },
+            "renameByName": {}
+          }
         }
       ],
       "title": "20. Top Failed Senders",

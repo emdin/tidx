@@ -14,8 +14,29 @@
         "uid": "clickhouse-igra"
       },
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "/explore/address/${__data.fields[\"sender_raw\"]}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -316,8 +337,24 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT `from`, count() AS tx_count FROM txs GROUP BY `from` ORDER BY tx_count DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(`from`, 3)) AS sender, `from` AS sender_raw, count() AS tx_count FROM txs GROUP BY sender, sender_raw ORDER BY tx_count DESC LIMIT 20",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "sender_raw": true
+            },
+            "indexByName": {
+              "sender": 0,
+              "tx_count": 1,
+              "sender_raw": 2
+            },
+            "renameByName": {}
+          }
         }
       ],
       "title": "9. Top Senders",
@@ -329,8 +366,29 @@
         "uid": "clickhouse-igra"
       },
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recipient"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "/explore/address/${__data.fields[\"recipient_raw\"]}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -351,8 +409,24 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT `to`, count() AS tx_count FROM txs WHERE `to` IS NOT NULL GROUP BY `to` ORDER BY tx_count DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(`to`, 3)) AS recipient, `to` AS recipient_raw, count() AS tx_count FROM txs WHERE `to` IS NOT NULL GROUP BY recipient, recipient_raw ORDER BY tx_count DESC LIMIT 20",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "recipient_raw": true
+            },
+            "indexByName": {
+              "recipient": 0,
+              "tx_count": 1,
+              "recipient_raw": 2
+            },
+            "renameByName": {}
+          }
         }
       ],
       "title": "10. Top Recipients / Contracts",
@@ -364,8 +438,29 @@
         "uid": "clickhouse-igra"
       },
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "contract"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "/explore/address/${__data.fields[\"contract_raw\"]}?tab=contract",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -386,8 +481,24 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT address, count() AS log_count FROM logs GROUP BY address ORDER BY log_count DESC LIMIT 20",
+          "rawSql": "SELECT concat('0x​', substring(address, 3)) AS contract, address AS contract_raw, count() AS log_count FROM logs GROUP BY contract, contract_raw ORDER BY log_count DESC LIMIT 20",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "contract_raw": true
+            },
+            "indexByName": {
+              "contract": 0,
+              "log_count": 1,
+              "contract_raw": 2
+            },
+            "renameByName": {}
+          }
         }
       ],
       "title": "11. Top Contracts By Emitted Logs",

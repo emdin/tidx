@@ -9,7 +9,7 @@
   "panels": [
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 200 }, { "color": "red", "value": 500 } ] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "locale", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 200 }, { "color": "red", "value": 500 } ] } }, "overrides": [] },
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "id": 1,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
@@ -19,7 +19,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 60 } ] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "locale", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 60 } ] } }, "overrides": [] },
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
       "id": 2,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
@@ -29,7 +29,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 100 } ] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "locale", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 20 }, { "color": "red", "value": 100 } ] } }, "overrides": [] },
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "id": 3,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
@@ -39,7 +39,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 10 }, { "color": "red", "value": 25 } ] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "locale", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 10 }, { "color": "red", "value": 25 } ] } }, "overrides": [] },
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "id": 4,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": [ "lastNotNull" ], "fields": "", "values": false }, "textMode": "auto" },
@@ -49,7 +49,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 1, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 1, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "id": 5,
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -59,7 +59,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 65, "lineWidth": 1, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 65, "lineWidth": 1, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "id": 6,
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -69,7 +69,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 18, "lineWidth": 2, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 18, "lineWidth": 2, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "id": 7,
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -79,7 +79,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 18, "lineWidth": 2, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 18, "lineWidth": 2, "showPoints": "never", "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "id": 8,
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -89,7 +89,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "sender" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"sender_raw\"]}", "targetBlank": true } ] } ] } ] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [ { "matcher": { "id": "byName", "options": "sender" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"sender_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "id": 9,
       "options": { "showHeader": true },
@@ -100,7 +100,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [ { "matcher": { "id": "byName", "options": "deployer" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"deployer_raw\"]}", "targetBlank": true } ] } ] } ] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [ { "matcher": { "id": "byName", "options": "deployer" }, "properties": [ { "id": "links", "value": [ { "title": "Open In Explorer", "url": "/explore/address/${__data.fields[\"deployer_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
       "id": 10,
       "options": { "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } },
@@ -110,7 +110,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisGridShow": true, "axisPlacement": "left", "barWidthFactor": 0.6, "groupWidth": 0.7, "lineWidth": 1, "orientation": "horizontal", "showValue": "auto", "stacking": "none" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "locale" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "id": 11,
       "options": { "showHeader": true },
@@ -121,7 +121,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "block_num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "https://stage-roman.igralabs.com/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "hash" }, "properties": [ { "id": "links", "value": [ { "title": "Open Receipt", "url": "https://stage-roman.igralabs.com/explore/receipt/${__data.fields[\"hash_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "sender" }, "properties": [ { "id": "links", "value": [ { "title": "Open Sender", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"sender_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "recipient" }, "properties": [ { "id": "links", "value": [ { "title": "Open Recipient", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"recipient_raw\"]}", "targetBlank": true } ] } ] } ] },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "block_num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "hash" }, "properties": [ { "id": "links", "value": [ { "title": "Open Receipt", "url": "/explore/receipt/${__data.fields[\"hash_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "sender" }, "properties": [ { "id": "links", "value": [ { "title": "Open Sender", "url": "/explore/address/${__data.fields[\"sender_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "recipient" }, "properties": [ { "id": "links", "value": [ { "title": "Open Recipient", "url": "/explore/address/${__data.fields[\"recipient_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 28 },
       "id": 12,
       "options": { "showHeader": true },
@@ -132,7 +132,7 @@
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-igra" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "block_num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "https://stage-roman.igralabs.com/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "tx_hash" }, "properties": [ { "id": "links", "value": [ { "title": "Open Receipt", "url": "https://stage-roman.igralabs.com/explore/receipt/${__data.fields[\"tx_hash_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "deployed_contract" }, "properties": [ { "id": "links", "value": [ { "title": "Open Contract", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"deployed_contract_raw\"]}?tab=contract", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "deployer" }, "properties": [ { "id": "links", "value": [ { "title": "Open Deployer", "url": "https://stage-roman.igralabs.com/explore/address/${__data.fields[\"deployer_raw\"]}", "targetBlank": true } ] } ] } ] },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "block_num" }, "properties": [ { "id": "links", "value": [ { "title": "Open Block", "url": "/explore/block/${__value.raw}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "tx_hash" }, "properties": [ { "id": "links", "value": [ { "title": "Open Receipt", "url": "/explore/receipt/${__data.fields[\"tx_hash_raw\"]}", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "deployed_contract" }, "properties": [ { "id": "links", "value": [ { "title": "Open Contract", "url": "/explore/address/${__data.fields[\"deployed_contract_raw\"]}?tab=contract", "targetBlank": true } ] } ] }, { "matcher": { "id": "byName", "options": "deployer" }, "properties": [ { "id": "links", "value": [ { "title": "Open Deployer", "url": "/explore/address/${__data.fields[\"deployer_raw\"]}", "targetBlank": true } ] } ] } ] },
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 28 },
       "id": 13,
       "options": { "showHeader": true },
