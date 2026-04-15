@@ -6,6 +6,7 @@ bind = "0.0.0.0"
 # Replace this with your company VPN / Tailscale CIDR so explorer admin writes
 # are allowed only from trusted networks. With an empty list, only loopback is trusted.
 trusted_cidrs = ["100.64.0.0/10"]
+kaspa_explorer_base_url = "https://kaspa.stream"
 
 [prometheus]
 enabled = true

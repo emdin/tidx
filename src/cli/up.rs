@@ -154,6 +154,7 @@ pub async fn run(args: Args) -> Result<()> {
                 Arc::clone(&clickhouse_configs),
                 Arc::clone(&clickhouse_engines),
                 config.http.trusted_cidrs.clone(),
+                config.http.kaspa_explorer_base_url.clone(),
             );
 
             info!(addr = %addr, "Starting HTTP API server (hot-reload enabled)");
@@ -231,6 +232,7 @@ pub async fn run(args: Args) -> Result<()> {
             Arc::clone(&clickhouse_configs),
             Arc::clone(&clickhouse_engines),
             config.http.trusted_cidrs.clone(),
+            config.http.kaspa_explorer_base_url.clone(),
         );
 
         info!(addr = %addr, "Starting HTTP API server");

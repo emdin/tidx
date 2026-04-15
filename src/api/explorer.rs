@@ -31,7 +31,13 @@ pub async fn index(
             .unwrap_or("-");
         info!(path = %path, referer = %referer, "Explorer route request");
     }
-    let html = INDEX_HTML.replace("__DEFAULT_CHAIN_ID__", &state.default_chain_id.to_string());
+    let html = INDEX_HTML
+        .replace("__DEFAULT_CHAIN_ID__", &state.default_chain_id.to_string())
+        .replace(
+            "__KASPA_EXPLORER_BASE_URL__",
+            &serde_json::to_string(&state.kaspa_explorer_base_url)
+                .unwrap_or_else(|_| "\"https://kaspa.stream\"".to_string()),
+        );
     Html(html)
 }
 

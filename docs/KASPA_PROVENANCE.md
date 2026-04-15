@@ -8,6 +8,9 @@ payloads. iidx syncs this L1 provenance as a sidecar to the normal EVM indexer.
 Enable per chain:
 
 ```toml
+[http]
+kaspa_explorer_base_url = "https://kaspa.stream"
+
 [chains.kaspa]
 enabled = true
 rpc_url = "ws://host.docker.internal:17111"

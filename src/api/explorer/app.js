@@ -99,6 +99,7 @@ const SOLIDITY_DECLARATION_HINTS = {
 
 const state = {
   chainId: Number(window.__TIDX_DEFAULT_CHAIN_ID__) || null,
+  kaspaExplorerBaseUrl: String(window.__TIDX_KASPA_EXPLORER_BASE_URL__ || "https://kaspa.stream"),
   status: null,
   adminCapabilities: null,
   refreshTimer: null,
@@ -615,7 +616,7 @@ async function renderReceiptPage(hash) {
   }
 
   const body = hexBody(hash);
-  const [txRows, logRows, decodePayload] = await Promise.all([
+  const [txRows, logRows, provenanceRows, decodePayload] = await Promise.all([
     runQuery(`
       SELECT
         txs.block_num,
@@ -657,6 +658,14 @@ async function renderReceiptPage(hash) {
       ORDER BY log_idx ASC
       LIMIT 250
     `),
+    runQuery(`
+      SELECT
+        encode(kaspa_txid, 'hex') AS kaspa_txid,
+        created_at
+      FROM kaspa_l2_submissions
+      WHERE l2_tx_hash = decode('${body}', 'hex')
+      LIMIT 1
+    `),
     tryFetchExplorerJson(
       `/explore/api/receipt/${hash}/decode?chainId=${encodeURIComponent(state.chainId)}`,
     ),
@@ -676,6 +685,7 @@ async function renderReceiptPage(hash) {
   const selector = decodedInput?.selector || (tx.selector ? with0x(tx.selector) : null);
   const methodLabel = decodedInput?.label || methodName(selector);
   const inputLength = tx.input_data ? Math.max(0, tx.input_data.length / 2) : 0;
+  const provenance = provenanceRows[0] || null;
 
   elements.pageRoot.innerHTML = `
     <section class="content-page">
@@ -710,12 +720,15 @@ async function renderReceiptPage(hash) {
           ${renderSummaryRow("Type", formatNumber(tx.type))}
           ${renderSummaryRow("Value", formatNativeAmount(tx.value || "0", 8))}
           ${renderSummaryRow("Selector", selector ? `<span class="wrap-anywhere">${escapeHtml(selector)}</span>` : '<span class="text-secondary">-</span>')}
+          ${renderSummaryRow("Kaspa L1 tx", provenance ? renderKaspaTxLink(provenance.kaspa_txid, false) : '<span class="text-secondary">Not indexed yet</span>')}
           ${renderSummaryRow("Gas limit", formatGasUnits(tx.gas_limit))}
           ${renderSummaryRow("Gas price", tx.effective_gas_price ? formatGasPrice(tx.effective_gas_price) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Cumulative gas", tx.cumulative_gas_used ? formatGasUnits(tx.cumulative_gas_used) : '<span class="text-secondary">-</span>')}
         </aside>
 
         <div class="panel-stack">
+          ${renderKaspaReceiptProvenance(provenance)}
+
           <section class="panel-card">
             <div class="panel-header">
               <div>
@@ -779,7 +792,9 @@ async function renderAddressPage(address, requestedTab, page) {
         (SELECT MIN(block_num) FROM receipts WHERE contract_address = decode('${body}', 'hex')) AS created_block,
         (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex')) AS emitted_logs,
         (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_logs,
-        (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_logs
+        (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_logs,
+        (SELECT COUNT(*) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_count,
+        (SELECT COALESCE(SUM(amount_sompi), 0) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_amount_sompi
     `),
     tryFetchExplorerJson(`/explore/api/address/${address}/inspect?chainId=${encodeURIComponent(state.chainId)}`),
   ]);
@@ -866,6 +881,24 @@ async function renderAddressPage(address, requestedTab, page) {
     panelSubtitle = `${formatNumber(summary.related_logs || 0)} related log row(s)`;
     panelBody = renderAddressLogsTable(logRows);
     hasNextPage = logRows.length === PAGE_SIZE;
+  } else if (tab === "kaspa") {
+    const offset = (page - 1) * PAGE_SIZE;
+    const entryRows = await runQuery(`
+      SELECT
+        encode(kaspa_txid, 'hex') AS kaspa_txid,
+        amount_sompi,
+        created_at
+      FROM kaspa_entries
+      WHERE recipient = decode('${body}', 'hex')
+      ORDER BY created_at DESC, kaspa_txid DESC
+      LIMIT ${PAGE_SIZE}
+      OFFSET ${offset}
+    `);
+
+    panelTitle = "Kaspa L1 provenance";
+    panelSubtitle = `${formatNumber(summary.kaspa_entry_count || 0)} native iKAS entry row(s) linked from Kaspa`;
+    panelBody = renderKaspaEntriesTable(entryRows);
+    hasNextPage = entryRows.length === PAGE_SIZE;
   } else if (tab === "contract") {
     const [contractLogs, methods, verification] = await Promise.all([
       runQuery(`
@@ -949,6 +982,7 @@ async function renderAddressPage(address, requestedTab, page) {
         ${renderKpiCard("Transactions", formatNumber(summary.tx_count || 0), "Direct tx activity")}
         ${renderKpiCard("Logs", formatNumber(summary.related_logs || 0), "Logs emitted or indexed to this address")}
         ${renderKpiCard("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : "-", "Latest RPC balance")}
+        ${renderKpiCard("Kaspa entries", formatNumber(summary.kaspa_entry_count || 0), "Native iKAS entries from Kaspa L1")}
         ${renderKpiCard("First seen", summary.first_seen_block ? formatNumber(summary.first_seen_block) : "-", "Earliest indexed block")}
         ${renderKpiCard("Last seen", summary.last_seen_block ? formatNumber(summary.last_seen_block) : "-", "Latest indexed block")}
       </section>
@@ -962,6 +996,8 @@ async function renderAddressPage(address, requestedTab, page) {
           ${renderSummaryRow("Verification", formatVerificationStatus(inspect?.verification?.verification_status))}
           ${renderSummaryRow("Bytecode proof", formatBytecodeProof(inspect?.verification))}
           ${renderSummaryRow("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : '<span class="text-secondary">-</span>')}
+          ${renderSummaryRow("Kaspa entries", formatNumber(summary.kaspa_entry_count || 0))}
+          ${renderSummaryRow("Kaspa entry amount", formatKaspaSompi(summary.kaspa_entry_amount_sompi || "0"))}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
           ${renderSummaryRow("Received", formatNumber(summary.received_count || 0))}
@@ -1222,6 +1258,74 @@ function renderAddressLogsTable(rows) {
             <th>Tx</th>
             <th>Contract</th>
             <th>Event</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderKaspaReceiptProvenance(provenance) {
+  if (!provenance) {
+    return `
+      <section class="panel-card">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Kaspa L1 provenance</div>
+            <div class="panel-subtitle">No Kaspa L1 provenance row has been indexed for this transaction yet</div>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="empty-mini">This can happen for older data, unpromoted pending rows, or transactions not submitted through the indexed Kaspa path.</div>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="panel-card">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Kaspa L1 provenance</div>
+          <div class="panel-subtitle">This Igra transaction was carried by a Kaspa L1 transaction payload</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="definition-list">
+          ${renderDefinitionItem("Kaspa tx", renderKaspaTxLink(provenance.kaspa_txid, false))}
+          ${renderDefinitionItem("Indexed at", formatTimestamp(provenance.created_at))}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderKaspaEntriesTable(rows) {
+  if (!rows.length) {
+    return '<div class="empty-state">No native iKAS Kaspa entries found for this address.</div>';
+  }
+
+  const body = rows
+    .map(
+      (row) => `
+        <tr>
+          <td>${escapeHtml(formatRelativeTime(row.created_at))}</td>
+          <td class="mono">${renderKaspaTxLink(row.kaspa_txid)}</td>
+          <td class="align-right mono">${formatKaspaSompi(row.amount_sompi)}</td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Indexed</th>
+            <th>Kaspa L1 tx</th>
+            <th class="align-right">Amount</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>
@@ -1922,6 +2026,7 @@ function renderAddressTabs(address, activeTab, kind) {
     { key: "transactions", label: "Transactions" },
     { key: "portfolio", label: "Portfolio" },
     { key: "logs", label: "Logs" },
+    { key: "kaspa", label: "Kaspa L1" },
   ];
 
   if (kind.isContract) {
@@ -2550,6 +2655,30 @@ function renderMonoLink(href, value, short = true) {
   return `<a href="${href}" class="wrap-anywhere">${escapeHtml(display)}</a>`;
 }
 
+function renderKaspaTxLink(txid, short = true) {
+  const clean = sanitizeKaspaTxid(txid);
+  if (!clean) {
+    return '<span class="text-secondary">-</span>';
+  }
+
+  const display = short ? shortKaspaTxid(clean, 10) : clean;
+  const href = kaspaTransactionUrl(clean);
+  if (!href) {
+    return `<span class="wrap-anywhere">${escapeHtml(display)}</span>`;
+  }
+
+  return `<a href="${escapeHtml(href)}" class="wrap-anywhere" target="_blank" rel="noopener noreferrer">${escapeHtml(display)}</a>`;
+}
+
+function kaspaTransactionUrl(txid) {
+  const clean = sanitizeKaspaTxid(txid);
+  const base = String(state.kaspaExplorerBaseUrl || "").trim().replace(/\/+$/, "");
+  if (!clean || !base) {
+    return null;
+  }
+  return `${base}/transactions/${clean}`;
+}
+
 function renderTxStatusBadge(kind) {
   const label =
     kind === "success" ? "Success" : kind === "failed" ? "Failed" : kind === "pending" ? "Pending" : "Unknown";
@@ -2596,7 +2725,7 @@ function normalizeAddressTab(requestedTab, kind) {
     return "transactions";
   }
 
-  const allowed = new Set(["transactions", "portfolio", "logs"]);
+  const allowed = new Set(["transactions", "portfolio", "logs", "kaspa"]);
   if (kind.isContract) {
     allowed.add("contract");
   }
@@ -2830,6 +2959,22 @@ function shortHex(value, visible = 8) {
   return `${normalized.slice(0, visible + 2)}...${normalized.slice(-visible)}`;
 }
 
+function sanitizeKaspaTxid(value) {
+  const body = hexBody(value);
+  return /^[0-9a-f]{64}$/.test(body) ? body : "";
+}
+
+function shortKaspaTxid(value, visible = 8) {
+  const clean = sanitizeKaspaTxid(value);
+  if (!clean) {
+    return "-";
+  }
+  if (clean.length <= visible * 2) {
+    return clean;
+  }
+  return `${clean.slice(0, visible)}...${clean.slice(-visible)}`;
+}
+
 function formatNumber(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) {
@@ -2868,6 +3013,11 @@ function formatNumericString(value) {
 function formatNativeAmount(value, precision = 6) {
   const formatted = formatTokenAmount(value, 18, precision);
   return formatted === "-" ? formatted : `${formatted} ${NATIVE_SYMBOL}`;
+}
+
+function formatKaspaSompi(value, precision = 6) {
+  const formatted = formatTokenAmount(value, 8, precision);
+  return formatted === "-" ? formatted : `${formatted} iKAS`;
 }
 
 function formatGasPrice(value, precision = 4) {

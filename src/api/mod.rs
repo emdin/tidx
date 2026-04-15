@@ -64,6 +64,8 @@ pub struct AppState {
     pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
     pub trusted_cidrs: Arc<Vec<(IpAddr, u8)>>,
+    /// Public Kaspa explorer base URL used for L1 provenance links.
+    pub kaspa_explorer_base_url: String,
 }
 
 impl AppState {
@@ -183,6 +185,7 @@ pub fn router_with_options(
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
+        kaspa_explorer_base_url: http_config.kaspa_explorer_base_url.clone(),
     };
 
     build_router(state)
@@ -197,6 +200,7 @@ pub fn router_shared(
     clickhouse_configs: SharedClickHouseConfigs,
     clickhouse_engines: SharedClickHouseEngines,
     trusted_cidrs: Vec<String>,
+    kaspa_explorer_base_url: String,
 ) -> Router<()> {
     let trusted_cidrs = Arc::new(parse_cidrs(&trusted_cidrs));
 
@@ -209,6 +213,7 @@ pub fn router_shared(
         clickhouse_configs,
         clickhouse_engines,
         trusted_cidrs,
+        kaspa_explorer_base_url,
     };
 
     build_router(state)
@@ -829,6 +834,7 @@ mod tests {
             clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(trusted_cidrs),
+            kaspa_explorer_base_url: "https://kaspa.stream".to_string(),
         }
     }
 

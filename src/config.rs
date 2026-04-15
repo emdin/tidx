@@ -37,6 +37,10 @@ pub struct HttpConfig {
     /// Trusted CIDRs for admin operations (e.g., `100.64.0.0/10` for Tailscale)
     #[serde(default)]
     pub trusted_cidrs: Vec<String>,
+
+    /// Public Kaspa explorer base URL used for L1 provenance links.
+    #[serde(default = "default_kaspa_explorer_base_url")]
+    pub kaspa_explorer_base_url: String,
 }
 
 impl Default for HttpConfig {
@@ -46,6 +50,7 @@ impl Default for HttpConfig {
             port: 8080,
             bind: "0.0.0.0".to_string(),
             trusted_cidrs: Vec::new(),
+            kaspa_explorer_base_url: default_kaspa_explorer_base_url(),
         }
     }
 }
@@ -80,6 +85,10 @@ fn default_http_port() -> u16 {
 
 fn default_bind() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_kaspa_explorer_base_url() -> String {
+    "https://kaspa.stream".to_string()
 }
 
 fn default_metrics_port() -> u16 {
