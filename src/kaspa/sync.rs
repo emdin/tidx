@@ -196,7 +196,19 @@ fn extract_pending_rows(
                 continue;
             };
             let kaspa_txid = txid.as_bytes();
-            match parser.parse(&kaspa_txid, payload)? {
+            let parsed = match parser.parse(&kaspa_txid, payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    debug!(
+                        kaspa_txid = %hex::encode(kaspa_txid),
+                        %error,
+                        "Skipping malformed Igra Kaspa payload"
+                    );
+                    continue;
+                }
+            };
+
+            match parsed {
                 Some(IgraKaspaPayload::L2Submission { l2_tx_hash }) => {
                     l2_submissions.push(PendingL2Submission {
                         l2_tx_hash,
