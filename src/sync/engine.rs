@@ -26,6 +26,10 @@ use super::writer::{
 const REALTIME_RPC_CONCURRENCY: usize = 4;
 const BACKFILL_RPC_CONCURRENCY: usize = 8;
 
+fn safe_tip_for_head(remote_head: u64, head_delay_blocks: u64) -> u64 {
+    remote_head.saturating_sub(head_delay_blocks)
+}
+
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
     throttled_pool: ThrottledPool,
@@ -40,6 +44,7 @@ pub struct SyncEngine {
     batch_size: u64,
     concurrency: usize,
     backfill_first: bool,
+    head_delay_blocks: u64,
     /// Skip parent hash validation (trust RPC for reorg handling)
     trust_rpc: bool,
 }
@@ -69,6 +74,7 @@ impl SyncEngine {
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
+            head_delay_blocks: 0,
             trust_rpc: false,
         })
     }
@@ -90,6 +96,11 @@ impl SyncEngine {
 
     pub fn with_backfill_first(mut self, backfill_first: bool) -> Self {
         self.backfill_first = backfill_first;
+        self
+    }
+
+    pub fn with_head_delay_blocks(mut self, head_delay_blocks: u64) -> Self {
+        self.head_delay_blocks = head_delay_blocks;
         self
     }
 
@@ -146,14 +157,18 @@ impl SyncEngine {
 
             // Get current head to know our target
             let remote_head = self.realtime_rpc.latest_block_number().await?;
-            update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
+            let safe_head = safe_tip_for_head(remote_head, self.head_delay_blocks);
+            metrics::set_sync_head_delay(self.chain_id, self.head_delay_blocks);
+            update_tip_num(self.pool(), self.chain_id, safe_head, remote_head).await?;
 
             // Check for gaps
-            let gaps = detect_all_gaps(self.pool(), remote_head).await?;
+            let gaps = detect_all_gaps(self.pool(), safe_head).await?;
             if gaps.is_empty() {
                 info!(
                     chain_id = self.chain_id,
                     head = remote_head,
+                    safe_head = safe_head,
+                    head_delay_blocks = self.head_delay_blocks,
                     "Backfill complete, switching to realtime sync"
                 );
                 break;
@@ -165,6 +180,8 @@ impl SyncEngine {
                 gaps = gaps.len(),
                 total_blocks = total_gap_blocks,
                 head = remote_head,
+                safe_head = safe_head,
+                head_delay_blocks = self.head_delay_blocks,
                 "Backfill in progress"
             );
 
@@ -222,6 +239,7 @@ impl SyncEngine {
             tip_num = state.tip_num,
             synced_num = state.synced_num,
             trust_rpc = self.trust_rpc,
+            head_delay_blocks = self.head_delay_blocks,
             "Starting sync engine with realtime + gap-fill + receipt backfill"
         );
 
@@ -232,6 +250,7 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
+        let gapfill_head_delay_blocks = self.head_delay_blocks;
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
                 gapfill_sinks,
@@ -240,6 +259,7 @@ impl SyncEngine {
                 gapfill_chain_id,
                 gapfill_batch_size,
                 gapfill_concurrency,
+                gapfill_head_delay_blocks,
                 gapfill_shutdown,
             )
             .await
@@ -292,27 +312,32 @@ impl SyncEngine {
             .await?
             .unwrap_or_default();
         let remote_head = self.realtime_rpc.latest_block_number().await?;
+        let safe_head = safe_tip_for_head(remote_head, self.head_delay_blocks);
+        metrics::set_sync_head_delay(self.chain_id, self.head_delay_blocks);
 
         // TAIL_WINDOW: how many blocks behind head to start realtime sync
         const TAIL_WINDOW: u64 = 10;
 
         // Jump to near head immediately, don't catch up sequentially
-        let start_from = if state.tip_num >= remote_head.saturating_sub(TAIL_WINDOW) {
+        let start_from = if state.tip_num >= safe_head.saturating_sub(TAIL_WINDOW) {
             state.tip_num + 1
         } else {
-            let jump_to = remote_head.saturating_sub(TAIL_WINDOW);
+            let jump_to = safe_head.saturating_sub(TAIL_WINDOW);
             if state.tip_num > 0 && jump_to > state.tip_num {
                 info!(
                     old_tip = state.tip_num,
                     new_start = jump_to,
                     skipped = jump_to - state.tip_num,
-                    "Realtime: jumping to near head, gap-fill will backfill"
+                    head = remote_head,
+                    safe_head = safe_head,
+                    head_delay_blocks = self.head_delay_blocks,
+                    "Realtime: jumping to safe head, gap-fill will backfill"
                 );
             }
             jump_to
         };
 
-        if start_from > remote_head {
+        if start_from > safe_head {
             progress.report_forward(state.tip_num, remote_head, 0);
             tokio::time::sleep(Duration::from_millis(100)).await;
             return Ok(());
@@ -320,7 +345,7 @@ impl SyncEngine {
 
         const BATCH_SIZE: u64 = 10;
         let mut current_from = start_from;
-        let mut current_to = (current_from + BATCH_SIZE - 1).min(remote_head);
+        let mut current_to = (current_from + BATCH_SIZE - 1).min(safe_head);
 
         // Fetch blocks + receipts + logs together for complete indexing
         let fetch_start = std::time::Instant::now();
@@ -336,7 +361,7 @@ impl SyncEngine {
             );
         }
 
-        while current_from <= remote_head {
+        while current_from <= safe_head {
             let batch_start = std::time::Instant::now();
             let (blocks, block_rows, all_txs, all_logs, all_receipts, all_withdrawals) =
                 current_fetch.take().unwrap();
@@ -348,8 +373,8 @@ impl SyncEngine {
             }
 
             let next_from = current_to + 1;
-            let next_to = (next_from + BATCH_SIZE - 1).min(remote_head);
-            let has_next = next_from <= remote_head;
+            let next_to = (next_from + BATCH_SIZE - 1).min(safe_head);
+            let has_next = next_from <= safe_head;
 
             // Pipeline: fetch next batch while writing current
             let next_fetch_future = if has_next {
@@ -813,6 +838,7 @@ async fn run_gapfill_loop(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    head_delay_blocks: u64,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(sinks.pool(), chain_id)
@@ -824,6 +850,7 @@ async fn run_gapfill_loop(
         chain_id = chain_id,
         batch_size = batch_size,
         concurrency = concurrency,
+        head_delay_blocks = head_delay_blocks,
         backfill_limit = backfill_semaphore.available_permits(),
         "Gap-fill: starting with parallel workers (throttled)"
     );
@@ -836,7 +863,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
+            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, head_delay_blocks, &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -858,6 +885,7 @@ async fn tick_gapfill_parallel(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    head_delay_blocks: u64,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let pool = sinks.pool();
@@ -866,13 +894,15 @@ async fn tick_gapfill_parallel(
     // Adaptive throttling: pause backfill when realtime lag is high
     // This ensures realtime sync always has priority
     let remote_head = rpc.latest_block_number().await.unwrap_or(state.tip_num);
-    let realtime_lag = remote_head.saturating_sub(state.tip_num);
+    let safe_head = safe_tip_for_head(remote_head, head_delay_blocks);
+    let realtime_lag = safe_head.saturating_sub(state.tip_num);
 
     const LAG_THRESHOLD: u64 = 10; // Pause backfill if lag exceeds this
     if realtime_lag > LAG_THRESHOLD {
         debug!(
             chain_id = chain_id,
             realtime_lag = realtime_lag,
+            head_delay_blocks = head_delay_blocks,
             threshold = LAG_THRESHOLD,
             "Gap-fill: pausing to let realtime sync catch up"
         );

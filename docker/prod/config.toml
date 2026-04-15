@@ -16,6 +16,7 @@ rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.testnet.tempo.xyz"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 backfill = true
 batch_size = 100
+head_delay_blocks = 0
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]
@@ -29,6 +30,7 @@ rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.tempo.xyz"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 backfill = true
 batch_size = 100
+head_delay_blocks = 0
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]

@@ -33,6 +33,11 @@ pub fn set_sync_lag(chain_id: u64, lag: u64) {
     gauge!("tidx_sync_lag_blocks", &labels).set(lag as f64);
 }
 
+pub fn set_sync_head_delay(chain_id: u64, delay_blocks: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_sync_head_delay_blocks", &labels).set(delay_blocks as f64);
+}
+
 pub fn set_backfill_block(chain_id: u64, sink: &str, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
     gauge!("tidx_backfill_block", &labels).set(block_num as f64);

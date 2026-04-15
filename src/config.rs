@@ -124,6 +124,12 @@ pub struct ChainConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
 
+    /// Number of newest RPC-head blocks to leave unindexed by realtime sync.
+    /// This reduces near-tip churn on chains where the latest block can briefly
+    /// disappear or be reorganized before stabilizing.
+    #[serde(default)]
+    pub head_delay_blocks: u64,
+
     /// Number of concurrent gap-fill workers (default: 4)
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -387,6 +393,7 @@ mod tests {
 
         assert!(config.backfill);
         assert_eq!(config.batch_size, 100);
+        assert_eq!(config.head_delay_blocks, 0);
         assert_eq!(config.concurrency, 4);
     }
 
@@ -479,6 +486,7 @@ mod tests {
             pg_password_env: None,
             backfill: true,
             batch_size: 100,
+            head_delay_blocks: 0,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
@@ -505,6 +513,7 @@ mod tests {
             pg_password_env: Some("PATH".to_string()),
             backfill: true,
             batch_size: 100,
+            head_delay_blocks: 0,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
@@ -530,6 +539,7 @@ mod tests {
             pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
             backfill: true,
             batch_size: 100,
+            head_delay_blocks: 0,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,

@@ -2,31 +2,40 @@ groups:
   - name: tidx_sync
     rules:
       - alert: TidxSyncLagHigh
-        expr: tidx_sync_lag_blocks > 10
+        expr: (tidx_sync_lag_blocks - tidx_sync_head_delay_blocks) > 10
         for: 2m
         labels:
           severity: warning
         annotations:
           summary: "Sync lag high on chain {{ $labels.chain_id }}"
-          description: "PostgreSQL is {{ $value }} blocks behind chain head"
+          description: "PostgreSQL is {{ $value }} blocks behind the configured safe head"
 
       - alert: TidxSyncLagCritical
-        expr: tidx_sync_lag_blocks > 100
+        expr: (tidx_sync_lag_blocks - tidx_sync_head_delay_blocks) > 100
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Sync lag critical on chain {{ $labels.chain_id }}"
-          description: "PostgreSQL is {{ $value }} blocks behind chain head"
+          description: "PostgreSQL is {{ $value }} blocks behind the configured safe head"
 
       - alert: TidxSyncStalled
-        expr: tidx_sync_blocks_per_second == 0 and tidx_sync_lag_blocks > 0
+        expr: tidx_sync_blocks_per_second == 0 and (tidx_sync_lag_blocks - tidx_sync_head_delay_blocks) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Sync stalled on chain {{ $labels.chain_id }}"
           description: "No blocks synced in 5 minutes while lag remains positive"
+
+      - alert: TidxGapBlocksHigh
+        expr: tidx_gap_blocks{sink="postgres"} > 25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Persistent PostgreSQL block gaps on chain {{ $labels.chain_id }}"
+          description: "Gap sync reports {{ $value }} missing blocks"
 
   - name: tidx_rpc
     rules:

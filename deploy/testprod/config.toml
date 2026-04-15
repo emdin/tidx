@@ -21,6 +21,7 @@ pg_password_env = "POSTGRES_PASSWORD"
 backfill = true
 backfill_first = false
 batch_size = 100
+head_delay_blocks = 10
 concurrency = 6
 
 # Keep false unless your devops team decides the RPC should be treated as authoritative.

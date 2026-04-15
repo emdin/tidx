@@ -87,6 +87,8 @@ rpc_url = "{rpc_url}"
 pg_url = "{pg_url}"
 backfill = true
 batch_size = 100
+# Leave newest N blocks unindexed by realtime sync to avoid unstable head churn.
+head_delay_blocks = 0
 "#
     )
 }
