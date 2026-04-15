@@ -63,6 +63,14 @@ If using Cloudflare, start as `DNS only` until Caddy successfully obtains TLS ce
 
 Production should use immutable image tags.
 
+The production deployment branch is currently:
+
+```text
+igra
+```
+
+Devops may build from the latest commit on `origin/igra`, but the resolved commit must be captured and used in the image tag. Do not deploy a floating branch name as the runtime image tag.
+
 Example:
 
 ```text
@@ -91,11 +99,31 @@ TIDX_IMAGE=ghcr.io/igralabs/iidx:igra-aa3fdcc
 Recommended CI release pattern:
 
 ```bash
+git fetch origin
+git checkout igra
+git pull --ff-only origin igra
+
 git_sha="$(git rev-parse --short=7 HEAD)"
 image="ghcr.io/igralabs/iidx:igra-${git_sha}"
 
 docker build -t "$image" .
 docker push "$image"
+```
+
+Manual equivalent from a fresh checkout:
+
+```bash
+git clone https://github.com/reshmem/tidx.git
+cd tidx
+git checkout igra
+git pull --ff-only origin igra
+
+git_sha="$(git rev-parse --short=7 HEAD)"
+image="ghcr.io/igralabs/iidx:igra-${git_sha}"
+
+docker build -t "$image" .
+docker push "$image"
+printf 'Use this in deploy/prod/.env: TIDX_IMAGE=%s\n' "$image"
 ```
 
 If the prod host pulls from private GHCR, authenticate once on the host:
