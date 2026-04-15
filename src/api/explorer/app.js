@@ -920,32 +920,71 @@ async function renderAddressPage(address, requestedTab, page) {
   } else if (tab === "kaspa") {
     const offset = (page - 1) * PAGE_SIZE;
     const entryRows = await runQuery(`
-      SELECT
-        encode(e.kaspa_txid, 'hex') AS kaspa_txid,
-        e.amount_sompi,
-        e.created_at,
-        w.block_num AS l2_block_num,
-        w.idx AS l2_withdrawal_idx,
-        w.withdrawal_index,
-        w.amount_gwei
-      FROM kaspa_entries e
-      LEFT JOIN LATERAL (
-        SELECT block_num, idx, withdrawal_index, amount_gwei
+      WITH withdrawal_rows AS (
+        SELECT
+          encode(e.kaspa_txid, 'hex') AS kaspa_txid,
+          w.amount_sompi,
+          e.created_at,
+          w.block_num AS l2_block_num,
+          w.idx AS l2_withdrawal_idx,
+          w.withdrawal_index,
+          w.amount_gwei,
+          'allocation' AS row_kind
         FROM l2_withdrawals w
-        WHERE w.index_le = substring(e.kaspa_txid FROM 25 FOR 8)
-          AND w.address = e.recipient
-          AND w.amount_sompi = e.amount_sompi
-        ORDER BY w.block_num DESC, w.idx DESC
-        LIMIT 1
-      ) w ON true
-      WHERE e.recipient = decode('${body}', 'hex')
-      ORDER BY e.created_at DESC, e.kaspa_txid DESC
+        LEFT JOIN LATERAL (
+          SELECT kaspa_txid, created_at
+          FROM kaspa_entries e
+          WHERE substring(e.kaspa_txid FROM 25 FOR 8) = w.index_le
+            AND e.recipient = w.address
+            AND e.amount_sompi = w.amount_sompi
+          ORDER BY e.created_at DESC, e.kaspa_txid DESC
+          LIMIT 1
+        ) e ON true
+        WHERE w.address = decode('${body}', 'hex')
+      ),
+      pending_entry_rows AS (
+        SELECT
+          encode(e.kaspa_txid, 'hex') AS kaspa_txid,
+          e.amount_sompi,
+          e.created_at,
+          NULL::bigint AS l2_block_num,
+          NULL::integer AS l2_withdrawal_idx,
+          NULL::text AS withdrawal_index,
+          NULL::bigint AS amount_gwei,
+          'entry' AS row_kind
+        FROM kaspa_entries e
+        LEFT JOIN LATERAL (
+          SELECT true AS matched
+          FROM l2_withdrawals w
+          WHERE w.index_le = substring(e.kaspa_txid FROM 25 FOR 8)
+            AND w.address = e.recipient
+            AND w.amount_sompi = e.amount_sompi
+          LIMIT 1
+        ) w ON true
+        WHERE e.recipient = decode('${body}', 'hex')
+          AND w.matched IS NULL
+      )
+      SELECT
+        kaspa_txid,
+        amount_sompi,
+        created_at,
+        l2_block_num,
+        l2_withdrawal_idx,
+        withdrawal_index,
+        amount_gwei,
+        row_kind
+      FROM (
+        SELECT * FROM withdrawal_rows
+        UNION ALL
+        SELECT * FROM pending_entry_rows
+      ) rows
+      ORDER BY l2_block_num DESC NULLS LAST, created_at DESC NULLS LAST, kaspa_txid DESC NULLS LAST
       LIMIT ${PAGE_SIZE}
       OFFSET ${offset}
     `);
 
     panelTitle = "Kaspa L1 provenance";
-    panelSubtitle = `${formatNumber(summary.kaspa_entry_count || 0)} native iKAS entry row(s) linked from Kaspa`;
+    panelSubtitle = `${formatNumber(summary.l2_withdrawal_count || 0)} L2 allocation row(s), ${formatNumber(summary.kaspa_entry_count || 0)} Kaspa entry row(s) indexed`;
     panelBody = renderKaspaEntriesTable(entryRows);
     hasNextPage = entryRows.length === PAGE_SIZE;
   } else if (tab === "contract") {
@@ -1390,14 +1429,14 @@ function renderKaspaReceiptProvenance(provenance) {
 
 function renderKaspaEntriesTable(rows) {
   if (!rows.length) {
-    return '<div class="empty-state">No native iKAS Kaspa entries found for this address.</div>';
+    return '<div class="empty-state">No native iKAS allocation or Kaspa entry rows found for this address.</div>';
   }
 
   const body = rows
     .map(
       (row) => `
         <tr>
-          <td>${escapeHtml(formatRelativeTime(row.created_at))}</td>
+          <td>${renderKaspaRowSource(row)}</td>
           <td class="mono">${renderKaspaTxLink(row.kaspa_txid)}</td>
           <td class="align-right mono">${formatKaspaSompi(row.amount_sompi)}</td>
           <td class="mono">${
@@ -1416,7 +1455,7 @@ function renderKaspaEntriesTable(rows) {
       <table class="data-table">
         <thead>
           <tr>
-            <th>Indexed</th>
+            <th>Source</th>
             <th>Kaspa L1 tx</th>
             <th class="align-right">Amount</th>
             <th>L2 allocation</th>
@@ -1427,6 +1466,16 @@ function renderKaspaEntriesTable(rows) {
       </table>
     </div>
   `;
+}
+
+function renderKaspaRowSource(row) {
+  if (row.kaspa_txid && row.created_at) {
+    return escapeHtml(formatRelativeTime(row.created_at));
+  }
+  if (row.l2_block_num) {
+    return '<span class="text-secondary">L2 allocation indexed</span>';
+  }
+  return '<span class="text-secondary">Pending L1 entry</span>';
 }
 
 function renderContractPanel(address, kind, summary, rows, inspect, methodsPayload, verificationPayload) {
