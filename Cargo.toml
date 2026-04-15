@@ -58,6 +58,10 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 # Crypto
 sha3 = "0.10"
 
+# Kaspa L1 provenance
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
@@ -86,6 +90,11 @@ glob = "0.3"
 dialoguer = "0.11"
 sqlparser = { version = "0.60.0", features = ["visitor"] }
 regex-lite = "0.1.8"
+
+[patch.crates-io]
+# kaspa-rpc-core v1.1.0 depends on serde_nested_with 0.2.x, whose crates.io
+# releases are yanked. Use the matching upstream tag instead of vendoring.
+serde_nested_with = { git = "https://github.com/murar8/serde_nested_with.git", tag = "0.2.6" }
 
 [dev-dependencies]
 # Testing & Benchmarks

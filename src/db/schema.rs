@@ -65,6 +65,8 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         .await?;
     conn.batch_execute(include_str!("../../db/explorer.sql"))
         .await?;
+    conn.batch_execute(include_str!("../../db/kaspa_provenance.sql"))
+        .await?;
     conn.batch_execute(include_str!("../../db/functions.sql"))
         .await?;
 

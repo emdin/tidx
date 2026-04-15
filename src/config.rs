@@ -146,6 +146,71 @@ pub struct ChainConfig {
     /// ClickHouse OLAP settings (for analytical queries)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
+
+    /// Optional Kaspa L1 provenance sync for Igra based-rollup transactions.
+    #[serde(default)]
+    pub kaspa: Option<KaspaConfig>,
+}
+
+/// Configuration for Kaspa L1 provenance sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KaspaConfig {
+    /// Enable Kaspa provenance sync.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Kaspa wRPC URL. Prefer Borsh wRPC, e.g. ws://127.0.0.1:17110.
+    #[serde(default = "default_kaspa_rpc_url")]
+    pub rpc_url: String,
+
+    /// Required Igra transaction-id prefix, hex encoded.
+    #[serde(default = "default_igra_txid_prefix")]
+    pub txid_prefix: String,
+
+    /// Poll interval for get_virtual_chain_from_block_v2.
+    #[serde(default = "default_kaspa_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Initial tip distance passed as min_confirmation_count.
+    #[serde(default = "default_kaspa_tip_distance")]
+    pub initial_tip_distance: u64,
+
+    /// Delay before pending accepted rows are promoted to final provenance.
+    #[serde(default = "default_kaspa_promotion_delay_secs")]
+    pub promotion_delay_secs: u64,
+}
+
+impl Default for KaspaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpc_url: default_kaspa_rpc_url(),
+            txid_prefix: default_igra_txid_prefix(),
+            poll_interval_ms: default_kaspa_poll_interval_ms(),
+            initial_tip_distance: default_kaspa_tip_distance(),
+            promotion_delay_secs: default_kaspa_promotion_delay_secs(),
+        }
+    }
+}
+
+fn default_kaspa_rpc_url() -> String {
+    "ws://127.0.0.1:17110".to_string()
+}
+
+fn default_igra_txid_prefix() -> String {
+    "97b1".to_string()
+}
+
+fn default_kaspa_poll_interval_ms() -> u64 {
+    1000
+}
+
+fn default_kaspa_tip_distance() -> u64 {
+    100
+}
+
+fn default_kaspa_promotion_delay_secs() -> u64 {
+    43_200
 }
 
 /// Configuration for ClickHouse OLAP engine
@@ -411,6 +476,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            kaspa: None,
         };
 
         assert_eq!(
@@ -436,6 +502,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            kaspa: None,
         };
 
         let resolved = config.resolved_pg_url().unwrap();
@@ -460,6 +527,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            kaspa: None,
         };
 
         assert!(config.resolved_pg_url().is_err());

@@ -16,6 +16,8 @@ use tidx::broadcast::Broadcaster;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
+use tidx::kaspa::clickhouse::KaspaClickHouseMirror;
+use tidx::kaspa::sync::run_kaspa_provenance_sync;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::fetcher::RpcClient;
@@ -307,6 +309,7 @@ fn spawn_sync_engine(
     tokio::spawn(async move {
         // Build SinkSet with PG (always) + optional ClickHouse direct-write sink
         let mut sinks = SinkSet::new(throttled_pool.inner().clone());
+        let mut kaspa_clickhouse: Option<KaspaClickHouseMirror> = None;
 
         if let Some(ref ch_config) = chain.clickhouse {
             if ch_config.enabled {
@@ -360,8 +363,31 @@ fn spawn_sync_engine(
                             );
                         }
                     }
+
+                    kaspa_clickhouse = Some(KaspaClickHouseMirror::new(
+                        &ch_config.url,
+                        &database,
+                        ch_config.user.as_deref(),
+                        ch_password.as_deref(),
+                    ));
                 }
             }
+        }
+
+        if chain.kaspa.as_ref().is_some_and(|cfg| cfg.enabled) {
+            let kaspa_chain = chain.clone();
+            let kaspa_pool = throttled_pool.inner().clone();
+            let kaspa_shutdown_rx = shutdown_rx.resubscribe();
+            let kaspa_clickhouse = kaspa_clickhouse.clone();
+            tokio::spawn(async move {
+                run_kaspa_provenance_sync(
+                    kaspa_chain,
+                    kaspa_pool,
+                    kaspa_clickhouse,
+                    kaspa_shutdown_rx,
+                )
+                .await;
+            });
         }
 
         // Auto-backfill ClickHouse from PostgreSQL in background (non-blocking).
