@@ -8,7 +8,7 @@ It includes:
 - `tidx` / `iidx` for L2 indexing, API, and explorer UI
 - `blockscout-importer` for verified contract source/ABI imports
 - `postgres` for primary indexed chain data
-- `clickhouse` for analytics queries and Grafana dashboards
+- `clickhouse` for analytics queries and Grafana dashboards; ClickHouse is part of the required production stack
 - `prometheus` for metrics
 - `grafana` for dashboards
 - `kaspa-wrpc-proxy` for Docker-to-host access to local Kaspa Borsh wRPC
@@ -18,6 +18,8 @@ Production defaults are intentionally conservative:
 - PostgreSQL and ClickHouse are private Docker services.
 - Prometheus and Grafana are bound to localhost; Grafana is also routed by Caddy at `/grafana`.
 - Explorer admin writes are allowed only from `trusted_cidrs` in `config.toml`.
+- Igra L2 data comes from the configured Igra Ethereum-compatible JSON-RPC.
+- Kaspa L1 provenance comes from a local Kaspa node over Borsh wRPC.
 - Kaspa provenance is shown as pending first, then promoted after the configured finality delay.
 - Database volumes are persistent and must never be deleted during redeploy.
 
@@ -32,6 +34,44 @@ Recommended first production host:
 - 1 TB NVMe minimum, larger if ClickHouse retention grows
 - Static public IPv4
 - Fully synced local Kaspa node with Borsh wRPC enabled on `127.0.0.1:17110`
+
+## Required Data Sources
+
+Production depends on two RPC inputs:
+
+| Input | Purpose | Production value |
+| --- | --- | --- |
+| Igra L2 JSON-RPC | L2 blocks, transactions, receipts, logs, balances, contract bytecode | `https://rpc.igralabs.com:8545` |
+| Kaspa Borsh wRPC | Kaspa L1 accepted transactions used for Igra provenance links and native iKAS entry tracking | local host `127.0.0.1:17110` |
+
+These are different systems:
+
+- The Igra RPC is an Ethereum-compatible RPC. It is configured in `config.toml` as `[[chains]].rpc_url`.
+- The Kaspa RPC is a Kaspa Borsh wRPC endpoint. It must run locally on the prod host and is reached by the container through `kaspa-wrpc-proxy`.
+- The explorer can index L2 data without Kaspa provenance, but production should keep Kaspa provenance enabled so bridge/entry rows can link back to Kaspa L1 transactions.
+
+Production also includes ClickHouse:
+
+- ClickHouse is not optional in this production bundle.
+- `tidx` writes PostgreSQL first, then mirrors analytical tables into ClickHouse.
+- Grafana dashboards and investigation query packs use ClickHouse.
+- ClickHouse is private inside Docker as `clickhouse:8123`; do not expose it publicly.
+
+Config references:
+
+```toml
+[[chains]]
+rpc_url = "https://rpc.igralabs.com:8545"
+
+[chains.clickhouse]
+enabled = true
+url = "http://clickhouse:8123"
+database = "tidx_38833"
+
+[chains.kaspa]
+enabled = true
+rpc_url = "ws://host.docker.internal:17111"
+```
 
 Open only:
 

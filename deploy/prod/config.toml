@@ -15,6 +15,9 @@ port = 9090
 [[chains]]
 name = "igra"
 chain_id = 38833
+
+# Igra L2 Ethereum-compatible JSON-RPC. This is the source for L2 blocks,
+# transactions, receipts, logs, balances, and contract bytecode.
 rpc_url = "https://rpc.igralabs.com:8545"
 pg_url = "postgres://tidx@postgres:5432/tidx_igra"
 pg_password_env = "POSTGRES_PASSWORD"
@@ -30,12 +33,18 @@ concurrency = 6
 trust_rpc = false
 
 [chains.clickhouse]
+# ClickHouse is part of the production stack. It powers Grafana dashboards,
+# investigation queries, and larger analytical scans.
 enabled = true
 url = "http://clickhouse:8123"
 database = "tidx_38833"
 
 [chains.kaspa]
 enabled = true
+
+# Kaspa L1 Borsh wRPC is expected on the host at 127.0.0.1:17110.
+# The kaspa-wrpc-proxy service exposes it to Docker as host.docker.internal:17111.
+# This is used only for Kaspa provenance, not for L2 block indexing.
 rpc_url = "ws://host.docker.internal:17111"
 txid_prefix = "97b1"
 poll_interval_ms = 1000
