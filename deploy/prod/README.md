@@ -153,7 +153,7 @@ docker push "$image"
 Manual equivalent from a fresh checkout:
 
 ```bash
-git clone https://github.com/reshmem/tidx.git
+git clone git@github.com:IgraLabs/tidx.git
 cd tidx
 git checkout igra
 git pull --ff-only origin igra
@@ -203,7 +203,7 @@ docker compose up -d tidx blockscout-importer
 Clone and configure:
 
 ```bash
-git clone https://github.com/reshmem/tidx.git
+git clone git@github.com:IgraLabs/tidx.git
 cd tidx
 git checkout igra
 cd deploy/prod
