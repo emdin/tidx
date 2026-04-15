@@ -1,0 +1,863 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "description": "Set wallet_address, wallet_topic, contract_address, and token_address in the dashboard variables before using the wallet/token investigation panels. wallet_topic must be a 32-byte left-padded topic value.",
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, idx, hash, `from`, `to`, value, gas_used FROM txs WHERE `from` = '$wallet_address' OR `to` = '$wallet_address' ORDER BY block_num DESC, idx DESC LIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "1. Wallet Activity Timeline",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT counterparty, count() AS interactions FROM ( SELECT `to` AS counterparty FROM txs WHERE `from` = '$wallet_address' AND `to` IS NOT NULL UNION ALL SELECT `from` AS counterparty FROM txs WHERE `to` = '$wallet_address' ) GROUP BY counterparty ORDER BY interactions DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "2. Wallet Counterparties",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT min(block_timestamp) AS first_seen, max(block_timestamp) AS last_seen, count() AS tx_count FROM txs WHERE `from` = '$wallet_address' OR `to` = '$wallet_address'",
+          "refId": "A"
+        }
+      ],
+      "title": "3. Wallet First Seen / Last Seen",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT receipts.block_num, receipts.tx_hash, receipts.status, receipts.gas_used, txs.`to` FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE (txs.`from` = '$wallet_address' OR txs.`to` = '$wallet_address') AND receipts.status = 0 ORDER BY receipts.block_num DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "4. Wallet Failed Transactions",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toStartOfMinute(block_timestamp) AS minute, count() AS txs FROM txs WHERE `from` = '$wallet_address' GROUP BY minute ORDER BY txs DESC, minute DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "5. Wallet Burst Activity By Minute",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT `from`, count() AS calls FROM txs WHERE `to` = '$contract_address' GROUP BY `from` ORDER BY calls DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "6. Top Callers To Contract",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, calls FROM (SELECT substring(input, 1, 10) AS selector_raw, count() AS calls FROM txs WHERE `to` = '$contract_address' AND length(input) >= 10 GROUP BY selector_raw ORDER BY calls DESC LIMIT 20)",
+          "refId": "A"
+        }
+      ],
+      "title": "7. Top Method Selectors To Contract",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, failed_calls FROM (SELECT substring(txs.input, 1, 10) AS selector_raw, count() AS failed_calls FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE txs.`to` = '$contract_address' AND receipts.status = 0 AND length(txs.input) >= 10 GROUP BY selector_raw ORDER BY failed_calls DESC LIMIT 20)",
+          "refId": "A"
+        }
+      ],
+      "title": "8. Failed Calls To Contract By Selector",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 9,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT topic0, count() AS emitted FROM logs WHERE address = '$contract_address' AND topic0 IS NOT NULL GROUP BY topic0 ORDER BY emitted DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "9. Top Events Emitted By Contract",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT receipts.block_num, receipts.tx_hash, receipts.gas_used, txs.`from`, concat('0x​', substring(substring(txs.input, 1, 10), 3)) AS selector FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE txs.`to` = '$contract_address' ORDER BY receipts.gas_used DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "10. High Gas Calls To Contract",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 11,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, tx_hash, contract_address, `from` FROM receipts WHERE contract_address IS NOT NULL ORDER BY block_num DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "11. Recent Contract Deployments",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 12,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT `from`, count() AS contracts_deployed FROM receipts WHERE contract_address IS NOT NULL GROUP BY `from` ORDER BY contracts_deployed DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "12. Top Deployers",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 13,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, tx_hash, address, topic1, topic2 FROM logs WHERE address = '$token_address' AND topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND (topic1 = '$wallet_topic' OR topic2 = '$wallet_topic') ORDER BY block_num DESC LIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "13. Token Transfers Involving Wallet",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 14,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT topic2 AS recipient_topic, count() AS transfers FROM logs WHERE address = '$token_address' AND topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' GROUP BY recipient_topic ORDER BY transfers DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "14. Top Token Recipients",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "id": 15,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT topic1 AS sender_topic, count() AS transfers FROM logs WHERE address = '$token_address' AND topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' GROUP BY sender_topic ORDER BY transfers DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "15. Top Token Senders",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "id": 16,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, tx_hash, topic1, topic2 FROM logs WHERE address = '$token_address' AND topic0 = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925' AND (topic1 = '$wallet_topic' OR topic2 = '$wallet_topic') ORDER BY block_num DESC LIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "16. Token Approvals Involving Wallet",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "id": 17,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT address, count() AS approvals FROM logs WHERE topic0 = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925' GROUP BY address ORDER BY approvals DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "17. Top Approval Heavy Contracts",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "id": 18,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT txs.block_num, count() AS tx_count, uniqExact(txs.`from`) AS unique_callers FROM txs WHERE txs.`to` = '$contract_address' GROUP BY txs.block_num HAVING tx_count >= 2 ORDER BY unique_callers DESC, tx_count DESC, txs.block_num DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "18. Same Block Swarm Into Contract",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "id": 19,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT `from`, `to`, count() AS tx_count FROM txs WHERE `to` IS NOT NULL GROUP BY `from`, `to` ORDER BY tx_count DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "19. Repeated Sender Contract Pairs",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Sender",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed_txs"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "id": 20,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(txs.`from`, 3)) AS sender, txs.`from` AS sender_raw, count() AS failed_txs FROM receipts INNER JOIN txs ON receipts.tx_hash = txs.hash WHERE receipts.status = 0 GROUP BY sender, sender_raw ORDER BY failed_txs DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "sender_raw": true
+            },
+            "indexByName": {
+              "sender": 0,
+              "failed_txs": 1,
+              "sender_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ],
+      "title": "20. Top Failed Senders",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "igra",
+    "clickhouse",
+    "investigator"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "0x123ddd6ebfafb687fee659a9f2f1d25298c965e8",
+          "value": "0x123ddd6ebfafb687fee659a9f2f1d25298c965e8"
+        },
+        "hide": 0,
+        "label": "Wallet Address",
+        "name": "wallet_address",
+        "options": [],
+        "query": "0x123ddd6ebfafb687fee659a9f2f1d25298c965e8",
+        "skipUrlSync": false,
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "0x000000000000000000000000123ddd6ebfafb687fee659a9f2f1d25298c965e8",
+          "value": "0x000000000000000000000000123ddd6ebfafb687fee659a9f2f1d25298c965e8"
+        },
+        "hide": 0,
+        "label": "Wallet Topic",
+        "name": "wallet_topic",
+        "options": [],
+        "query": "0x000000000000000000000000123ddd6ebfafb687fee659a9f2f1d25298c965e8",
+        "skipUrlSync": false,
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "0xc24df70e408739aef6bf594fd41db4632df49188",
+          "value": "0xc24df70e408739aef6bf594fd41db4632df49188"
+        },
+        "hide": 0,
+        "label": "Contract Address",
+        "name": "contract_address",
+        "options": [],
+        "query": "0xc24df70e408739aef6bf594fd41db4632df49188",
+        "skipUrlSync": false,
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "0x69791fe346567c11941644ea53f556264a27b8d6",
+          "value": "0x69791fe346567c11941644ea53f556264a27b8d6"
+        },
+        "hide": 0,
+        "label": "Token Address",
+        "name": "token_address",
+        "options": [],
+        "query": "0x69791fe346567c11941644ea53f556264a27b8d6",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Igra Investigator Workbench",
+  "uid": "igra-investigator-workbench",
+  "version": 1,
+  "weekStart": ""
+}

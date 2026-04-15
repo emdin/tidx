@@ -1,0 +1,1471 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT num, hash, timestamp, gas_used FROM blocks ORDER BY num DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "1. Latest 20 Blocks",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, idx, hash, `from`, `to`, gas_used FROM txs ORDER BY block_num DESC, idx DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "2. Latest 20 Transactions",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, tx_idx, tx_hash, status, gas_used FROM receipts ORDER BY block_num DESC, tx_idx DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "3. Latest 20 Receipts",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, log_idx, tx_hash, address, topic0 FROM logs ORDER BY block_num DESC, log_idx DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "4. Latest 20 Logs",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT (SELECT count() FROM blocks) AS blocks, (SELECT count() FROM txs) AS txs, (SELECT count() FROM receipts) AS receipts, (SELECT count() FROM logs) AS logs",
+          "refId": "A"
+        }
+      ],
+      "title": "5. Basic Chain Totals",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toDate(block_timestamp) AS day, count() AS txs FROM txs GROUP BY day ORDER BY day DESC LIMIT 30",
+          "refId": "A"
+        }
+      ],
+      "title": "6. Daily Transactions",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toDate(block_timestamp) AS day, countIf(status = 1) AS success_txs, countIf(status = 0) AS failed_txs FROM receipts GROUP BY day ORDER BY day DESC LIMIT 30",
+          "refId": "A"
+        }
+      ],
+      "title": "7. Daily Success vs Failed",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toStartOfHour(block_timestamp) AS hour, count() AS txs, round(count() / 3600, 4) AS avg_tps FROM txs GROUP BY hour ORDER BY hour DESC LIMIT 48",
+          "refId": "A"
+        }
+      ],
+      "title": "8. Hourly TPS Approximation",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Sender",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tx_count"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 9,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(`from`, 3)) AS sender, `from` AS sender_raw, toUInt64(count()) AS tx_count FROM txs GROUP BY sender, sender_raw ORDER BY tx_count DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "sender_raw": true
+            },
+            "indexByName": {
+              "sender": 0,
+              "tx_count": 1,
+              "sender_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ],
+      "title": "9. Top Senders",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recipient"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tx_count"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(`to`, 3)) AS recipient, `to` AS recipient_raw, toUInt64(count()) AS tx_count FROM txs WHERE `to` IS NOT NULL GROUP BY recipient, recipient_raw ORDER BY tx_count DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "recipient_raw": true
+            },
+            "indexByName": {
+              "recipient": 0,
+              "tx_count": 1,
+              "recipient_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ],
+      "title": "10. Top Recipients / Contracts",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "contract"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open In Explorer",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}?tab=contract",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "log_count"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 11,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(address, 3)) AS contract, address AS contract_raw, toUInt64(count()) AS log_count FROM logs GROUP BY contract, contract_raw ORDER BY log_count DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "contract_raw": true
+            },
+            "indexByName": {
+              "contract": 0,
+              "log_count": 1,
+              "contract_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ],
+      "title": "11. Top Contracts By Emitted Logs",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 12,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT topic0, count() AS log_count FROM logs WHERE topic0 IS NOT NULL GROUP BY topic0 ORDER BY log_count DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "12. Top Event Signatures",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 13,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(selector_raw, 3)) AS selector, tx_count FROM (SELECT substring(input, 1, 10) AS selector_raw, count() AS tx_count FROM txs WHERE length(input) >= 10 GROUP BY selector_raw ORDER BY tx_count DESC LIMIT 20)",
+          "refId": "A"
+        }
+      ],
+      "title": "13. Top Method Selectors",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "block_num"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Block",
+                    "url": "__EXPLORER_BASE_URL__/block/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tx_hash"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Receipt",
+                    "url": "__EXPLORER_BASE_URL__/receipt/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "contract"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Contract",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}?tab=contract",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "deployer"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Deployer",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 14,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, concat('0x​', substring(tx_hash_raw, 3)) AS tx_hash, tx_hash_raw, concat('0x​', substring(contract_raw, 3)) AS contract, contract_raw, concat('0x​', substring(deployer_raw, 3)) AS deployer, deployer_raw FROM (SELECT block_num, tx_hash AS tx_hash_raw, contract_address AS contract_raw, `from` AS deployer_raw FROM receipts WHERE contract_address IS NOT NULL ORDER BY block_num DESC LIMIT 20)",
+          "refId": "A"
+        }
+      ],
+      "title": "14. Recent Contract Deployments",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "tx_hash_raw": true,
+              "contract_raw": true,
+              "deployer_raw": true
+            },
+            "indexByName": {
+              "block_num": 0,
+              "tx_hash": 1,
+              "contract": 2,
+              "deployer": 3,
+              "tx_hash_raw": 4,
+              "contract_raw": 5,
+              "deployer_raw": 6
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "block_num"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Block",
+                    "url": "__EXPLORER_BASE_URL__/block/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tx_hash"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Receipt",
+                    "url": "__EXPLORER_BASE_URL__/receipt/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Sender",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recipient"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Recipient",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gas_used"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "id": 15,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, concat('0x​', substring(tx_hash_raw, 3)) AS tx_hash, tx_hash_raw, toUInt64(gas_used) AS gas_used, concat('0x​', substring(sender_raw, 3)) AS sender, sender_raw, concat('0x​', substring(recipient_raw, 3)) AS recipient, recipient_raw FROM (SELECT block_num, tx_hash AS tx_hash_raw, gas_used, `from` AS sender_raw, `to` AS recipient_raw FROM receipts ORDER BY gas_used DESC LIMIT 20)",
+          "refId": "A"
+        }
+      ],
+      "title": "15. Biggest Gas Users",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "tx_hash_raw": true,
+              "sender_raw": true,
+              "recipient_raw": true
+            },
+            "indexByName": {
+              "block_num": 0,
+              "tx_hash": 1,
+              "gas_used": 2,
+              "sender": 3,
+              "recipient": 4,
+              "tx_hash_raw": 5,
+              "sender_raw": 6,
+              "recipient_raw": 7
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "contract"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Contract",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}?tab=contract",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_gas"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tx_count"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "id": 16,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(`to`, 3)) AS contract, `to` AS contract_raw, toUInt64(sum(gas_used)) AS total_gas, toUInt64(count()) AS tx_count FROM receipts WHERE `to` IS NOT NULL GROUP BY contract, contract_raw ORDER BY total_gas DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "16. Contracts With Highest Total Gas",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "contract_raw": true
+            },
+            "indexByName": {
+              "contract": 0,
+              "total_gas": 1,
+              "tx_count": 2,
+              "contract_raw": 3
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "address"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Address",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "appearances"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "id": 17,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(address, 3)) AS address, address AS address_raw, toUInt64(count()) AS appearances FROM ( SELECT `from` AS address FROM txs WHERE block_timestamp >= now() - INTERVAL 1 DAY UNION ALL SELECT `to` AS address FROM txs WHERE `to` IS NOT NULL AND block_timestamp >= now() - INTERVAL 1 DAY ) GROUP BY address, address_raw ORDER BY appearances DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "17. Most Active Addresses In Last 24h",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "address_raw": true
+            },
+            "indexByName": {
+              "address": 0,
+              "appearances": 1,
+              "address_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "token"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Token",
+                    "url": "__EXPLORER_BASE_URL__/token/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "transfers"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "id": 18,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(address, 3)) AS token, address AS token_raw, toUInt64(count()) AS transfers FROM logs WHERE topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' GROUP BY token, token_raw ORDER BY transfers DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "18. ERC-20 Transfer Heavy Contracts",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "token_raw": true
+            },
+            "indexByName": {
+              "token": 0,
+              "transfers": 1,
+              "token_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "token"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Token",
+                    "url": "__EXPLORER_BASE_URL__/token/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "approvals"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "id": 19,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat('0x​', substring(address, 3)) AS token, address AS token_raw, toUInt64(count()) AS approvals FROM logs WHERE topic0 = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925' GROUP BY token, token_raw ORDER BY approvals DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "19. ERC-20 Approval Heavy Contracts",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "token_raw": true
+            },
+            "indexByName": {
+              "token": 0,
+              "approvals": 1,
+              "token_raw": 2
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-igra"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "block_num"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Block",
+                    "url": "__EXPLORER_BASE_URL__/block/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hash"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Receipt",
+                    "url": "__EXPLORER_BASE_URL__/receipt/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sender"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Sender",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recipient"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Recipient",
+                    "url": "__EXPLORER_BASE_URL__/address/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "native_value"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gas_used"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "id": 20,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-igra"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT block_num, idx, concat('0x​', substring(hash_raw, 3)) AS hash, hash_raw, concat('0x​', substring(sender_raw, 3)) AS sender, sender_raw, concat('0x​', substring(recipient_raw, 3)) AS recipient, recipient_raw, round(toFloat64(value) / 1e18, 4) AS native_value, toUInt64(gas_used) AS gas_used FROM (SELECT block_num, idx, hash AS hash_raw, `from` AS sender_raw, `to` AS recipient_raw, value, gas_used FROM txs WHERE `from` = '0x123ddd6ebfafb687fee659a9f2f1d25298c965e8' OR `to` = '0x123ddd6ebfafb687fee659a9f2f1d25298c965e8' ORDER BY block_num DESC, idx DESC LIMIT 100)",
+          "refId": "A"
+        }
+      ],
+      "title": "20. Address Activity Drilldown",
+      "type": "table",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "hash_raw": true,
+              "sender_raw": true,
+              "recipient_raw": true
+            },
+            "indexByName": {
+              "block_num": 0,
+              "idx": 1,
+              "hash": 2,
+              "sender": 3,
+              "recipient": 4,
+              "native_value": 5,
+              "gas_used": 6,
+              "hash_raw": 7,
+              "sender_raw": 8,
+              "recipient_raw": 9
+            },
+            "renameByName": {
+              "value": "native_value"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "igra",
+    "clickhouse",
+    "analytics"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Igra ClickHouse Analytics",
+  "uid": "igra-clickhouse-analytics",
+  "version": 1,
+  "weekStart": ""
+}
