@@ -29,3 +29,11 @@ trust_rpc = false
 enabled = true
 url = "http://clickhouse:8123"
 database = "tidx_38833"
+
+[chains.kaspa]
+enabled = true
+rpc_url = "ws://127.0.0.1:17110"
+txid_prefix = "97b1"
+poll_interval_ms = 1000
+initial_tip_distance = 100
+promotion_delay_secs = 43200
