@@ -71,6 +71,65 @@ TIDX_IMAGE=ghcr.io/igralabs/iidx:igra-ac8e120
 
 Avoid mutable tags like `latest` for prod rollback safety.
 
+`TIDX_IMAGE` is the Docker image used by both production application services:
+
+- `tidx`, which runs the indexer, API, and explorer UI
+- `blockscout-importer`, which reuses the same binary image to import verified contracts
+
+The placeholder in `.env.example` is intentionally not deployable:
+
+```env
+TIDX_IMAGE=ghcr.io/igralabs/iidx:replace-with-release-tag
+```
+
+Before production deploy, replace it with a real release tag built from a known git commit:
+
+```env
+TIDX_IMAGE=ghcr.io/igralabs/iidx:igra-aa3fdcc
+```
+
+Recommended CI release pattern:
+
+```bash
+git_sha="$(git rev-parse --short=7 HEAD)"
+image="ghcr.io/igralabs/iidx:igra-${git_sha}"
+
+docker build -t "$image" .
+docker push "$image"
+```
+
+If the prod host pulls from private GHCR, authenticate once on the host:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-user-or-bot> --password-stdin
+```
+
+Then set `.env` on the prod host:
+
+```env
+TIDX_IMAGE=ghcr.io/igralabs/iidx:igra-aa3fdcc
+```
+
+Deploy exactly that image:
+
+```bash
+docker compose pull
+docker compose up -d tidx blockscout-importer
+./stability-smoke.sh
+```
+
+Rollback is the same mechanism with the previous known-good tag:
+
+```env
+TIDX_IMAGE=ghcr.io/igralabs/iidx:igra-ac8e120
+```
+
+```bash
+docker compose pull
+docker compose up -d tidx blockscout-importer
+./stability-smoke.sh
+```
+
 ## First Deploy
 
 Clone and configure:
