@@ -12,8 +12,8 @@ use crate::metrics::{self, SyncProgress};
 use crate::types::SyncState;
 
 use super::decoder::{
-    decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-    timestamp_from_secs,
+    decode_block, decode_log, decode_receipt, decode_transaction, decode_withdrawals,
+    enrich_txs_from_receipts, timestamp_from_secs,
 };
 use super::fetcher::{ReceiptFetchMode, RpcClient};
 use super::sink::SinkSet;
@@ -338,7 +338,7 @@ impl SyncEngine {
 
         while current_from <= remote_head {
             let batch_start = std::time::Instant::now();
-            let (blocks, block_rows, all_txs, all_logs, all_receipts) =
+            let (blocks, block_rows, all_txs, all_logs, all_receipts, all_withdrawals) =
                 current_fetch.take().unwrap();
             let tx_count = all_txs.len() as u64;
             let log_count = all_logs.len() as u64;
@@ -362,7 +362,13 @@ impl SyncEngine {
             let write_future = async move {
                 let write_start = std::time::Instant::now();
                 sinks
-                    .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
+                    .write_all(
+                        &block_rows,
+                        &all_txs,
+                        &all_logs,
+                        &all_receipts,
+                        &all_withdrawals,
+                    )
                     .await?;
                 let write_ms = write_start.elapsed().as_millis();
                 Ok::<_, anyhow::Error>(write_ms)
@@ -549,6 +555,7 @@ impl SyncEngine {
         Vec<crate::types::TxRow>,
         Vec<crate::types::LogRow>,
         Vec<crate::types::ReceiptRow>,
+        Vec<crate::types::L2WithdrawalRow>,
     )> {
         let (blocks, receipts) = fetch_blocks_and_receipts(&self.realtime_rpc, from, to).await?;
 
@@ -561,6 +568,7 @@ impl SyncEngine {
             .collect();
 
         let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
+        let all_withdrawals: Vec<_> = blocks.iter().flat_map(decode_withdrawals).collect();
 
         let mut all_txs: Vec<_> = blocks
             .iter()
@@ -605,15 +613,28 @@ impl SyncEngine {
 
         enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
-        Ok((blocks, block_rows, all_txs, all_logs, all_receipts))
+        Ok((
+            blocks,
+            block_rows,
+            all_txs,
+            all_logs,
+            all_receipts,
+            all_withdrawals,
+        ))
     }
 
     pub async fn sync_range(&self, from: u64, to: u64) -> Result<()> {
-        let (_blocks, block_rows, all_txs, all_logs, all_receipts) =
+        let (_blocks, block_rows, all_txs, all_logs, all_receipts, all_withdrawals) =
             self.fetch_range(from, to).await?;
 
         self.sinks
-            .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
+            .write_all(
+                &block_rows,
+                &all_txs,
+                &all_logs,
+                &all_receipts,
+                &all_withdrawals,
+            )
             .await?;
 
         Ok(())
@@ -647,6 +668,7 @@ impl SyncEngine {
             .iter()
             .map(|r| decode_receipt(r, block_ts))
             .collect();
+        let withdrawal_rows = decode_withdrawals(&block);
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
 
@@ -656,6 +678,7 @@ impl SyncEngine {
                 &txs,
                 &log_rows,
                 &receipt_rows,
+                &withdrawal_rows,
             )
             .await?;
 
@@ -1332,8 +1355,8 @@ async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
 async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
     use super::decoder::{
-        decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-        timestamp_from_secs,
+        decode_block, decode_log, decode_receipt, decode_transaction, decode_withdrawals,
+        enrich_txs_from_receipts, timestamp_from_secs,
     };
     use alloy::network::ReceiptResponse;
 
@@ -1345,6 +1368,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         .collect();
 
     let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
+    let all_withdrawals: Vec<_> = blocks.iter().flat_map(decode_withdrawals).collect();
 
     let mut all_txs: Vec<_> = blocks
         .iter()
@@ -1390,7 +1414,13 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
     sinks
-        .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
+        .write_all(
+            &block_rows,
+            &all_txs,
+            &all_logs,
+            &all_receipts,
+            &all_withdrawals,
+        )
         .await?;
 
     Ok(())
@@ -1524,7 +1554,9 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         let receipt_count = all_receipts.len();
 
         // Write logs + receipts atomically in a single transaction
-        sinks.write_all(&[], &[], &all_logs, &all_receipts).await?;
+        sinks
+            .write_all(&[], &[], &all_logs, &all_receipts, &[])
+            .await?;
 
         if receipt_count > 0 {
             min_block = Some(min_block.map_or(from, |m: u64| m.min(from)));

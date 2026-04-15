@@ -3,7 +3,7 @@ use alloy::network::{ReceiptResponse, TransactionResponse};
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::tempo::{Block, Log, Receipt, Transaction};
-use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
+use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
 pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
     Utc.timestamp_opt(secs as i64, 0)
@@ -62,6 +62,34 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
     }
 }
 
+pub fn decode_withdrawals(block: &Block) -> Vec<L2WithdrawalRow> {
+    let block_timestamp = timestamp_from_secs(block.header.timestamp);
+    let Some(withdrawals) = block.withdrawals.as_ref() else {
+        return Vec::new();
+    };
+
+    withdrawals
+        .iter()
+        .enumerate()
+        .map(|(idx, withdrawal)| {
+            let amount_gwei = i64::try_from(withdrawal.amount).unwrap_or(i64::MAX);
+            L2WithdrawalRow {
+                block_num: block.header.number as i64,
+                block_timestamp,
+                idx: idx as i32,
+                withdrawal_index: withdrawal.index.to_string(),
+                index_le: withdrawal.index.to_le_bytes().to_vec(),
+                validator_index: withdrawal.validator_index.to_string(),
+                address: withdrawal.address.as_slice().to_vec(),
+                amount_gwei,
+                // Igra entry amounts are sompi. The Engine API withdrawal field is gwei,
+                // so the adapter multiplies sompi by 10 before block inclusion.
+                amount_sompi: amount_gwei / 10,
+            }
+        })
+        .collect()
+}
+
 pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
     let topics = log.topics();
     let selector = topics.first().map(|s| s.as_slice().to_vec());
@@ -113,7 +141,12 @@ mod tests {
         }
     }
 
-    fn make_receipt(block_num: i64, tx_idx: i32, gas_used: i64, fee_payer: Option<Vec<u8>>) -> ReceiptRow {
+    fn make_receipt(
+        block_num: i64,
+        tx_idx: i32,
+        gas_used: i64,
+        fee_payer: Option<Vec<u8>>,
+    ) -> ReceiptRow {
         ReceiptRow {
             block_num,
             tx_idx,
@@ -168,11 +201,7 @@ mod tests {
 
     #[test]
     fn enrich_multi_block_batch() {
-        let mut txs = vec![
-            make_tx(10, 0),
-            make_tx(10, 1),
-            make_tx(11, 0),
-        ];
+        let mut txs = vec![make_tx(10, 0), make_tx(10, 1), make_tx(11, 0)];
         let receipts = vec![
             make_receipt(10, 0, 21000, Some(vec![0x01; 20])),
             make_receipt(10, 1, 42000, None),

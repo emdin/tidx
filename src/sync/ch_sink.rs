@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::metrics;
-use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
+use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
 /// Schema SQL files embedded at compile time.
 const BLOCKS_SCHEMA: &str = include_str!("../../db/clickhouse/blocks.sql");
 const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
 const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
+const L2_WITHDRAWALS_SCHEMA: &str = include_str!("../../db/clickhouse/l2_withdrawals.sql");
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 10_000;
@@ -89,6 +90,7 @@ impl ClickHouseSink {
             ("txs", TXS_SCHEMA),
             ("logs", LOGS_SCHEMA),
             ("receipts", RECEIPTS_SCHEMA),
+            ("l2_withdrawals", L2_WITHDRAWALS_SCHEMA),
         ] {
             self.client
                 .query(ddl)
@@ -174,6 +176,22 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    pub async fn write_l2_withdrawals(&self, withdrawals: &[L2WithdrawalRow]) -> Result<()> {
+        if withdrawals.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        self.insert_chunked("l2_withdrawals", withdrawals, ChL2WithdrawalWire::from_row)
+            .await?;
+        metrics::record_sink_write_duration(self.name(), "l2_withdrawals", start.elapsed());
+        metrics::record_sink_write_rows(self.name(), "l2_withdrawals", withdrawals.len() as u64);
+        metrics::increment_sink_row_count(self.name(), "l2_withdrawals", withdrawals.len() as u64);
+        if let Some(max) = withdrawals.iter().map(|w| w.block_num).max() {
+            metrics::update_sink_watermark(self.name(), "l2_withdrawals", max);
+        }
+        Ok(())
+    }
+
     /// Query the highest block number in ClickHouse, or None if empty.
     pub async fn max_block_num(&self) -> Result<Option<i64>> {
         let count: u64 = self
@@ -234,7 +252,7 @@ impl ClickHouseSink {
 
     /// Delete all data from a given block number onwards (reorg support).
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
-        let tables = ["logs", "receipts", "txs", "blocks"];
+        let tables = ["logs", "receipts", "txs", "l2_withdrawals", "blocks"];
         let block_col = |t: &str| if t == "blocks" { "num" } else { "block_num" };
 
         for table in &tables {
@@ -480,13 +498,43 @@ impl ChReceiptWire {
     }
 }
 
+#[derive(Row, Serialize)]
+struct ChL2WithdrawalWire {
+    block_num: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
+    idx: i32,
+    withdrawal_index: String,
+    index_le: String,
+    validator_index: String,
+    address: String,
+    amount_gwei: i64,
+    amount_sompi: i64,
+}
+
+impl ChL2WithdrawalWire {
+    fn from_row(w: &L2WithdrawalRow) -> Self {
+        Self {
+            block_num: w.block_num,
+            block_timestamp: w.block_timestamp,
+            idx: w.idx,
+            withdrawal_index: w.withdrawal_index.clone(),
+            index_le: hex_encode(&w.index_le),
+            validator_index: w.validator_index.clone(),
+            address: hex_encode(&w.address),
+            amount_gwei: w.amount_gwei,
+            amount_sompi: w.amount_sompi,
+        }
+    }
+}
+
 /// Hex-encode bytes with 0x prefix.
 fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
 /// Known table names that are safe to interpolate into SQL.
-const KNOWN_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
+const KNOWN_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts", "l2_withdrawals"];
 
 /// Validate that a table name is one of the known tables.
 /// Returns the validated name or an error for unknown tables.

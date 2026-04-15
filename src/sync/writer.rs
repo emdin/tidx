@@ -6,7 +6,7 @@ use tokio_postgres::types::Type;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
+use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, SyncState, TxRow};
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
@@ -112,28 +112,28 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     .await?;
 
     let types = &[
-        Type::INT8,       // block_num
+        Type::INT8,        // block_num
         Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,       // idx
-        Type::BYTEA,      // hash
-        Type::INT2,       // type
-        Type::BYTEA,      // from
-        Type::BYTEA,      // to
-        Type::TEXT,       // value
-        Type::BYTEA,      // input
-        Type::INT8,       // gas_limit
-        Type::TEXT,       // max_fee_per_gas
-        Type::TEXT,       // max_priority_fee_per_gas
-        Type::INT8,       // gas_used
-        Type::BYTEA,      // nonce_key
-        Type::INT8,       // nonce
-        Type::BYTEA,      // fee_token
-        Type::BYTEA,      // fee_payer
-        Type::JSONB,      // calls
-        Type::INT2,       // call_count
-        Type::INT8,       // valid_before
-        Type::INT8,       // valid_after
-        Type::INT2,       // signature_type
+        Type::INT4,        // idx
+        Type::BYTEA,       // hash
+        Type::INT2,        // type
+        Type::BYTEA,       // from
+        Type::BYTEA,       // to
+        Type::TEXT,        // value
+        Type::BYTEA,       // input
+        Type::INT8,        // gas_limit
+        Type::TEXT,        // max_fee_per_gas
+        Type::TEXT,        // max_priority_fee_per_gas
+        Type::INT8,        // gas_used
+        Type::BYTEA,       // nonce_key
+        Type::INT8,        // nonce
+        Type::BYTEA,       // fee_token
+        Type::BYTEA,       // fee_payer
+        Type::JSONB,       // calls
+        Type::INT2,        // call_count
+        Type::INT8,        // valid_before
+        Type::INT8,        // valid_after
+        Type::INT2,        // signature_type
     ];
 
     let sink = tx
@@ -180,7 +180,11 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
-    tx.execute("INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING", &[]).await?;
+    tx.execute(
+        "INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
@@ -213,18 +217,18 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     .await?;
 
     let types = &[
-        Type::INT8,       // block_num
+        Type::INT8,        // block_num
         Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,       // log_idx
-        Type::INT4,       // tx_idx
-        Type::BYTEA,      // tx_hash
-        Type::BYTEA,      // address
-        Type::BYTEA,      // selector
-        Type::BYTEA,      // topic0
-        Type::BYTEA,      // topic1
-        Type::BYTEA,      // topic2
-        Type::BYTEA,      // topic3
-        Type::BYTEA,      // data
+        Type::INT4,        // log_idx
+        Type::INT4,        // tx_idx
+        Type::BYTEA,       // tx_hash
+        Type::BYTEA,       // address
+        Type::BYTEA,       // selector
+        Type::BYTEA,       // topic0
+        Type::BYTEA,       // topic1
+        Type::BYTEA,       // topic2
+        Type::BYTEA,       // topic3
+        Type::BYTEA,       // data
     ];
 
     let sink = tx
@@ -258,7 +262,11 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
-    tx.execute("INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING", &[]).await?;
+    tx.execute(
+        "INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
@@ -339,7 +347,11 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     pinned_writer.as_mut().finish().await?;
 
-    tx.execute("INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING", &[]).await?;
+    tx.execute(
+        "INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
@@ -352,6 +364,80 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     Ok(())
 }
 
+pub async fn write_l2_withdrawals(pool: &Pool, withdrawals: &[L2WithdrawalRow]) -> Result<()> {
+    if withdrawals.is_empty() {
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.execute(
+        "CREATE TEMP TABLE _staging_l2_withdrawals (
+            block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4,
+            withdrawal_index TEXT, index_le BYTEA, validator_index TEXT,
+            address BYTEA, amount_gwei INT8, amount_sompi INT8
+        ) ON COMMIT DROP",
+        &[],
+    )
+    .await?;
+
+    let types = &[
+        Type::INT8,        // block_num
+        Type::TIMESTAMPTZ, // block_timestamp
+        Type::INT4,        // idx
+        Type::TEXT,        // withdrawal_index
+        Type::BYTEA,       // index_le
+        Type::TEXT,        // validator_index
+        Type::BYTEA,       // address
+        Type::INT8,        // amount_gwei
+        Type::INT8,        // amount_sompi
+    ];
+
+    let sink = tx
+        .copy_in(
+            "COPY _staging_l2_withdrawals (block_num, block_timestamp, idx, withdrawal_index, index_le, validator_index, address, amount_gwei, amount_sompi) FROM STDIN BINARY",
+        )
+        .await?;
+
+    let writer = BinaryCopyInWriter::new(sink, types);
+    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+    for withdrawal in withdrawals {
+        pinned_writer
+            .as_mut()
+            .write(&[
+                &withdrawal.block_num,
+                &withdrawal.block_timestamp,
+                &withdrawal.idx,
+                &withdrawal.withdrawal_index,
+                &withdrawal.index_le,
+                &withdrawal.validator_index,
+                &withdrawal.address,
+                &withdrawal.amount_gwei,
+                &withdrawal.amount_sompi,
+            ])
+            .await?;
+    }
+
+    pinned_writer.as_mut().finish().await?;
+
+    tx.execute(
+        "INSERT INTO l2_withdrawals SELECT * FROM _staging_l2_withdrawals ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
+    tx.commit().await?;
+
+    metrics::record_sink_write_duration("postgres", "l2_withdrawals", start.elapsed());
+    metrics::record_sink_write_rows("postgres", "l2_withdrawals", withdrawals.len() as u64);
+    metrics::increment_sink_row_count("postgres", "l2_withdrawals", withdrawals.len() as u64);
+    if let Some(max) = withdrawals.iter().map(|w| w.block_num).max() {
+        metrics::update_sink_watermark("postgres", "l2_withdrawals", max);
+    }
+
+    Ok(())
+}
 
 /// Batch insert blocks, txs, logs, and receipts in a single PG transaction.
 ///
@@ -363,6 +449,7 @@ pub async fn write_batch(
     txs: &[TxRow],
     logs: &[LogRow],
     receipts: &[ReceiptRow],
+    withdrawals: &[L2WithdrawalRow],
 ) -> Result<()> {
     let start = Instant::now();
     let mut conn = pool.get().await?;
@@ -510,7 +597,11 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        tx.execute("INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING", &[]).await?;
+        tx.execute(
+            "INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
     }
 
     // ── logs ──────────────────────────────────────────────────────────────
@@ -571,7 +662,11 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        tx.execute("INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING", &[]).await?;
+        tx.execute(
+            "INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
     }
 
     // ── receipts ──────────────────────────────────────────────────────────
@@ -635,7 +730,70 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        tx.execute("INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING", &[]).await?;
+        tx.execute(
+            "INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
+    }
+
+    // ── L2 withdrawals ───────────────────────────────────────────────────
+    if !withdrawals.is_empty() {
+        tx.execute(
+            "CREATE TEMP TABLE _staging_l2_withdrawals (
+                block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4,
+                withdrawal_index TEXT, index_le BYTEA, validator_index TEXT,
+                address BYTEA, amount_gwei INT8, amount_sompi INT8
+            ) ON COMMIT DROP",
+            &[],
+        )
+        .await?;
+
+        let types = &[
+            Type::INT8,        // block_num
+            Type::TIMESTAMPTZ, // block_timestamp
+            Type::INT4,        // idx
+            Type::TEXT,        // withdrawal_index
+            Type::BYTEA,       // index_le
+            Type::TEXT,        // validator_index
+            Type::BYTEA,       // address
+            Type::INT8,        // amount_gwei
+            Type::INT8,        // amount_sompi
+        ];
+
+        let sink = tx
+            .copy_in(
+                "COPY _staging_l2_withdrawals (block_num, block_timestamp, idx, withdrawal_index, index_le, validator_index, address, amount_gwei, amount_sompi) FROM STDIN BINARY",
+            )
+            .await?;
+
+        let writer = BinaryCopyInWriter::new(sink, types);
+        let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+        for withdrawal in withdrawals {
+            pinned_writer
+                .as_mut()
+                .write(&[
+                    &withdrawal.block_num,
+                    &withdrawal.block_timestamp,
+                    &withdrawal.idx,
+                    &withdrawal.withdrawal_index,
+                    &withdrawal.index_le,
+                    &withdrawal.validator_index,
+                    &withdrawal.address,
+                    &withdrawal.amount_gwei,
+                    &withdrawal.amount_sompi,
+                ])
+                .await?;
+        }
+
+        pinned_writer.as_mut().finish().await?;
+
+        tx.execute(
+            "INSERT INTO l2_withdrawals SELECT * FROM _staging_l2_withdrawals ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
     }
 
     // ── single COMMIT ─────────────────────────────────────────────────────
@@ -678,6 +836,15 @@ pub async fn write_batch(
         metrics::increment_sink_row_count("postgres", "receipts", receipts.len() as u64);
         if let Some(max) = receipts.iter().map(|r| r.block_num).max() {
             metrics::update_sink_watermark("postgres", "receipts", max);
+        }
+    }
+
+    if !withdrawals.is_empty() {
+        metrics::record_sink_write_duration("postgres", "l2_withdrawals", elapsed);
+        metrics::record_sink_write_rows("postgres", "l2_withdrawals", withdrawals.len() as u64);
+        metrics::increment_sink_row_count("postgres", "l2_withdrawals", withdrawals.len() as u64);
+        if let Some(max) = withdrawals.iter().map(|w| w.block_num).max() {
+            metrics::update_sink_watermark("postgres", "l2_withdrawals", max);
         }
     }
 
@@ -872,12 +1039,7 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
 
     Ok(rows
         .iter()
-        .map(|r| {
-            (
-                r.get::<_, i64>(0) as u64,
-                r.get::<_, i64>(1) as u64,
-            )
-        })
+        .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64))
         .collect())
 }
 
@@ -937,20 +1099,28 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
     Ok(gaps)
 }
 
-/// Delete all blocks (and related txs, logs, receipts) from a given block number onwards.
+/// Delete all blocks (and related txs, logs, receipts, withdrawals) from a given block number onwards.
 /// Used for reorg handling - removes orphaned blocks so they can be re-synced.
 /// Returns the number of blocks deleted.
 pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
     let conn = pool.get().await?;
     let from_block_i64 = from_block as i64;
 
-    // Delete in order: logs, receipts, txs, blocks (foreign key order)
+    // Delete in order: logs, receipts, txs, withdrawals, blocks (foreign key order)
     conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
         .await?;
-    conn.execute("DELETE FROM receipts WHERE block_num >= $1", &[&from_block_i64])
-        .await?;
+    conn.execute(
+        "DELETE FROM receipts WHERE block_num >= $1",
+        &[&from_block_i64],
+    )
+    .await?;
     conn.execute("DELETE FROM txs WHERE block_num >= $1", &[&from_block_i64])
         .await?;
+    conn.execute(
+        "DELETE FROM l2_withdrawals WHERE block_num >= $1",
+        &[&from_block_i64],
+    )
+    .await?;
     let deleted = conn
         .execute("DELETE FROM blocks WHERE num >= $1", &[&from_block_i64])
         .await?;

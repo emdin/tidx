@@ -3,7 +3,7 @@ use tracing::info;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
+use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
 use super::ch_sink::ClickHouseSink;
 use super::writer;
@@ -51,10 +51,7 @@ impl SinkSet {
 
     pub async fn write_txs(&self, txs: &[TxRow]) -> Result<()> {
         if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                writer::write_txs(&self.pool, txs),
-                ch.write_txs(txs),
-            )?;
+            tokio::try_join!(writer::write_txs(&self.pool, txs), ch.write_txs(txs),)?;
         } else {
             writer::write_txs(&self.pool, txs).await?;
         }
@@ -63,10 +60,7 @@ impl SinkSet {
 
     pub async fn write_logs(&self, logs: &[LogRow]) -> Result<()> {
         if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                writer::write_logs(&self.pool, logs),
-                ch.write_logs(logs),
-            )?;
+            tokio::try_join!(writer::write_logs(&self.pool, logs), ch.write_logs(logs),)?;
         } else {
             writer::write_logs(&self.pool, logs).await?;
         }
@@ -85,6 +79,17 @@ impl SinkSet {
         Ok(())
     }
 
+    pub async fn write_l2_withdrawals(&self, withdrawals: &[L2WithdrawalRow]) -> Result<()> {
+        if let Some(ch) = &self.ch {
+            tokio::try_join!(
+                writer::write_l2_withdrawals(&self.pool, withdrawals),
+                ch.write_l2_withdrawals(withdrawals),
+            )?;
+        } else {
+            writer::write_l2_withdrawals(&self.pool, withdrawals).await?;
+        }
+        Ok(())
+    }
 
     /// Write all four tables in a single PG transaction, with CH writes concurrent.
     pub async fn write_all(
@@ -93,17 +98,19 @@ impl SinkSet {
         txs: &[TxRow],
         logs: &[LogRow],
         receipts: &[ReceiptRow],
+        withdrawals: &[L2WithdrawalRow],
     ) -> Result<()> {
         if let Some(ch) = &self.ch {
             tokio::try_join!(
-                writer::write_batch(&self.pool, blocks, txs, logs, receipts),
+                writer::write_batch(&self.pool, blocks, txs, logs, receipts, withdrawals),
                 ch.write_blocks(blocks),
                 ch.write_txs(txs),
                 ch.write_logs(logs),
                 ch.write_receipts(receipts),
+                ch.write_l2_withdrawals(withdrawals),
             )?;
         } else {
-            writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
+            writer::write_batch(&self.pool, blocks, txs, logs, receipts, withdrawals).await?;
         }
         Ok(())
     }
@@ -150,8 +157,7 @@ impl SinkSet {
         if from_block > pg_max {
             info!(
                 ch_backfill_block = cursor,
-                pg_max,
-                "ClickHouse backfill up to date"
+                pg_max, "ClickHouse backfill up to date"
             );
             metrics::set_backfill_remaining(chain_id, "clickhouse", 0);
             return Ok(());
@@ -159,7 +165,13 @@ impl SinkSet {
 
         let total = pg_max - from_block + 1;
         metrics::set_backfill_remaining(chain_id, "clickhouse", total as u64);
-        info!(chain_id, from_block, pg_max, total_blocks = total, "Starting ClickHouse backfill");
+        info!(
+            chain_id,
+            from_block,
+            pg_max,
+            total_blocks = total,
+            "Starting ClickHouse backfill"
+        );
 
         let start = std::time::Instant::now();
         let mut blocks_written: i64 = 0;
@@ -174,12 +186,13 @@ impl SinkSet {
                 fetch_txs(&conn, current, batch_end),
                 fetch_logs(&conn, current, batch_end),
                 fetch_receipts(&conn, current, batch_end),
+                fetch_l2_withdrawals(&conn, current, batch_end),
             )?;
             current = batch_end + 1;
             Some((batch_end, data))
         };
 
-        while let Some((batch_end, (blocks, txs, logs, receipts))) = pending.take() {
+        while let Some((batch_end, (blocks, txs, logs, receipts, withdrawals))) = pending.take() {
             let block_count = blocks.len() as i64;
 
             // Pipeline: fetch next batch from PG while writing current batch to CH
@@ -194,16 +207,48 @@ impl SinkSet {
                     fetch_txs(&conn, current, next_end),
                     fetch_logs(&conn, current, next_end),
                     fetch_receipts(&conn, current, next_end),
+                    fetch_l2_withdrawals(&conn, current, next_end),
                 )?;
                 Ok::<_, anyhow::Error>(Some((next_end, data)))
             };
 
             let ch_write = async {
                 tokio::try_join!(
-                    async { if !blocks.is_empty() { ch.write_blocks(&blocks).await } else { Ok(()) } },
-                    async { if !txs.is_empty() { ch.write_txs(&txs).await } else { Ok(()) } },
-                    async { if !logs.is_empty() { ch.write_logs(&logs).await } else { Ok(()) } },
-                    async { if !receipts.is_empty() { ch.write_receipts(&receipts).await } else { Ok(()) } },
+                    async {
+                        if !blocks.is_empty() {
+                            ch.write_blocks(&blocks).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !txs.is_empty() {
+                            ch.write_txs(&txs).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !logs.is_empty() {
+                            ch.write_logs(&logs).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !receipts.is_empty() {
+                            ch.write_receipts(&receipts).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !withdrawals.is_empty() {
+                            ch.write_l2_withdrawals(&withdrawals).await
+                        } else {
+                            Ok(())
+                        }
+                    },
                 )
             };
 
@@ -221,10 +266,7 @@ impl SinkSet {
                 let pct = (((batch_end - from_block + 1) as f64 / total as f64) * 100.0) as u64;
                 info!(
                     chain_id,
-                    blocks_written,
-                    pct,
-                    batch_end,
-                    "ClickHouse backfill progress"
+                    blocks_written, pct, batch_end, "ClickHouse backfill progress"
                 );
             }
 
@@ -292,7 +334,11 @@ async fn save_ch_backfill_cursor(pool: &Pool, chain_id: u64, block: i64) -> Resu
 
 // ── PG fetch functions (one query per batch, no cursors) ──────────────────
 
-async fn fetch_blocks(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Result<Vec<BlockRow>> {
+async fn fetch_blocks(
+    conn: &deadpool_postgres::Object,
+    from: i64,
+    to: i64,
+) -> Result<Vec<BlockRow>> {
     let rows = conn
         .query(
             "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data \
@@ -387,7 +433,11 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
         .collect())
 }
 
-async fn fetch_receipts(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Result<Vec<ReceiptRow>> {
+async fn fetch_receipts(
+    conn: &deadpool_postgres::Object,
+    from: i64,
+    to: i64,
+) -> Result<Vec<ReceiptRow>> {
     let rows = conn
         .query(
             "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", \
@@ -413,6 +463,37 @@ async fn fetch_receipts(conn: &deadpool_postgres::Object, from: i64, to: i64) ->
             effective_gas_price: r.get(9),
             status: r.get(10),
             fee_payer: r.get(11),
+        })
+        .collect())
+}
+
+async fn fetch_l2_withdrawals(
+    conn: &deadpool_postgres::Object,
+    from: i64,
+    to: i64,
+) -> Result<Vec<L2WithdrawalRow>> {
+    let rows = conn
+        .query(
+            "SELECT block_num, block_timestamp, idx, withdrawal_index, index_le, \
+             validator_index, address, amount_gwei, amount_sompi \
+             FROM l2_withdrawals WHERE block_num >= $1 AND block_num <= $2 \
+             ORDER BY block_num, idx",
+            &[&from, &to],
+        )
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| L2WithdrawalRow {
+            block_num: r.get(0),
+            block_timestamp: r.get(1),
+            idx: r.get(2),
+            withdrawal_index: r.get(3),
+            index_le: r.get(4),
+            validator_index: r.get(5),
+            address: r.get(6),
+            amount_gwei: r.get(7),
+            amount_sompi: r.get(8),
         })
         .collect())
 }

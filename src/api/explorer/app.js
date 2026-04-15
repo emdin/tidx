@@ -507,7 +507,7 @@ async function renderBlockPage(blockId, page) {
   }
 
   const offset = (page - 1) * PAGE_SIZE;
-  const [blocks, txs, counts] = await Promise.all([
+  const [blocks, txs, withdrawals, counts] = await Promise.all([
     runQuery(`
       SELECT
         num,
@@ -541,9 +541,27 @@ async function renderBlockPage(blockId, page) {
     `),
     runQuery(`
       SELECT
+        block_num,
+        block_timestamp,
+        idx,
+        withdrawal_index,
+        encode(index_le, 'hex') AS index_le,
+        validator_index,
+        encode(address, 'hex') AS address,
+        amount_gwei,
+        amount_sompi
+      FROM l2_withdrawals
+      WHERE block_num = ${blockNum}
+      ORDER BY idx ASC
+      LIMIT 250
+    `),
+    runQuery(`
+      SELECT
         (SELECT COUNT(*) FROM txs WHERE block_num = ${blockNum}) AS tx_count,
         (SELECT COUNT(*) FROM logs WHERE block_num = ${blockNum}) AS log_count,
-        (SELECT COUNT(*) FROM receipts WHERE block_num = ${blockNum}) AS receipt_count
+        (SELECT COUNT(*) FROM receipts WHERE block_num = ${blockNum}) AS receipt_count,
+        (SELECT COUNT(*) FROM l2_withdrawals WHERE block_num = ${blockNum}) AS withdrawal_count,
+        (SELECT COALESCE(SUM(amount_sompi), 0) FROM l2_withdrawals WHERE block_num = ${blockNum}) AS withdrawal_amount_sompi
     `),
   ]);
 
@@ -576,6 +594,7 @@ async function renderBlockPage(blockId, page) {
 
       <section class="kpi-grid">
         ${renderKpiCard("Transactions", formatNumber(stats.tx_count || 0), "Included in this block")}
+        ${renderKpiCard("Withdrawals", formatNumber(stats.withdrawal_count || 0), "Native iKAS allocations from Kaspa entries")}
         ${renderKpiCard("Logs", formatNumber(stats.log_count || 0), "Decoded raw log rows")}
         ${renderKpiCard("Receipts", formatNumber(stats.receipt_count || 0), "Receipt rows indexed")}
       </section>
@@ -586,22 +605,37 @@ async function renderBlockPage(blockId, page) {
           ${renderSummaryRow("Hash", renderMonoLink(`/explore/block/${block.num}`, with0x(block.hash), false))}
           ${renderSummaryRow("Parent", previousBlockHref ? renderMonoLink(previousBlockHref, with0x(block.parent_hash), false) : escapeHtml(with0x(block.parent_hash)))}
           ${renderSummaryRow("Miner", renderMonoLink(`/explore/address/${with0x(block.miner)}?tab=contract`, with0x(block.miner), false))}
+          ${renderSummaryRow("Withdrawals", `${formatNumber(stats.withdrawal_count || 0)} · ${formatKaspaSompi(stats.withdrawal_amount_sompi || "0")}`)}
           ${renderSummaryRow("Gas used", formatGasUnits(block.gas_used))}
           ${renderSummaryRow("Gas limit", formatGasUnits(block.gas_limit))}
         </aside>
 
-        <section class="panel-card">
-          <div class="panel-header">
-            <div>
-              <div class="panel-title">Transactions</div>
-              <div class="panel-subtitle">${formatNumber(stats.tx_count || 0)} transaction(s) in block ${formatNumber(block.num)}</div>
+        <div class="panel-stack">
+          <section class="panel-card">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Transactions</div>
+                <div class="panel-subtitle">${formatNumber(stats.tx_count || 0)} transaction(s) in block ${formatNumber(block.num)}</div>
+              </div>
             </div>
-          </div>
-          <div class="panel-body table-wrap">
-            ${renderBlockTransactionsTable(txs)}
-          </div>
-          ${page > 1 || txs.length === PAGE_SIZE ? renderPagination(`/explore/block/${block.num}`, page, txs.length === PAGE_SIZE) : ""}
-        </section>
+            <div class="panel-body table-wrap">
+              ${renderBlockTransactionsTable(txs)}
+            </div>
+            ${page > 1 || txs.length === PAGE_SIZE ? renderPagination(`/explore/block/${block.num}`, page, txs.length === PAGE_SIZE) : ""}
+          </section>
+
+          <section class="panel-card">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">L2 withdrawals</div>
+                <div class="panel-subtitle">EIP-4895 withdrawal rows used by Igra to allocate native iKAS from Kaspa entries</div>
+              </div>
+            </div>
+            <div class="panel-body table-wrap">
+              ${renderBlockWithdrawalsTable(withdrawals)}
+            </div>
+          </section>
+        </div>
       </div>
     </section>
   `;
@@ -794,7 +828,9 @@ async function renderAddressPage(address, requestedTab, page) {
         (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.transfer)}', 'hex')) AS transfer_logs,
         (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_logs,
         (SELECT COUNT(*) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_count,
-        (SELECT COALESCE(SUM(amount_sompi), 0) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_amount_sompi
+        (SELECT COALESCE(SUM(amount_sompi), 0) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_amount_sompi,
+        (SELECT COUNT(*) FROM l2_withdrawals WHERE address = decode('${body}', 'hex')) AS l2_withdrawal_count,
+        (SELECT COALESCE(SUM(amount_sompi), 0) FROM l2_withdrawals WHERE address = decode('${body}', 'hex')) AS l2_withdrawal_amount_sompi
     `),
     tryFetchExplorerJson(`/explore/api/address/${address}/inspect?chainId=${encodeURIComponent(state.chainId)}`),
   ]);
@@ -885,12 +921,25 @@ async function renderAddressPage(address, requestedTab, page) {
     const offset = (page - 1) * PAGE_SIZE;
     const entryRows = await runQuery(`
       SELECT
-        encode(kaspa_txid, 'hex') AS kaspa_txid,
-        amount_sompi,
-        created_at
-      FROM kaspa_entries
-      WHERE recipient = decode('${body}', 'hex')
-      ORDER BY created_at DESC, kaspa_txid DESC
+        encode(e.kaspa_txid, 'hex') AS kaspa_txid,
+        e.amount_sompi,
+        e.created_at,
+        w.block_num AS l2_block_num,
+        w.idx AS l2_withdrawal_idx,
+        w.withdrawal_index,
+        w.amount_gwei
+      FROM kaspa_entries e
+      LEFT JOIN LATERAL (
+        SELECT block_num, idx, withdrawal_index, amount_gwei
+        FROM l2_withdrawals w
+        WHERE w.index_le = substring(e.kaspa_txid FROM 25 FOR 8)
+          AND w.address = e.recipient
+          AND w.amount_sompi = e.amount_sompi
+        ORDER BY w.block_num DESC, w.idx DESC
+        LIMIT 1
+      ) w ON true
+      WHERE e.recipient = decode('${body}', 'hex')
+      ORDER BY e.created_at DESC, e.kaspa_txid DESC
       LIMIT ${PAGE_SIZE}
       OFFSET ${offset}
     `);
@@ -983,6 +1032,7 @@ async function renderAddressPage(address, requestedTab, page) {
         ${renderKpiCard("Logs", formatNumber(summary.related_logs || 0), "Logs emitted or indexed to this address")}
         ${renderKpiCard("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : "-", "Latest RPC balance")}
         ${renderKpiCard("Kaspa entries", formatNumber(summary.kaspa_entry_count || 0), "Native iKAS entries from Kaspa L1")}
+        ${renderKpiCard("L2 allocations", formatNumber(summary.l2_withdrawal_count || 0), "Block withdrawals credited to this address")}
         ${renderKpiCard("First seen", summary.first_seen_block ? formatNumber(summary.first_seen_block) : "-", "Earliest indexed block")}
         ${renderKpiCard("Last seen", summary.last_seen_block ? formatNumber(summary.last_seen_block) : "-", "Latest indexed block")}
       </section>
@@ -998,6 +1048,7 @@ async function renderAddressPage(address, requestedTab, page) {
           ${renderSummaryRow("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Kaspa entries", formatNumber(summary.kaspa_entry_count || 0))}
           ${renderSummaryRow("Kaspa entry amount", formatKaspaSompi(summary.kaspa_entry_amount_sompi || "0"))}
+          ${renderSummaryRow("L2 allocation amount", formatKaspaSompi(summary.l2_withdrawal_amount_sompi || "0"))}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
           ${renderSummaryRow("Received", formatNumber(summary.received_count || 0))}
@@ -1180,6 +1231,42 @@ function renderBlockTransactionsTable(rows) {
   `;
 }
 
+function renderBlockWithdrawalsTable(rows) {
+  if (!rows.length) {
+    return '<div class="empty-state">No L2 withdrawals found in this block.</div>';
+  }
+
+  const body = rows
+    .map((row) => {
+      const address = with0x(row.address);
+      return `
+        <tr>
+          <td class="mono">${formatNumber(row.idx)}</td>
+          <td class="mono"><a href="/explore/address/${address}?tab=kaspa">${escapeHtml(shortHex(address, 8))}</a></td>
+          <td class="align-right mono">${formatKaspaSompi(row.amount_sompi)}</td>
+          <td class="align-right mono">${formatNumericString(row.amount_gwei)} gwei</td>
+          <td class="mono">${escapeHtml(row.withdrawal_index)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Row</th>
+          <th>Recipient</th>
+          <th class="align-right">iKAS</th>
+          <th class="align-right">EIP-4895 amount</th>
+          <th>Withdrawal index</th>
+        </tr>
+      </thead>
+      <tbody>${body}</tbody>
+    </table>
+  `;
+}
+
 function renderAddressTransactionsTable(rows, address) {
   if (!rows.length) {
     return '<div class="empty-state">No address activity found.</div>';
@@ -1313,6 +1400,12 @@ function renderKaspaEntriesTable(rows) {
           <td>${escapeHtml(formatRelativeTime(row.created_at))}</td>
           <td class="mono">${renderKaspaTxLink(row.kaspa_txid)}</td>
           <td class="align-right mono">${formatKaspaSompi(row.amount_sompi)}</td>
+          <td class="mono">${
+            row.l2_block_num
+              ? `<a href="/explore/block/${row.l2_block_num}">Block ${formatNumber(row.l2_block_num)}</a> · row ${formatNumber(row.l2_withdrawal_idx)}`
+              : '<span class="text-secondary">Not indexed yet</span>'
+          }</td>
+          <td class="mono">${row.withdrawal_index ? escapeHtml(row.withdrawal_index) : '<span class="text-secondary">-</span>'}</td>
         </tr>
       `,
     )
@@ -1326,6 +1419,8 @@ function renderKaspaEntriesTable(rows) {
             <th>Indexed</th>
             <th>Kaspa L1 tx</th>
             <th class="align-right">Amount</th>
+            <th>L2 allocation</th>
+            <th>Withdrawal index</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>
