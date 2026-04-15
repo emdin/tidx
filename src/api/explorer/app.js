@@ -829,6 +829,8 @@ async function renderAddressPage(address, requestedTab, page) {
         (SELECT COUNT(*) FROM logs WHERE address = decode('${body}', 'hex') AND topic0 = decode('${hexBody(TOPICS.approval)}', 'hex')) AS approval_logs,
         (SELECT COUNT(*) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_count,
         (SELECT COALESCE(SUM(amount_sompi), 0) FROM kaspa_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_entry_amount_sompi,
+        (SELECT COUNT(*) FROM kaspa_pending_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_pending_entry_count,
+        (SELECT COALESCE(SUM(amount_sompi), 0) FROM kaspa_pending_entries WHERE recipient = decode('${body}', 'hex')) AS kaspa_pending_entry_amount_sompi,
         (SELECT COUNT(*) FROM l2_withdrawals WHERE address = decode('${body}', 'hex')) AS l2_withdrawal_count,
         (SELECT COALESCE(SUM(amount_sompi), 0) FROM l2_withdrawals WHERE address = decode('${body}', 'hex')) AS l2_withdrawal_amount_sompi
     `),
@@ -922,13 +924,19 @@ async function renderAddressPage(address, requestedTab, page) {
     const entryRows = await runQuery(`
       WITH withdrawal_rows AS (
         SELECT
-          encode(e.kaspa_txid, 'hex') AS kaspa_txid,
+          encode(COALESCE(e.kaspa_txid, p.kaspa_txid), 'hex') AS kaspa_txid,
           w.amount_sompi,
-          e.created_at,
+          COALESCE(e.created_at, p.accepted_at) AS created_at,
+          p.promote_after,
           w.block_num AS l2_block_num,
           w.idx AS l2_withdrawal_idx,
           w.withdrawal_index,
           w.amount_gwei,
+          CASE
+            WHEN e.kaspa_txid IS NOT NULL THEN 'final'
+            WHEN p.kaspa_txid IS NOT NULL THEN 'pending'
+            ELSE 'missing'
+          END AS provenance_status,
           'allocation' AS row_kind
         FROM l2_withdrawals w
         LEFT JOIN LATERAL (
@@ -940,17 +948,28 @@ async function renderAddressPage(address, requestedTab, page) {
           ORDER BY e.created_at DESC, e.kaspa_txid DESC
           LIMIT 1
         ) e ON true
+        LEFT JOIN LATERAL (
+          SELECT kaspa_txid, accepted_at, promote_after
+          FROM kaspa_pending_entries p
+          WHERE substring(p.kaspa_txid FROM 25 FOR 8) = w.index_le
+            AND p.recipient = w.address
+            AND p.amount_sompi = w.amount_sompi
+          ORDER BY p.promote_after ASC, p.kaspa_txid DESC
+          LIMIT 1
+        ) p ON e.kaspa_txid IS NULL
         WHERE w.address = decode('${body}', 'hex')
       ),
-      pending_entry_rows AS (
+      final_entry_rows AS (
         SELECT
           encode(e.kaspa_txid, 'hex') AS kaspa_txid,
           e.amount_sompi,
           e.created_at,
+          NULL::timestamptz AS promote_after,
           NULL::bigint AS l2_block_num,
           NULL::integer AS l2_withdrawal_idx,
           NULL::text AS withdrawal_index,
           NULL::bigint AS amount_gwei,
+          'final' AS provenance_status,
           'entry' AS row_kind
         FROM kaspa_entries e
         LEFT JOIN LATERAL (
@@ -963,18 +982,46 @@ async function renderAddressPage(address, requestedTab, page) {
         ) w ON true
         WHERE e.recipient = decode('${body}', 'hex')
           AND w.matched IS NULL
+      ),
+      pending_entry_rows AS (
+        SELECT
+          encode(p.kaspa_txid, 'hex') AS kaspa_txid,
+          p.amount_sompi,
+          p.accepted_at AS created_at,
+          p.promote_after,
+          NULL::bigint AS l2_block_num,
+          NULL::integer AS l2_withdrawal_idx,
+          NULL::text AS withdrawal_index,
+          NULL::bigint AS amount_gwei,
+          'pending' AS provenance_status,
+          'entry' AS row_kind
+        FROM kaspa_pending_entries p
+        LEFT JOIN LATERAL (
+          SELECT true AS matched
+          FROM l2_withdrawals w
+          WHERE w.index_le = substring(p.kaspa_txid FROM 25 FOR 8)
+            AND w.address = p.recipient
+            AND w.amount_sompi = p.amount_sompi
+          LIMIT 1
+        ) w ON true
+        WHERE p.recipient = decode('${body}', 'hex')
+          AND w.matched IS NULL
       )
       SELECT
         kaspa_txid,
         amount_sompi,
         created_at,
+        promote_after,
         l2_block_num,
         l2_withdrawal_idx,
         withdrawal_index,
         amount_gwei,
+        provenance_status,
         row_kind
       FROM (
         SELECT * FROM withdrawal_rows
+        UNION ALL
+        SELECT * FROM final_entry_rows
         UNION ALL
         SELECT * FROM pending_entry_rows
       ) rows
@@ -984,7 +1031,7 @@ async function renderAddressPage(address, requestedTab, page) {
     `);
 
     panelTitle = "Kaspa L1 provenance";
-    panelSubtitle = `${formatNumber(summary.l2_withdrawal_count || 0)} L2 allocation row(s), ${formatNumber(summary.kaspa_entry_count || 0)} Kaspa entry row(s) indexed`;
+    panelSubtitle = `${formatNumber(summary.l2_withdrawal_count || 0)} L2 allocation row(s), ${formatNumber(summary.kaspa_entry_count || 0)} final and ${formatNumber(summary.kaspa_pending_entry_count || 0)} pending Kaspa entry row(s)`;
     panelBody = renderKaspaEntriesTable(entryRows);
     hasNextPage = entryRows.length === PAGE_SIZE;
   } else if (tab === "contract") {
@@ -1071,6 +1118,7 @@ async function renderAddressPage(address, requestedTab, page) {
         ${renderKpiCard("Logs", formatNumber(summary.related_logs || 0), "Logs emitted or indexed to this address")}
         ${renderKpiCard("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : "-", "Latest RPC balance")}
         ${renderKpiCard("Kaspa entries", formatNumber(summary.kaspa_entry_count || 0), "Native iKAS entries from Kaspa L1")}
+        ${renderKpiCard("Pending Kaspa", formatNumber(summary.kaspa_pending_entry_count || 0), "Kaspa entries waiting for finality")}
         ${renderKpiCard("L2 allocations", formatNumber(summary.l2_withdrawal_count || 0), "Block withdrawals credited to this address")}
         ${renderKpiCard("First seen", summary.first_seen_block ? formatNumber(summary.first_seen_block) : "-", "Earliest indexed block")}
         ${renderKpiCard("Last seen", summary.last_seen_block ? formatNumber(summary.last_seen_block) : "-", "Latest indexed block")}
@@ -1087,6 +1135,8 @@ async function renderAddressPage(address, requestedTab, page) {
           ${renderSummaryRow("Native balance", profile ? formatNativeAmount(profile.native_balance || "0", 6) : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Kaspa entries", formatNumber(summary.kaspa_entry_count || 0))}
           ${renderSummaryRow("Kaspa entry amount", formatKaspaSompi(summary.kaspa_entry_amount_sompi || "0"))}
+          ${renderSummaryRow("Pending Kaspa entries", formatNumber(summary.kaspa_pending_entry_count || 0))}
+          ${renderSummaryRow("Pending Kaspa amount", formatKaspaSompi(summary.kaspa_pending_entry_amount_sompi || "0"))}
           ${renderSummaryRow("L2 allocation amount", formatKaspaSompi(summary.l2_withdrawal_amount_sompi || "0"))}
           ${renderSummaryRow("Transactions", formatNumber(summary.tx_count || 0))}
           ${renderSummaryRow("Sent", formatNumber(summary.sent_count || 0))}
@@ -1437,7 +1487,10 @@ function renderKaspaEntriesTable(rows) {
       (row) => `
         <tr>
           <td>${renderKaspaRowSource(row)}</td>
-          <td class="mono">${renderKaspaTxLink(row.kaspa_txid)}</td>
+          <td class="mono">
+            ${renderKaspaTxLink(row.kaspa_txid)}
+            <div class="table-secondary-cell">${renderKaspaFinality(row)}</div>
+          </td>
           <td class="align-right mono">${formatKaspaSompi(row.amount_sompi)}</td>
           <td class="mono">${
             row.l2_block_num
@@ -1469,13 +1522,30 @@ function renderKaspaEntriesTable(rows) {
 }
 
 function renderKaspaRowSource(row) {
-  if (row.kaspa_txid && row.created_at) {
+  if (row.provenance_status === "final" && row.created_at) {
+    return escapeHtml(formatRelativeTime(row.created_at));
+  }
+  if (row.provenance_status === "pending" && row.created_at) {
     return escapeHtml(formatRelativeTime(row.created_at));
   }
   if (row.l2_block_num) {
     return '<span class="text-secondary">L2 allocation indexed</span>';
   }
   return '<span class="text-secondary">Pending L1 entry</span>';
+}
+
+function renderKaspaFinality(row) {
+  if (row.provenance_status === "final") {
+    return '<span class="tx-status tx-status-success">Final</span>';
+  }
+  if (row.provenance_status === "pending") {
+    const until = row.promote_after ? ` until ${escapeHtml(formatTimestamp(row.promote_after))}` : "";
+    return `<span class="tx-status tx-status-pending">Pending finality${until}</span>`;
+  }
+  if (row.kaspa_txid) {
+    return '<span class="tx-status tx-status-pending">Pending finality</span>';
+  }
+  return '<span class="text-secondary">Kaspa L1 tx not indexed yet</span>';
 }
 
 function renderContractPanel(address, kind, summary, rows, inspect, methodsPayload, verificationPayload) {
