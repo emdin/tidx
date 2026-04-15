@@ -32,7 +32,7 @@ database = "tidx_38833"
 
 [chains.kaspa]
 enabled = true
-rpc_url = "ws://127.0.0.1:17110"
+rpc_url = "ws://host.docker.internal:17111"
 txid_prefix = "97b1"
 poll_interval_ms = 1000
 initial_tip_distance = 100

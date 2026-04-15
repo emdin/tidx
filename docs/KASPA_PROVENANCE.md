@@ -10,7 +10,7 @@ Enable per chain:
 ```toml
 [chains.kaspa]
 enabled = true
-rpc_url = "ws://127.0.0.1:17110"
+rpc_url = "ws://host.docker.internal:17111"
 txid_prefix = "97b1"
 poll_interval_ms = 1000
 initial_tip_distance = 100
@@ -24,6 +24,10 @@ Use Borsh wRPC locally. The staging Kaspa node exposes:
 127.0.0.1:17110  wRPC Borsh
 127.0.0.1:18110  wRPC JSON
 ```
+
+In Docker test-prod, Kaspa stays bound to host loopback. The compose stack starts
+`kaspa-wrpc-proxy` in host network mode and forwards
+`host.docker.internal:17111` to `127.0.0.1:17110`.
 
 ## Sync Flow
 
