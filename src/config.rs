@@ -124,11 +124,19 @@ pub struct ChainConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
 
-    /// Number of newest RPC-head blocks to leave unindexed by realtime sync.
-    /// This reduces near-tip churn on chains where the latest block can briefly
-    /// disappear or be reorganized before stabilizing.
-    #[serde(default)]
+    /// Minimum and initial number of newest RPC-head blocks to leave unindexed
+    /// by realtime sync. Adaptive delay never goes below this confirmation
+    /// floor. Zero is not allowed.
+    #[serde(default = "default_head_delay_blocks")]
     pub head_delay_blocks: u64,
+
+    /// Maximum adaptive head delay after repeated near-tip instability.
+    #[serde(default = "default_max_head_delay_blocks")]
+    pub max_head_delay_blocks: u64,
+
+    /// Rolling window used to increase/decrease adaptive head delay.
+    #[serde(default = "default_head_delay_window_secs")]
+    pub head_delay_window_secs: u64,
 
     /// Number of concurrent gap-fill workers (default: 4)
     #[serde(default = "default_concurrency")]
@@ -360,6 +368,18 @@ fn default_concurrency() -> usize {
     4
 }
 
+fn default_head_delay_blocks() -> u64 {
+    30
+}
+
+fn default_max_head_delay_blocks() -> u64 {
+    100
+}
+
+fn default_head_delay_window_secs() -> u64 {
+    600
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -370,6 +390,28 @@ impl Config {
 
         if config.chains.is_empty() {
             anyhow::bail!("No chains configured. Add at least one [[chains]] section.");
+        }
+        for chain in &config.chains {
+            if chain.head_delay_blocks == 0 {
+                anyhow::bail!(
+                    "chain '{}' has head_delay_blocks=0; minimum confirmation delay must be >= 1",
+                    chain.name
+                );
+            }
+            if chain.max_head_delay_blocks < chain.head_delay_blocks {
+                anyhow::bail!(
+                    "chain '{}' has max_head_delay_blocks ({}) below head_delay_blocks ({})",
+                    chain.name,
+                    chain.max_head_delay_blocks,
+                    chain.head_delay_blocks
+                );
+            }
+            if chain.head_delay_window_secs == 0 {
+                anyhow::bail!(
+                    "chain '{}' has head_delay_window_secs=0; adaptive window must be >= 1",
+                    chain.name
+                );
+            }
         }
 
         Ok(config)
@@ -393,7 +435,9 @@ mod tests {
 
         assert!(config.backfill);
         assert_eq!(config.batch_size, 100);
-        assert_eq!(config.head_delay_blocks, 0);
+        assert_eq!(config.head_delay_blocks, 30);
+        assert_eq!(config.max_head_delay_blocks, 100);
+        assert_eq!(config.head_delay_window_secs, 600);
         assert_eq!(config.concurrency, 4);
     }
 
@@ -486,7 +530,9 @@ mod tests {
             pg_password_env: None,
             backfill: true,
             batch_size: 100,
-            head_delay_blocks: 0,
+            head_delay_blocks: 30,
+            max_head_delay_blocks: 100,
+            head_delay_window_secs: 600,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
@@ -513,7 +559,9 @@ mod tests {
             pg_password_env: Some("PATH".to_string()),
             backfill: true,
             batch_size: 100,
-            head_delay_blocks: 0,
+            head_delay_blocks: 30,
+            max_head_delay_blocks: 100,
+            head_delay_window_secs: 600,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
@@ -539,7 +587,9 @@ mod tests {
             pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
             backfill: true,
             batch_size: 100,
-            head_delay_blocks: 0,
+            head_delay_blocks: 30,
+            max_head_delay_blocks: 100,
+            head_delay_window_secs: 600,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,

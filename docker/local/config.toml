@@ -16,7 +16,9 @@ rpc_url = "http://tempo:8545"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
 backfill = true
 batch_size = 100
-head_delay_blocks = 0
+head_delay_blocks = 30
+max_head_delay_blocks = 100
+head_delay_window_secs = 600
 
 # ClickHouse OLAP engine
 [chains.clickhouse]

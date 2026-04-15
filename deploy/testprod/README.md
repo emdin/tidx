@@ -185,10 +185,11 @@ If you leave `trusted_cidrs` empty, only loopback is trusted.
 
 - Keep `trust_rpc = false` for now.
   - During local testing on April 13, 2026, the `igra` chain showed reorg handling in the live sync logs.
-- Keep `head_delay_blocks = 10` for Igra staging unless metrics show the safe head can be tightened.
+- Keep `head_delay_blocks = 30` for Igra staging unless metrics show the safe head can be tightened.
   - `head_num` remains the true RPC head.
-  - `tip_num` follows `head_num - head_delay_blocks`.
-  - Alerts subtract the configured delay so intentional safety lag does not page the team.
+  - `tip_num` follows `head_num - current adaptive delay`.
+  - Adaptive delay starts at `30`, increases up to `100` if repeated near-tip instability is detected, and later decreases back to `30` after a quiet window.
+  - Alerts subtract the current delay so intentional safety lag does not page the team.
 - Your RPC currently blocks `eth_getBlockReceipts`.
   - `tidx` will fall back to batched `eth_getTransactionReceipt`.
   - This works, but it is slower than block-level receipt fetching.

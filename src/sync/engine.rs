@@ -1,8 +1,9 @@
 use alloy::network::ReceiptResponse;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
@@ -30,6 +31,99 @@ fn safe_tip_for_head(remote_head: u64, head_delay_blocks: u64) -> u64 {
     remote_head.saturating_sub(head_delay_blocks)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RealtimeTickOutcome {
+    caught_up_to_safe_head: bool,
+}
+
+struct AdaptiveHeadDelay {
+    min_blocks: u64,
+    max_blocks: u64,
+    window: Duration,
+    current_blocks: Arc<AtomicU64>,
+    instability_seen: Arc<AtomicBool>,
+    history: VecDeque<(Instant, bool)>,
+    last_adjustment: Instant,
+}
+
+impl AdaptiveHeadDelay {
+    fn new(min_blocks: u64, max_blocks: u64, window: Duration) -> Self {
+        let min_blocks = min_blocks.max(1);
+        let max_blocks = max_blocks.max(min_blocks);
+        Self {
+            min_blocks,
+            max_blocks,
+            window,
+            current_blocks: Arc::new(AtomicU64::new(min_blocks)),
+            instability_seen: Arc::new(AtomicBool::new(false)),
+            history: VecDeque::new(),
+            last_adjustment: Instant::now(),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.current_blocks.load(Ordering::Relaxed)
+    }
+
+    fn current_shared(&self) -> Arc<AtomicU64> {
+        self.current_blocks.clone()
+    }
+
+    fn mark_instability(&self) {
+        self.instability_seen.store(true, Ordering::Relaxed);
+    }
+
+    fn record_tick(&mut self, unstable: bool, caught_up_to_safe_head: bool) {
+        let unstable = unstable || self.instability_seen.swap(false, Ordering::Relaxed);
+        let now = Instant::now();
+        self.history.push_front((now, unstable));
+        while self
+            .history
+            .back()
+            .is_some_and(|(at, _)| now.duration_since(*at) > self.window)
+        {
+            self.history.pop_back();
+        }
+
+        let instability_count = self.history.iter().filter(|(_, seen)| *seen).count();
+        let current = self.current();
+        if instability_count >= 3 {
+            let next = (current + 1).min(self.max_blocks);
+            if next != current {
+                self.current_blocks.store(next, Ordering::Relaxed);
+                self.last_adjustment = now;
+                info!(
+                    old_delay_blocks = current,
+                    new_delay_blocks = next,
+                    min_delay_blocks = self.min_blocks,
+                    max_delay_blocks = self.max_blocks,
+                    window_secs = self.window.as_secs(),
+                    instability_count,
+                    "Increased adaptive head delay"
+                );
+            }
+            self.history.clear();
+        } else if caught_up_to_safe_head
+            && instability_count == 0
+            && current > self.min_blocks
+            && now.duration_since(self.last_adjustment) >= self.window
+        {
+            let next = current - 1;
+            self.current_blocks.store(next, Ordering::Relaxed);
+            self.last_adjustment = now;
+            self.history.clear();
+            info!(
+                old_delay_blocks = current,
+                new_delay_blocks = next,
+                min_delay_blocks = self.min_blocks,
+                max_delay_blocks = self.max_blocks,
+                window_secs = self.window.as_secs(),
+                "Decreased adaptive head delay after quiet window"
+            );
+        }
+    }
+}
+
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
     throttled_pool: ThrottledPool,
@@ -44,7 +138,7 @@ pub struct SyncEngine {
     batch_size: u64,
     concurrency: usize,
     backfill_first: bool,
-    head_delay_blocks: u64,
+    head_delay: AdaptiveHeadDelay,
     /// Skip parent hash validation (trust RPC for reorg handling)
     trust_rpc: bool,
 }
@@ -74,7 +168,7 @@ impl SyncEngine {
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
-            head_delay_blocks: 0,
+            head_delay: AdaptiveHeadDelay::new(30, 100, Duration::from_secs(600)),
             trust_rpc: false,
         })
     }
@@ -99,8 +193,12 @@ impl SyncEngine {
         self
     }
 
-    pub fn with_head_delay_blocks(mut self, head_delay_blocks: u64) -> Self {
-        self.head_delay_blocks = head_delay_blocks;
+    pub fn with_head_delay(mut self, min_blocks: u64, max_blocks: u64, window_secs: u64) -> Self {
+        self.head_delay = AdaptiveHeadDelay::new(
+            min_blocks,
+            max_blocks,
+            Duration::from_secs(window_secs.max(1)),
+        );
         self
     }
 
@@ -157,8 +255,9 @@ impl SyncEngine {
 
             // Get current head to know our target
             let remote_head = self.realtime_rpc.latest_block_number().await?;
-            let safe_head = safe_tip_for_head(remote_head, self.head_delay_blocks);
-            metrics::set_sync_head_delay(self.chain_id, self.head_delay_blocks);
+            let head_delay_blocks = self.head_delay.current();
+            let safe_head = safe_tip_for_head(remote_head, head_delay_blocks);
+            metrics::set_sync_head_delay(self.chain_id, head_delay_blocks);
             update_tip_num(self.pool(), self.chain_id, safe_head, remote_head).await?;
 
             // Check for gaps
@@ -168,7 +267,7 @@ impl SyncEngine {
                     chain_id = self.chain_id,
                     head = remote_head,
                     safe_head = safe_head,
-                    head_delay_blocks = self.head_delay_blocks,
+                    head_delay_blocks = head_delay_blocks,
                     "Backfill complete, switching to realtime sync"
                 );
                 break;
@@ -181,7 +280,7 @@ impl SyncEngine {
                 total_blocks = total_gap_blocks,
                 head = remote_head,
                 safe_head = safe_head,
-                head_delay_blocks = self.head_delay_blocks,
+                head_delay_blocks = head_delay_blocks,
                 "Backfill in progress"
             );
 
@@ -212,9 +311,13 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
-                    if let Err(e) = result {
-                        error!(error = %e, "Realtime sync tick failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    match result {
+                        Ok(outcome) => self.head_delay.record_tick(false, outcome.caught_up_to_safe_head),
+                        Err(e) => {
+                            self.head_delay.record_tick(true, false);
+                            error!(error = %e, "Realtime sync tick failed");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             }
@@ -239,7 +342,7 @@ impl SyncEngine {
             tip_num = state.tip_num,
             synced_num = state.synced_num,
             trust_rpc = self.trust_rpc,
-            head_delay_blocks = self.head_delay_blocks,
+            head_delay_blocks = self.head_delay.current(),
             "Starting sync engine with realtime + gap-fill + receipt backfill"
         );
 
@@ -250,7 +353,7 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
-        let gapfill_head_delay_blocks = self.head_delay_blocks;
+        let gapfill_head_delay_blocks = self.head_delay.current_shared();
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
                 gapfill_sinks,
@@ -288,9 +391,13 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
-                    if let Err(e) = result {
-                        error!(error = %e, "Realtime sync tick failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    match result {
+                        Ok(outcome) => self.head_delay.record_tick(false, outcome.caught_up_to_safe_head),
+                        Err(e) => {
+                            self.head_delay.record_tick(true, false);
+                            error!(error = %e, "Realtime sync tick failed");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             }
@@ -307,13 +414,14 @@ impl SyncEngine {
     /// Strategy: fetch blocks, txs, receipts, and logs together, then commit
     /// them atomically before advancing the tip. This keeps log-backed views
     /// consistent with newly indexed transactions.
-    async fn tick_realtime(&mut self, progress: &mut SyncProgress) -> Result<()> {
+    async fn tick_realtime(&mut self, progress: &mut SyncProgress) -> Result<RealtimeTickOutcome> {
         let state = load_sync_state(self.pool(), self.chain_id)
             .await?
             .unwrap_or_default();
         let remote_head = self.realtime_rpc.latest_block_number().await?;
-        let safe_head = safe_tip_for_head(remote_head, self.head_delay_blocks);
-        metrics::set_sync_head_delay(self.chain_id, self.head_delay_blocks);
+        let head_delay_blocks = self.head_delay.current();
+        let safe_head = safe_tip_for_head(remote_head, head_delay_blocks);
+        metrics::set_sync_head_delay(self.chain_id, head_delay_blocks);
 
         // TAIL_WINDOW: how many blocks behind head to start realtime sync
         const TAIL_WINDOW: u64 = 10;
@@ -330,7 +438,7 @@ impl SyncEngine {
                     skipped = jump_to - state.tip_num,
                     head = remote_head,
                     safe_head = safe_head,
-                    head_delay_blocks = self.head_delay_blocks,
+                    head_delay_blocks = head_delay_blocks,
                     "Realtime: jumping to safe head, gap-fill will backfill"
                 );
             }
@@ -340,7 +448,9 @@ impl SyncEngine {
         if start_from > safe_head {
             progress.report_forward(state.tip_num, remote_head, 0);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            return Ok(());
+            return Ok(RealtimeTickOutcome {
+                caught_up_to_safe_head: true,
+            });
         }
 
         const BATCH_SIZE: u64 = 10;
@@ -464,7 +574,9 @@ impl SyncEngine {
             current_to = next_to;
         }
 
-        Ok(())
+        Ok(RealtimeTickOutcome {
+            caught_up_to_safe_head: true,
+        })
     }
 
     /// Validate parent hash chain for a batch of blocks.
@@ -510,6 +622,7 @@ impl SyncEngine {
     /// After this, the next sync tick will re-fetch the canonical chain.
     async fn handle_reorg(&self, mismatch_block: u64) -> Result<()> {
         const MAX_REORG_DEPTH: u64 = 128;
+        self.head_delay.mark_instability();
 
         info!(
             chain_id = self.chain_id,
@@ -838,7 +951,7 @@ async fn run_gapfill_loop(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
-    head_delay_blocks: u64,
+    head_delay_blocks: Arc<AtomicU64>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(sinks.pool(), chain_id)
@@ -850,7 +963,7 @@ async fn run_gapfill_loop(
         chain_id = chain_id,
         batch_size = batch_size,
         concurrency = concurrency,
-        head_delay_blocks = head_delay_blocks,
+        head_delay_blocks = head_delay_blocks.load(Ordering::Relaxed),
         backfill_limit = backfill_semaphore.available_permits(),
         "Gap-fill: starting with parallel workers (throttled)"
     );
@@ -863,7 +976,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, head_delay_blocks, &mut progress) => {
+            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, head_delay_blocks.load(Ordering::Relaxed), &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1703,6 +1816,43 @@ fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_head_delay_increases_and_respects_bounds() {
+        let mut delay = AdaptiveHeadDelay::new(30, 32, Duration::from_secs(1));
+
+        for _ in 0..3 {
+            delay.record_tick(true, false);
+        }
+        assert_eq!(delay.current(), 31);
+
+        for _ in 0..3 {
+            delay.record_tick(true, false);
+        }
+        assert_eq!(delay.current(), 32);
+
+        for _ in 0..3 {
+            delay.record_tick(true, false);
+        }
+        assert_eq!(delay.current(), 32);
+    }
+
+    #[test]
+    fn adaptive_head_delay_decreases_to_minimum_after_quiet_window() {
+        let mut delay = AdaptiveHeadDelay::new(30, 100, Duration::from_secs(1));
+        for _ in 0..3 {
+            delay.record_tick(true, false);
+        }
+        assert_eq!(delay.current(), 31);
+
+        delay.last_adjustment = Instant::now() - Duration::from_secs(2);
+        delay.record_tick(false, true);
+        assert_eq!(delay.current(), 30);
+
+        delay.last_adjustment = Instant::now() - Duration::from_secs(2);
+        delay.record_tick(false, true);
+        assert_eq!(delay.current(), 30);
+    }
 
     #[test]
     fn test_group_consecutive_blocks_empty() {

@@ -87,8 +87,11 @@ rpc_url = "{rpc_url}"
 pg_url = "{pg_url}"
 backfill = true
 batch_size = 100
-# Leave newest N blocks unindexed by realtime sync to avoid unstable head churn.
-head_delay_blocks = 0
+# Minimum/initial confirmations before realtime indexing. Adaptive delay can
+# increase during repeated near-tip instability and later decrease to this floor.
+head_delay_blocks = 30
+max_head_delay_blocks = 100
+head_delay_window_secs = 600
 "#
     )
 }

@@ -430,7 +430,11 @@ fn spawn_sync_engine(
                         .with_batch_size(chain.batch_size)
                         .with_concurrency(chain.concurrency)
                         .with_backfill_first(backfill_first)
-                        .with_head_delay_blocks(chain.head_delay_blocks)
+                        .with_head_delay(
+                            chain.head_delay_blocks,
+                            chain.max_head_delay_blocks,
+                            chain.head_delay_window_secs,
+                        )
                         .with_trust_rpc(trust_rpc);
                 }
                 Err(e) => {
