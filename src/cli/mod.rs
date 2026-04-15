@@ -1,4 +1,5 @@
 pub mod backfill_receipt_data;
+pub mod backfill_withdrawals;
 pub mod import_blockscout;
 pub mod init;
 pub mod query;
@@ -32,6 +33,8 @@ pub enum Commands {
     Views(views::Args),
     /// Backfill txs.gas_used and txs.fee_payer from receipts
     BackfillReceiptData(backfill_receipt_data::Args),
+    /// Backfill L2 block withdrawal allocations from RPC
+    BackfillWithdrawals(backfill_withdrawals::Args),
     /// Import verified contracts from a Blockscout explorer into local explorer metadata
     ImportBlockscout(import_blockscout::Args),
     /// Update tidx to the latest version

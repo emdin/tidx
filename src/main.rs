@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         Commands::Query(args) => cli::query::run(args).await,
         Commands::Views(args) => cli::views::run(args).await,
         Commands::BackfillReceiptData(args) => cli::backfill_receipt_data::run(args).await,
+        Commands::BackfillWithdrawals(args) => cli::backfill_withdrawals::run(args).await,
         Commands::ImportBlockscout(args) => cli::import_blockscout::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
     }
