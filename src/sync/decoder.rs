@@ -17,8 +17,8 @@ pub fn decode_block(block: &Block) -> BlockRow {
     let timestamp = timestamp_from_secs(timestamp_secs);
     let timestamp_ms = (timestamp_secs * 1000) as i64;
     let parent_beacon_block_root = block
-        .header
-        .parent_beacon_block_root()
+        .parent_beacon_block_root
+        .or_else(|| block.header.parent_beacon_block_root())
         .map(|root| root.as_slice().to_vec());
     let igra_timestamp = parent_beacon_block_root
         .as_deref()
