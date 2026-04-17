@@ -232,6 +232,7 @@ fn build_router(state: AppState) -> Router<()> {
         .allow_origin(tower_http::cors::Any);
 
     Router::new()
+        .route("/txs", get(explorer::index))
         .route("/explore", get(explorer::index))
         .route("/explore/assets/app.js", get(explorer::app_js))
         .route("/explore/assets/styles.css", get(explorer::styles_css))

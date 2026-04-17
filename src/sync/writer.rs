@@ -25,7 +25,10 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     tx.execute(
         "CREATE TEMP TABLE _staging_blocks (
             num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA
+            timestamp_ms INT8, real_timestamp TIMESTAMPTZ, real_timestamp_ms INT8,
+            timestamp_drift_secs INT4, l1_block_count INT2, l1_last_daa_score INT8,
+            parent_beacon_block_root BYTEA, gas_limit INT8, gas_used INT8, miner BYTEA,
+            extra_data BYTEA
         ) ON COMMIT DROP",
         &[],
     )
@@ -37,6 +40,12 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
         Type::BYTEA,       // parent_hash
         Type::TIMESTAMPTZ, // timestamp
         Type::INT8,        // timestamp_ms
+        Type::TIMESTAMPTZ, // real_timestamp
+        Type::INT8,        // real_timestamp_ms
+        Type::INT4,        // timestamp_drift_secs
+        Type::INT2,        // l1_block_count
+        Type::INT8,        // l1_last_daa_score
+        Type::BYTEA,       // parent_beacon_block_root
         Type::INT8,        // gas_limit
         Type::INT8,        // gas_used
         Type::BYTEA,       // miner
@@ -45,7 +54,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
 
     let sink = tx
         .copy_in(
-            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, real_timestamp, real_timestamp_ms, timestamp_drift_secs, l1_block_count, l1_last_daa_score, parent_beacon_block_root, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
         )
         .await?;
 
@@ -61,6 +70,12 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
                 &block.parent_hash,
                 &block.timestamp,
                 &block.timestamp_ms,
+                &block.real_timestamp,
+                &block.real_timestamp_ms,
+                &block.timestamp_drift_secs,
+                &block.l1_block_count,
+                &block.l1_last_daa_score,
+                &block.parent_beacon_block_root,
                 &block.gas_limit,
                 &block.gas_used,
                 &block.miner,
@@ -72,7 +87,17 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     pinned_writer.as_mut().finish().await?;
 
     tx.execute(
-        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
+        "INSERT INTO blocks (
+            num, hash, parent_hash, timestamp, timestamp_ms, real_timestamp, real_timestamp_ms,
+            timestamp_drift_secs, l1_block_count, l1_last_daa_score, parent_beacon_block_root,
+            gas_limit, gas_used, miner, extra_data
+        )
+        SELECT
+            num, hash, parent_hash, timestamp, timestamp_ms, real_timestamp, real_timestamp_ms,
+            timestamp_drift_secs, l1_block_count, l1_last_daa_score, parent_beacon_block_root,
+            gas_limit, gas_used, miner, extra_data
+        FROM _staging_blocks
+        ON CONFLICT (timestamp, num) DO NOTHING",
         &[],
     )
     .await?;

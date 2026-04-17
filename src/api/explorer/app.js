@@ -185,6 +185,7 @@ function shouldAutoRefreshRoute(route, previousSynced, nextSynced) {
     case "home":
       return true;
     case "blocks":
+    case "txs":
     case "contracts":
     case "tokens":
       return route.page === 1;
@@ -244,6 +245,9 @@ function currentRoute() {
 
   if (parts[0] === "blocks") {
     return { name: "blocks", page, params };
+  }
+  if (parts[0] === "txs") {
+    return { name: "txs", page, params };
   }
   if (parts[0] === "contracts") {
     return { name: "contracts", page, params };
@@ -305,6 +309,9 @@ async function renderRoute(_options = {}) {
     case "blocks":
       await renderBlocksPage(route.page);
       return;
+    case "txs":
+      await renderTransactionsPage(route.page);
+      return;
     case "contracts":
       await renderContractsPage(route.page);
       return;
@@ -337,14 +344,27 @@ async function renderHomePage() {
 
   const recentTxs = await runQuery(`
     SELECT
-      block_num,
-      idx,
-      encode(hash, 'hex') AS hash,
-      encode("from", 'hex') AS from_addr,
-      encode("to", 'hex') AS to_addr
+      txs.block_num,
+      txs.idx,
+      encode(txs.hash, 'hex') AS hash,
+      CASE
+        WHEN octet_length(txs.input) >= 4 THEN encode(substring(txs.input FROM 1 FOR 4), 'hex')
+        ELSE NULL
+      END AS selector,
+      encode(txs.input, 'hex') AS input_data,
+      encode(txs."from", 'hex') AS from_addr,
+      encode(txs."to", 'hex') AS to_addr,
+      txs.value,
+      txs.gas_used,
+      receipts.status,
+      COALESCE(blocks.real_timestamp, txs.block_timestamp) AS display_timestamp,
+      txs.block_timestamp AS evm_timestamp,
+      blocks.timestamp_drift_secs
     FROM txs
-    ORDER BY block_num DESC, idx DESC
-    LIMIT 5
+    LEFT JOIN receipts ON receipts.tx_hash = txs.hash
+    LEFT JOIN blocks ON blocks.num = txs.block_num
+    ORDER BY txs.block_num DESC, txs.idx DESC
+    LIMIT 8
   `);
 
   const recent = recentTxs[0] || {};
@@ -387,8 +407,24 @@ async function renderHomePage() {
           ${renderPillLink("Contract", contractHref, icons.contract)}
           ${renderPillLink("Receipt", receiptHref, icons.receipt)}
           ${renderPillLink("Blocks", "/explore/blocks", icons.blocks)}
+          ${renderPillLink("Transactions", "/explore/txs", icons.receipt)}
           ${renderPillLink("Contracts", "/explore/contracts", icons.contract)}
           ${renderPillLink("Tokens", "/explore/tokens", icons.tokens)}
+        </section>
+
+        <section class="home-latest-panel">
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Latest transactions</div>
+                <div class="panel-subtitle">Recent Igra activity, ordered like the canonical explorer transaction feed</div>
+              </div>
+              <a class="ghost-link" href="/explore/txs">${icons.arrow} View all</a>
+            </div>
+            <div class="panel-body table-wrap">
+              ${renderTransactionsTable(recentTxs, { compact: true })}
+            </div>
+          </div>
         </section>
       </div>
     </section>
@@ -405,7 +441,9 @@ async function renderBlocksPage(page) {
     SELECT
       b.num,
       encode(b.hash, 'hex') AS hash,
-      b.timestamp,
+      COALESCE(b.real_timestamp, b.timestamp) AS display_timestamp,
+      b.timestamp AS evm_timestamp,
+      b.timestamp_drift_secs,
       b.gas_used,
       b.gas_limit,
       (SELECT COUNT(*) FROM txs t WHERE t.block_num = b.num) AS tx_count
@@ -446,6 +484,72 @@ async function renderBlocksPage(page) {
           ${renderBlocksTable(blocks)}
         </div>
         ${renderPagination("/explore/blocks", page, blocks.length === PAGE_SIZE)}
+      </section>
+    </section>
+  `;
+}
+
+async function renderTransactionsPage(page) {
+  setDocumentTitle("Transactions · Igra Explorer");
+
+  const offset = (page - 1) * PAGE_SIZE;
+  const txs = await runQuery(`
+    SELECT
+      txs.block_num,
+      txs.idx,
+      encode(txs.hash, 'hex') AS hash,
+      CASE
+        WHEN octet_length(txs.input) >= 4 THEN encode(substring(txs.input FROM 1 FOR 4), 'hex')
+        ELSE NULL
+      END AS selector,
+      encode(txs.input, 'hex') AS input_data,
+      encode(txs."from", 'hex') AS from_addr,
+      encode(txs."to", 'hex') AS to_addr,
+      txs.value,
+      txs.gas_used,
+      receipts.status,
+      COALESCE(blocks.real_timestamp, txs.block_timestamp) AS display_timestamp,
+      txs.block_timestamp AS evm_timestamp,
+      blocks.timestamp_drift_secs
+    FROM txs
+    LEFT JOIN receipts ON receipts.tx_hash = txs.hash
+    LEFT JOIN blocks ON blocks.num = txs.block_num
+    ORDER BY txs.block_num DESC, txs.idx DESC
+    LIMIT ${PAGE_SIZE}
+    OFFSET ${offset}
+  `);
+
+  const latest = state.status?.synced_num ?? state.status?.tip_num ?? 0;
+  const chainLabel = formatChainId(state.chainId);
+
+  elements.pageRoot.innerHTML = `
+    <section class="content-page">
+      <header class="page-header">
+        <div class="badge-row">
+          <span class="status-pill">Live</span>
+          <span class="muted-badge mono">Chain ${chainLabel}</span>
+          <span class="muted-badge mono">Head ${formatNumber(latest)}</span>
+        </div>
+        <div>
+          <h1 class="page-heading">Latest transactions</h1>
+          <p class="page-subheading">Recent transaction feed with method, status, value, gas, and real L1-adjusted time.</p>
+        </div>
+      </header>
+
+      <section class="panel-card">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Transactions</div>
+            <div class="panel-subtitle">Newest first by block number and transaction index</div>
+          </div>
+          <div class="section-actions">
+            <a class="ghost-link" href="/explore/blocks">${icons.blocks} Blocks</a>
+          </div>
+        </div>
+        <div class="panel-body table-wrap">
+          ${renderTransactionsTable(txs)}
+        </div>
+        ${renderPagination("/explore/txs", page, txs.length === PAGE_SIZE)}
       </section>
     </section>
   `;
@@ -513,7 +617,14 @@ async function renderBlockPage(blockId, page) {
         num,
         encode(hash, 'hex') AS hash,
         encode(parent_hash, 'hex') AS parent_hash,
-        timestamp,
+        COALESCE(real_timestamp, timestamp) AS display_timestamp,
+        timestamp AS evm_timestamp,
+        real_timestamp,
+        real_timestamp_ms,
+        timestamp_drift_secs,
+        l1_block_count,
+        l1_last_daa_score,
+        encode(parent_beacon_block_root, 'hex') AS parent_beacon_block_root,
         gas_used,
         gas_limit,
         encode(miner, 'hex') AS miner
@@ -524,7 +635,8 @@ async function renderBlockPage(blockId, page) {
     runQuery(`
       SELECT
         txs.block_num,
-        txs.block_timestamp,
+        COALESCE(blocks.real_timestamp, txs.block_timestamp) AS display_timestamp,
+        txs.block_timestamp AS evm_timestamp,
         txs.idx,
         encode(txs.hash, 'hex') AS hash,
         encode(txs."from", 'hex') AS from_addr,
@@ -534,6 +646,7 @@ async function renderBlockPage(blockId, page) {
         receipts.status
       FROM txs
       LEFT JOIN receipts ON receipts.tx_hash = txs.hash
+      LEFT JOIN blocks ON blocks.num = txs.block_num
       WHERE txs.block_num = ${blockNum}
       ORDER BY txs.idx ASC
       LIMIT ${PAGE_SIZE}
@@ -588,7 +701,7 @@ async function renderBlockPage(blockId, page) {
         </div>
         <div>
           <h1 class="page-heading">Block ${formatNumber(block.num)}</h1>
-          <p class="page-subheading">${escapeHtml(formatTimestamp(block.timestamp))}</p>
+          <p class="page-subheading">${escapeHtml(formatTimestamp(block.display_timestamp))}</p>
         </div>
       </header>
 
@@ -605,6 +718,10 @@ async function renderBlockPage(blockId, page) {
           ${renderSummaryRow("Hash", renderMonoLink(`/explore/block/${block.num}`, with0x(block.hash), false))}
           ${renderSummaryRow("Parent", previousBlockHref ? renderMonoLink(previousBlockHref, with0x(block.parent_hash), false) : escapeHtml(with0x(block.parent_hash)))}
           ${renderSummaryRow("Miner", renderMonoLink(`/explore/address/${with0x(block.miner)}?tab=contract`, with0x(block.miner), false))}
+          ${renderSummaryRow("Real L1 time", escapeHtml(formatTimestamp(block.real_timestamp || block.display_timestamp)))}
+          ${renderSummaryRow("EVM block.timestamp", escapeHtml(formatTimestamp(block.evm_timestamp)))}
+          ${renderSummaryRow("Timestamp drift", block.timestamp_drift_secs === null || block.timestamp_drift_secs === undefined ? '<span class="text-secondary">Not decoded</span>' : `${formatNumber(block.timestamp_drift_secs)} sec`)}
+          ${renderSummaryRow("L1 window", block.l1_block_count ? `${formatNumber(block.l1_block_count)} Kaspa block(s)` : '<span class="text-secondary">-</span>')}
           ${renderSummaryRow("Withdrawals", `${formatNumber(stats.withdrawal_count || 0)} · ${formatKaspaSompi(stats.withdrawal_amount_sompi || "0")}`)}
           ${renderSummaryRow("Gas used", formatGasUnits(block.gas_used))}
           ${renderSummaryRow("Gas limit", formatGasUnits(block.gas_limit))}
@@ -654,7 +771,8 @@ async function renderReceiptPage(hash) {
     runQuery(`
       SELECT
         txs.block_num,
-        txs.block_timestamp,
+        COALESCE(blocks.real_timestamp, txs.block_timestamp) AS display_timestamp,
+        txs.block_timestamp AS evm_timestamp,
         txs.idx,
         encode(txs.hash, 'hex') AS hash,
         CASE
@@ -675,6 +793,7 @@ async function renderReceiptPage(hash) {
         encode(receipts.contract_address, 'hex') AS contract_address
       FROM txs
       LEFT JOIN receipts ON receipts.tx_hash = txs.hash
+      LEFT JOIN blocks ON blocks.num = txs.block_num
       WHERE txs.hash = decode('${body}', 'hex')
       LIMIT 1
     `),
@@ -745,7 +864,8 @@ async function renderReceiptPage(hash) {
         <aside class="summary-card">
           ${renderSummaryRow("Status", renderTxStatusBadge(statusKind))}
           ${renderSummaryRow("Block", `<a href="/explore/block/${tx.block_num}">${formatNumber(tx.block_num)}</a>`)}
-          ${renderSummaryRow("Time", escapeHtml(formatTimestamp(tx.block_timestamp)))}
+          ${renderSummaryRow("Time", escapeHtml(formatTimestamp(tx.display_timestamp)))}
+          ${renderSummaryRow("EVM timestamp", escapeHtml(formatTimestamp(tx.evm_timestamp)))}
           ${renderSummaryRow("Index", formatNumber(tx.idx))}
           ${renderSummaryRow("From", renderMonoLink(`/explore/address/${with0x(tx.from_addr)}`, with0x(tx.from_addr), false))}
           ${renderSummaryRow("To", tx.to_addr ? renderMonoLink(`/explore/address/${with0x(tx.to_addr)}`, with0x(tx.to_addr), false) : '<span class="text-secondary">Contract creation</span>')}
@@ -858,7 +978,8 @@ async function renderAddressPage(address, requestedTab, page) {
     const txRows = await runQuery(`
       SELECT
         txs.block_num,
-        txs.block_timestamp,
+        COALESCE(blocks.real_timestamp, txs.block_timestamp) AS display_timestamp,
+        txs.block_timestamp AS evm_timestamp,
         txs.idx,
         encode(txs.hash, 'hex') AS hash,
         encode(txs."from", 'hex') AS from_addr,
@@ -868,6 +989,7 @@ async function renderAddressPage(address, requestedTab, page) {
         receipts.status
       FROM txs
       LEFT JOIN receipts ON receipts.tx_hash = txs.hash
+      LEFT JOIN blocks ON blocks.num = txs.block_num
       WHERE txs."from" = decode('${body}', 'hex') OR txs."to" = decode('${body}', 'hex')
       ORDER BY txs.block_num DESC, txs.idx DESC
       LIMIT ${PAGE_SIZE}
@@ -1257,10 +1379,10 @@ function renderBlocksTable(rows) {
       (row) => `
         <tr>
           <td class="mono"><a href="/explore/block/${row.num}">${formatNumber(row.num)}</a></td>
-          <td>${escapeHtml(formatRelativeTime(row.timestamp))}</td>
+          <td>${escapeHtml(formatRelativeTime(row.display_timestamp))}</td>
           <td class="align-right mono">${formatNumber(row.tx_count || 0)}</td>
           <td class="mono"><a href="/explore/block/${row.num}">${escapeHtml(shortHex(with0x(row.hash), 10))}</a></td>
-          <td class="align-right mono">${formatNumber(row.gas_used)}</td>
+          <td class="align-right mono">${formatGasUnits(row.gas_used)}</td>
         </tr>
       `,
     )
@@ -1275,6 +1397,56 @@ function renderBlocksTable(rows) {
           <th class="align-right">Txs</th>
           <th>Hash</th>
           <th class="align-right">Gas used</th>
+        </tr>
+      </thead>
+      <tbody>${body}</tbody>
+    </table>
+  `;
+}
+
+function renderTransactionsTable(rows, options = {}) {
+  if (!rows.length) {
+    return '<div class="empty-state">No transactions indexed yet.</div>';
+  }
+
+  const compact = Boolean(options.compact);
+  const body = rows
+    .map((row) => {
+      const from = with0x(row.from_addr);
+      const to = row.to_addr ? with0x(row.to_addr) : null;
+      const selector = row.selector ? with0x(row.selector) : null;
+      const decoded = row.input_data ? decodeCallData(row.input_data) : null;
+      const method = decoded?.label || methodName(selector);
+
+      return `
+        <tr>
+          <td>${renderTxStatusBadge(statusKindFromValue(row.status))}</td>
+          <td class="mono"><a href="/explore/receipt/${with0x(row.hash)}">${escapeHtml(shortHex(with0x(row.hash), compact ? 8 : 10))}</a></td>
+          <td><span class="method-chip">${escapeHtml(method || "Transfer")}</span></td>
+          <td class="mono"><a href="/explore/block/${row.block_num}">${formatNumber(row.block_num)}</a></td>
+          <td>${escapeHtml(formatRelativeTime(row.display_timestamp || row.evm_timestamp))}</td>
+          <td class="mono"><a href="/explore/address/${from}">${escapeHtml(shortHex(from, 7))}</a></td>
+          <td class="mono">${to ? `<a href="/explore/address/${to}">${escapeHtml(shortHex(to, 7))}</a>` : '<span class="text-secondary">create</span>'}</td>
+          <td class="align-right mono">${formatNativeAmount(row.value || "0", compact ? 4 : 6)}</td>
+          ${compact ? "" : `<td class="align-right mono">${formatGasUnits(row.gas_used)}</td>`}
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Txn hash</th>
+          <th>Method</th>
+          <th>Block</th>
+          <th>Age</th>
+          <th>From</th>
+          <th>To</th>
+          <th class="align-right">Value</th>
+          ${compact ? "" : '<th class="align-right">Gas used</th>'}
         </tr>
       </thead>
       <tbody>${body}</tbody>
@@ -1297,7 +1469,7 @@ function renderBlockTransactionsTable(rows) {
           <td class="mono"><a href="/explore/address/${with0x(row.from_addr)}">${escapeHtml(shortHex(with0x(row.from_addr), 8))}</a></td>
           <td class="mono">${toAddress ? `<a href="/explore/address/${toAddress}">${escapeHtml(shortHex(toAddress, 8))}</a>` : '<span class="text-secondary">create</span>'}</td>
           <td class="align-right mono">${formatNativeAmount(row.value || "0", 6)}</td>
-          <td class="align-right mono">${formatNumber(row.gas_used)}</td>
+          <td class="align-right mono">${formatGasUnits(row.gas_used)}</td>
         </tr>
       `;
     })
@@ -1373,7 +1545,7 @@ function renderAddressTransactionsTable(rows, address) {
         <tr>
           <td>${renderTxStatusBadge(statusKindFromValue(row.status))}</td>
           <td class="mono"><a href="/explore/block/${row.block_num}">${formatNumber(row.block_num)}</a></td>
-          <td>${escapeHtml(formatRelativeTime(row.block_timestamp))}</td>
+          <td>${escapeHtml(formatRelativeTime(row.display_timestamp || row.block_timestamp))}</td>
           <td><span class="direction-chip direction-chip-${direction.toLowerCase()}">${direction}</span></td>
           <td class="mono"><a href="/explore/receipt/${with0x(row.hash)}">${escapeHtml(shortHex(with0x(row.hash), 10))}</a></td>
           <td class="mono">${counterparty ? `<a href="/explore/address/${counterparty}">${escapeHtml(shortHex(counterparty, 8))}</a>` : '<span class="text-secondary">-</span>'}</td>
@@ -3383,6 +3555,13 @@ function formatRelativeTime(value) {
   const hour = 60 * minute;
   const day = 24 * hour;
   const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+
+  // Older indexed rows may not have decoded L1 time yet. Igra's synthetic
+  // EVM timestamp can be a few minutes ahead, so never render small drift as
+  // "in N minutes" in explorer feeds.
+  if (deltaMs > 0 && deltaMs < 10 * minute) {
+    return "just now";
+  }
 
   if (abs < hour) {
     return rtf.format(Math.round(deltaMs / minute), "minute");

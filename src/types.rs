@@ -6,8 +6,16 @@ pub struct BlockRow {
     pub num: i64,
     pub hash: Vec<u8>,
     pub parent_hash: Vec<u8>,
+    /// EVM block.timestamp. On Igra this is synthetic and DAA-derived.
     pub timestamp: DateTime<Utc>,
     pub timestamp_ms: i64,
+    /// Real Kaspa L1 wall-clock timestamp decoded from parentBeaconBlockRoot.
+    pub real_timestamp: Option<DateTime<Utc>>,
+    pub real_timestamp_ms: Option<i64>,
+    pub timestamp_drift_secs: Option<i32>,
+    pub l1_block_count: Option<i16>,
+    pub l1_last_daa_score: Option<i64>,
+    pub parent_beacon_block_root: Option<Vec<u8>>,
     pub gas_limit: i64,
     pub gas_used: i64,
     pub miner: Vec<u8>,

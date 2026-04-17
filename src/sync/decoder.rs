@@ -2,6 +2,7 @@ use alloy::consensus::{Transaction as TransactionTrait, Typed2718};
 use alloy::network::{ReceiptResponse, TransactionResponse};
 use chrono::{DateTime, TimeZone, Utc};
 
+use crate::igra_timestamp::decode_igra_timestamp_metadata;
 use crate::tempo::{Block, Log, Receipt, Transaction};
 use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
@@ -15,6 +16,14 @@ pub fn decode_block(block: &Block) -> BlockRow {
     let timestamp_secs = block.header.timestamp;
     let timestamp = timestamp_from_secs(timestamp_secs);
     let timestamp_ms = (timestamp_secs * 1000) as i64;
+    let parent_beacon_block_root = block
+        .header
+        .parent_beacon_block_root
+        .as_ref()
+        .map(|root| root.as_slice().to_vec());
+    let igra_timestamp = parent_beacon_block_root
+        .as_deref()
+        .and_then(|root| decode_igra_timestamp_metadata(root, timestamp_secs));
 
     BlockRow {
         num: block.header.number as i64,
@@ -22,6 +31,12 @@ pub fn decode_block(block: &Block) -> BlockRow {
         parent_hash: block.header.parent_hash.as_slice().to_vec(),
         timestamp,
         timestamp_ms,
+        real_timestamp: igra_timestamp.as_ref().map(|m| m.real_timestamp),
+        real_timestamp_ms: igra_timestamp.as_ref().map(|m| m.real_timestamp_ms),
+        timestamp_drift_secs: igra_timestamp.as_ref().map(|m| m.timestamp_drift_secs),
+        l1_block_count: igra_timestamp.as_ref().map(|m| m.l1_block_count),
+        l1_last_daa_score: igra_timestamp.as_ref().map(|m| m.l1_last_daa_score),
+        parent_beacon_block_root,
         gas_limit: block.header.gas_limit as i64,
         gas_used: block.header.gas_used as i64,
         miner: block.header.beneficiary.as_slice().to_vec(),

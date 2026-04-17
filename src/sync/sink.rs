@@ -341,7 +341,9 @@ async fn fetch_blocks(
 ) -> Result<Vec<BlockRow>> {
     let rows = conn
         .query(
-            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data \
+            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, real_timestamp, real_timestamp_ms, \
+             timestamp_drift_secs, l1_block_count, l1_last_daa_score, parent_beacon_block_root, \
+             gas_limit, gas_used, miner, extra_data \
              FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
             &[&from, &to],
         )
@@ -355,10 +357,16 @@ async fn fetch_blocks(
             parent_hash: r.get(2),
             timestamp: r.get(3),
             timestamp_ms: r.get(4),
-            gas_limit: r.get(5),
-            gas_used: r.get(6),
-            miner: r.get(7),
-            extra_data: r.get(8),
+            real_timestamp: r.get(5),
+            real_timestamp_ms: r.get(6),
+            timestamp_drift_secs: r.get(7),
+            l1_block_count: r.get(8),
+            l1_last_daa_score: r.get(9),
+            parent_beacon_block_root: r.get(10),
+            gas_limit: r.get(11),
+            gas_used: r.get(12),
+            miner: r.get(13),
+            extra_data: r.get(14),
         })
         .collect())
 }

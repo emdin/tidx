@@ -65,8 +65,8 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 break;
             }
 
-            let timestamp = chrono::Utc::now()
-                - chrono::Duration::seconds((config.txs - txs_written) as i64);
+            let timestamp =
+                chrono::Utc::now() - chrono::Duration::seconds((config.txs - txs_written) as i64);
             let block_hash = generate_hash(block_num as u64, 0xB10C);
 
             blocks.push(BlockRow {
@@ -75,6 +75,12 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 parent_hash: prev_block_hash.clone(),
                 timestamp,
                 timestamp_ms: timestamp.timestamp_millis(),
+                real_timestamp: None,
+                real_timestamp_ms: None,
+                timestamp_drift_secs: None,
+                l1_block_count: None,
+                l1_last_daa_score: None,
+                parent_beacon_block_root: None,
                 gas_limit: 30_000_000,
                 gas_used: rng.random_range(10_000_000..25_000_000),
                 miner: generate_address(block_num as u64),

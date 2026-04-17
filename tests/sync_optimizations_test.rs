@@ -3,12 +3,12 @@ mod common;
 use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
+use serial_test::serial;
 use tidx::db::ThrottledPool;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer::{write_blocks, write_logs, write_txs};
 use tidx::types::{BlockRow, LogRow, TxRow};
-use serial_test::serial;
 
 fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {
     (0..count)
@@ -20,6 +20,12 @@ fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {
                 parent_hash: vec![((n - 1) % 256) as u8; 32],
                 timestamp: chrono::Utc::now(),
                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                real_timestamp: None,
+                real_timestamp_ms: None,
+                timestamp_drift_secs: None,
+                l1_block_count: None,
+                l1_last_daa_score: None,
+                parent_beacon_block_root: None,
                 gas_limit: 30_000_000,
                 gas_used: 15_000_000,
                 miner: vec![0u8; 20],
@@ -84,12 +90,17 @@ async fn test_batch_write_blocks() {
     db.truncate_all().await;
 
     let blocks = generate_blocks(50, 10_000_000);
-    write_blocks(&db.pool, &blocks).await.expect("Failed to write blocks");
+    write_blocks(&db.pool, &blocks)
+        .await
+        .expect("Failed to write blocks");
 
     // Verify blocks in our range were written
     let conn = db.pool.get().await.unwrap();
     let count: i64 = conn
-        .query_one("SELECT COUNT(*) FROM blocks WHERE num >= 10000000 AND num < 10000050", &[])
+        .query_one(
+            "SELECT COUNT(*) FROM blocks WHERE num >= 10000000 AND num < 10000050",
+            &[],
+        )
         .await
         .expect("Failed to count")
         .get(0);
@@ -121,7 +132,9 @@ async fn test_batch_write_txs() {
     write_blocks(&db.pool, &blocks).await.unwrap();
 
     let txs = generate_txs(100, 20_000_000);
-    write_txs(&db.pool, &txs).await.expect("Failed to write txs");
+    write_txs(&db.pool, &txs)
+        .await
+        .expect("Failed to write txs");
 
     // Verify type is preserved (count for this specific block)
     let conn = db.pool.get().await.unwrap();
@@ -147,7 +160,9 @@ async fn test_batch_write_logs() {
     write_blocks(&db.pool, &blocks).await.unwrap();
 
     let logs = generate_logs(500, 30_000_000);
-    write_logs(&db.pool, &logs).await.expect("Failed to write logs");
+    write_logs(&db.pool, &logs)
+        .await
+        .expect("Failed to write logs");
 
     // Verify selector is preserved (count for this specific block)
     let conn = db.pool.get().await.unwrap();
@@ -183,17 +198,26 @@ async fn test_batch_write_mixed_realistic() {
     // Count for specific block range
     let conn = db.pool.get().await.unwrap();
     let block_count: i64 = conn
-        .query_one("SELECT COUNT(*) FROM blocks WHERE num >= 40000000 AND num < 40000010", &[])
+        .query_one(
+            "SELECT COUNT(*) FROM blocks WHERE num >= 40000000 AND num < 40000010",
+            &[],
+        )
         .await
         .unwrap()
         .get(0);
     let tx_count: i64 = conn
-        .query_one("SELECT COUNT(*) FROM txs WHERE block_num >= 40000000 AND block_num < 40000010", &[])
+        .query_one(
+            "SELECT COUNT(*) FROM txs WHERE block_num >= 40000000 AND block_num < 40000010",
+            &[],
+        )
         .await
         .unwrap()
         .get(0);
     let log_count: i64 = conn
-        .query_one("SELECT COUNT(*) FROM logs WHERE block_num >= 40000000 AND block_num < 40000010", &[])
+        .query_one(
+            "SELECT COUNT(*) FROM logs WHERE block_num >= 40000000 AND block_num < 40000010",
+            &[],
+        )
         .await
         .unwrap()
         .get(0);
@@ -237,7 +261,9 @@ async fn test_copy_large_batch_logs() {
     write_blocks(&db.pool, &blocks).await.unwrap();
 
     let logs = generate_logs(10000, 60_000_000);
-    write_logs(&db.pool, &logs).await.expect("Failed to COPY logs");
+    write_logs(&db.pool, &logs)
+        .await
+        .expect("Failed to COPY logs");
 
     let conn = db.pool.get().await.unwrap();
     let count: i64 = conn
@@ -292,7 +318,10 @@ async fn test_delete_copy_overwrites_existing_data() {
     // Verify initial selector
     let conn = db.pool.get().await.unwrap();
     let initial: Vec<u8> = conn
-        .query_one("SELECT selector FROM logs WHERE block_num = 71000000 LIMIT 1", &[])
+        .query_one(
+            "SELECT selector FROM logs WHERE block_num = 71000000 LIMIT 1",
+            &[],
+        )
         .await
         .unwrap()
         .get(0);
@@ -306,11 +335,18 @@ async fn test_delete_copy_overwrites_existing_data() {
 
     // Verify data was replaced
     let updated: Vec<u8> = conn
-        .query_one("SELECT selector FROM logs WHERE block_num = 71000000 LIMIT 1", &[])
+        .query_one(
+            "SELECT selector FROM logs WHERE block_num = 71000000 LIMIT 1",
+            &[],
+        )
         .await
         .unwrap()
         .get(0);
-    assert_eq!(updated, vec![0x11, 0x22, 0x33, 0x44], "Data should be overwritten");
+    assert_eq!(
+        updated,
+        vec![0x11, 0x22, 0x33, 0x44],
+        "Data should be overwritten"
+    );
 
     let count: i64 = conn
         .query_one("SELECT COUNT(*) FROM logs WHERE block_num = 71000000", &[])
@@ -377,12 +413,19 @@ async fn test_pipelined_sync() {
     db.truncate_all().await;
 
     // Wait for some blocks
-    tempo.wait_for_block(30).await.expect("Block 30 not reached");
+    tempo
+        .wait_for_block(30)
+        .await
+        .expect("Block 30 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let mut engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let mut engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
     // Create a shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

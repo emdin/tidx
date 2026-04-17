@@ -100,7 +100,27 @@ impl ClickHouseSink {
             debug!(table = name, database = %self.database, "ClickHouse table ready");
         }
 
+        self.ensure_blocks_columns().await?;
+
         info!(database = %self.database, "ClickHouse schema ready");
+        Ok(())
+    }
+
+    async fn ensure_blocks_columns(&self) -> Result<()> {
+        for ddl in [
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS real_timestamp Nullable(DateTime64(3, 'UTC')) AFTER timestamp_ms",
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS real_timestamp_ms Nullable(Int64) AFTER real_timestamp",
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS timestamp_drift_secs Nullable(Int32) AFTER real_timestamp_ms",
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS l1_block_count Nullable(Int16) AFTER timestamp_drift_secs",
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS l1_last_daa_score Nullable(Int64) AFTER l1_block_count",
+            "ALTER TABLE blocks ADD COLUMN IF NOT EXISTS parent_beacon_block_root Nullable(String) AFTER l1_last_daa_score",
+        ] {
+            self.client
+                .query(ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to alter ClickHouse blocks table: {e}"))?;
+        }
         Ok(())
     }
 
@@ -343,6 +363,13 @@ struct ChBlockWire {
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     timestamp: chrono::DateTime<chrono::Utc>,
     timestamp_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    real_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    real_timestamp_ms: Option<i64>,
+    timestamp_drift_secs: Option<i32>,
+    l1_block_count: Option<i16>,
+    l1_last_daa_score: Option<i64>,
+    parent_beacon_block_root: Option<String>,
     gas_limit: i64,
     gas_used: i64,
     miner: String,
@@ -357,6 +384,12 @@ impl ChBlockWire {
             parent_hash: hex_encode(&b.parent_hash),
             timestamp: b.timestamp,
             timestamp_ms: b.timestamp_ms,
+            real_timestamp: b.real_timestamp,
+            real_timestamp_ms: b.real_timestamp_ms,
+            timestamp_drift_secs: b.timestamp_drift_secs,
+            l1_block_count: b.l1_block_count,
+            l1_last_daa_score: b.l1_last_daa_score,
+            parent_beacon_block_root: b.parent_beacon_block_root.as_ref().map(|v| hex_encode(v)),
             gas_limit: b.gas_limit,
             gas_used: b.gas_used,
             miner: hex_encode(&b.miner),
@@ -579,6 +612,12 @@ mod tests {
             parent_hash: vec![0xcd; 32],
             timestamp: dt,
             timestamp_ms: 1705320000000,
+            real_timestamp: Some(dt - chrono::Duration::seconds(150)),
+            real_timestamp_ms: Some(1705319850000),
+            timestamp_drift_secs: Some(150),
+            l1_block_count: Some(10),
+            l1_last_daa_score: Some(123456),
+            parent_beacon_block_root: Some(vec![0x01; 32]),
             gas_limit: 30_000_000,
             gas_used: 15_000_000,
             miner: vec![0xee; 20],

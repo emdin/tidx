@@ -3,6 +3,7 @@ pub mod broadcast;
 pub mod clickhouse;
 pub mod config;
 pub mod db;
+pub mod igra_timestamp;
 pub mod kaspa;
 pub mod metrics;
 pub mod query;

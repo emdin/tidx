@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use tidx::db::{create_pool, run_migrations};
@@ -15,6 +15,12 @@ fn generate_blocks(count: usize, offset: usize) -> Vec<BlockRow> {
                 parent_hash: vec![((n - 1) % 256) as u8; 32],
                 timestamp: chrono::Utc::now(),
                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                real_timestamp: None,
+                real_timestamp_ms: None,
+                timestamp_drift_secs: None,
+                l1_block_count: None,
+                l1_last_daa_score: None,
+                parent_beacon_block_root: None,
                 gas_limit: 30_000_000,
                 gas_used: 15_000_000,
                 miner: vec![0u8; 20],
@@ -79,7 +85,9 @@ fn bench_batch_writes(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -156,7 +164,9 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -220,7 +230,9 @@ fn bench_copy_throughput(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -274,5 +286,10 @@ fn bench_copy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch_writes, bench_mixed_workload, bench_copy_throughput);
+criterion_group!(
+    benches,
+    bench_batch_writes,
+    bench_mixed_workload,
+    bench_copy_throughput
+);
 criterion_main!(benches);
