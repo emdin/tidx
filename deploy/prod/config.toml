@@ -3,9 +3,10 @@ enabled = true
 port = 8080
 bind = "0.0.0.0"
 
-# Replace this with your company VPN / Tailscale CIDR so explorer admin writes
-# are allowed only from trusted networks. With an empty list, only loopback is trusted.
-trusted_cidrs = ["100.64.0.0/10"]
+# Explorer admin writes are allowed only from trusted networks.
+# 100.64.0.0/10 covers Tailscale/VPN; 172.16.0.0/12 lets internal Docker
+# services such as blockscout-importer call tidx without exposing writes publicly.
+trusted_cidrs = ["100.64.0.0/10", "172.16.0.0/12"]
 kaspa_explorer_base_url = "https://kaspa.stream"
 
 [prometheus]
