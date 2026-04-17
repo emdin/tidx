@@ -1,4 +1,4 @@
-use alloy::consensus::{Transaction as TransactionTrait, Typed2718};
+use alloy::consensus::{BlockHeader, Transaction as TransactionTrait, Typed2718};
 use alloy::network::{ReceiptResponse, TransactionResponse};
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -18,8 +18,7 @@ pub fn decode_block(block: &Block) -> BlockRow {
     let timestamp_ms = (timestamp_secs * 1000) as i64;
     let parent_beacon_block_root = block
         .header
-        .parent_beacon_block_root
-        .as_ref()
+        .parent_beacon_block_root()
         .map(|root| root.as_slice().to_vec());
     let igra_timestamp = parent_beacon_block_root
         .as_deref()
