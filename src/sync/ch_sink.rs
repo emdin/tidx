@@ -103,17 +103,23 @@ impl ClickHouseSink {
         self.ensure_blocks_columns().await?;
         self.ensure_txs_columns().await?;
         self.ensure_logs_columns().await?;
+        self.ensure_receipts_columns().await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
     }
 
     async fn ensure_txs_columns(&self) -> Result<()> {
-        // Denormalized 4-byte ABI selector (first 4 bytes of `input`).
-        // String DEFAULT '' so existing rows backfill on next merge.
+        // Denormalized 4-byte selector + UInt256 mirrors of the wei-valued
+        // string columns so callers can skip `toUInt256OrZero()` casts. The
+        // DEFAULT expression handles existing rows lazily on read; new merges
+        // materialize. Idempotent ADD COLUMN IF NOT EXISTS — safe to re-run.
         for ddl in [
             "ALTER TABLE txs ADD COLUMN IF NOT EXISTS selector String DEFAULT '' AFTER input",
             "ALTER TABLE txs ADD INDEX IF NOT EXISTS idx_selector selector TYPE bloom_filter GRANULARITY 1",
+            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS value_u256 UInt256 DEFAULT toUInt256OrZero(value) AFTER value",
+            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS max_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_fee_per_gas) AFTER max_fee_per_gas",
+            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS max_priority_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_priority_fee_per_gas) AFTER max_priority_fee_per_gas",
         ] {
             self.client
                 .query(ddl)
@@ -135,6 +141,20 @@ impl ClickHouseSink {
                 .execute()
                 .await
                 .map_err(|e| anyhow!("Failed to alter ClickHouse logs table: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_receipts_columns(&self) -> Result<()> {
+        // UInt256 mirror of effective_gas_price (Nullable since the source is).
+        for ddl in [
+            "ALTER TABLE receipts ADD COLUMN IF NOT EXISTS effective_gas_price_u256 Nullable(UInt256) DEFAULT toUInt256OrZero(effective_gas_price) AFTER effective_gas_price",
+        ] {
+            self.client
+                .query(ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to alter ClickHouse receipts table: {e}"))?;
         }
         Ok(())
     }
