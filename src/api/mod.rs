@@ -1,5 +1,6 @@
 mod explorer;
 mod explorer_api;
+mod tables;
 mod views;
 
 use std::collections::HashMap;
@@ -296,6 +297,7 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/explore/{*path}", get(explorer::index))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
+        .route("/tables", get(tables::handle_tables))
         .route("/query", get(handle_query))
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
@@ -514,9 +516,12 @@ async fn handle_query_once(
         .await
         .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id,)))?;
 
+    // Engine-specific row cap: ClickHouse handles wider result sets, so callers
+    // who explicitly opt into it via ?engine=clickhouse get HARD_LIMIT_CLICKHOUSE.
+    let cap = crate::query::engine_limit_cap(params.engine.as_deref());
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
-        limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
+        limit: params.limit.clamp(1, cap),
     };
 
     // Route to appropriate engine
@@ -588,9 +593,12 @@ async fn handle_query_live(
 
     let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
+    // Live (SSE) only supports the Postgres engine, so the cap is always
+    // HARD_LIMIT_MAX. Using engine_limit_cap keeps the call site uniform.
+    let cap = crate::query::engine_limit_cap(params.engine.as_deref());
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
-        limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
+        limit: params.limit.clamp(1, cap),
     };
 
     let stream = async_stream::stream! {
