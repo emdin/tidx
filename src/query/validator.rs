@@ -25,7 +25,26 @@ const ALLOWED_TABLES: &[&str] = &[
 
 const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
+
+/// Maximum row count per page for the default (Postgres) engine. PG's planner
+/// is sensitive to large LIMITs, especially when combined with non-indexed
+/// ORDER BY, so we keep this conservative.
 pub const HARD_LIMIT_MAX: i64 = 10_000;
+
+/// Maximum row count per page when the caller explicitly opts into ClickHouse
+/// via `?engine=clickhouse`. CH is built for analytical scans and handles
+/// 50k-row result sets routinely, so the cap can be higher.
+pub const HARD_LIMIT_CLICKHOUSE: i64 = 50_000;
+
+/// Resolve the per-page row cap for a given `?engine=` parameter. Unknown,
+/// missing, or postgres values fall back to the conservative cap so callers
+/// who don't opt in to ClickHouse don't accidentally get 5x the result size.
+pub fn engine_limit_cap(engine: Option<&str>) -> i64 {
+    match engine {
+        Some("clickhouse") => HARD_LIMIT_CLICKHOUSE,
+        _ => HARD_LIMIT_MAX,
+    }
+}
 
 /// Validates that a SQL query is safe to execute.
 ///
@@ -1018,5 +1037,31 @@ mod tests {
     #[test]
     fn test_rejects_fetch_clause() {
         assert!(validate_query("SELECT * FROM blocks FETCH FIRST 10 ROWS ONLY").is_err());
+    }
+
+    // === engine-aware row cap (item #8C) ===
+
+    #[test]
+    fn engine_cap_is_higher_for_clickhouse_than_postgres() {
+        assert_eq!(engine_limit_cap(Some("clickhouse")), HARD_LIMIT_CLICKHOUSE);
+        assert!(HARD_LIMIT_CLICKHOUSE > HARD_LIMIT_MAX);
+    }
+
+    #[test]
+    fn engine_cap_defaults_to_postgres_for_unknown_or_missing_engine() {
+        assert_eq!(engine_limit_cap(None), HARD_LIMIT_MAX);
+        assert_eq!(engine_limit_cap(Some("postgres")), HARD_LIMIT_MAX);
+        assert_eq!(engine_limit_cap(Some("")), HARD_LIMIT_MAX);
+        assert_eq!(engine_limit_cap(Some("duckdb")), HARD_LIMIT_MAX); // historical, no longer supported
+        assert_eq!(engine_limit_cap(Some("garbage")), HARD_LIMIT_MAX);
+    }
+
+    #[test]
+    fn engine_cap_is_case_sensitive() {
+        // "ClickHouse" or "CLICKHOUSE" should NOT raise the cap — only the
+        // exact lowercase form the API documents. Otherwise typos silently
+        // change behavior.
+        assert_eq!(engine_limit_cap(Some("ClickHouse")), HARD_LIMIT_MAX);
+        assert_eq!(engine_limit_cap(Some("CLICKHOUSE")), HARD_LIMIT_MAX);
     }
 }
