@@ -45,6 +45,8 @@ pub fn decode_block(block: &Block) -> BlockRow {
 
 pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
     let block_timestamp = timestamp_from_secs(block.header.timestamp);
+    let input = tx.input().to_vec();
+    let selector = selector_from_input(&input);
 
     TxRow {
         block_num: block.header.number as i64,
@@ -55,7 +57,8 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         from: tx.from().as_slice().to_vec(),
         to: tx.to().map(|a| a.as_slice().to_vec()),
         value: tx.value().to_string(),
-        input: tx.input().to_vec(),
+        input,
+        selector,
         gas_limit: tx.gas_limit() as i64,
         max_fee_per_gas: TransactionTrait::max_fee_per_gas(tx).to_string(),
         max_priority_fee_per_gas: TransactionTrait::max_priority_fee_per_gas(tx)
@@ -124,6 +127,36 @@ pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
         topic2: topics.get(2).map(|t| t.as_slice().to_vec()),
         topic3: topics.get(3).map(|t| t.as_slice().to_vec()),
         data: log.data().data.to_vec(),
+        // Filled by `enrich_logs_from_txs` once parent txs are decoded.
+        from: None,
+    }
+}
+
+/// Returns the first 4 bytes of `input` as the ABI function selector, or `None`
+/// when input is shorter than 4 bytes (plain value transfers, etc.). Stored on
+/// `TxRow.selector` so the public query API can index on selector without
+/// resorting to an expression index.
+pub fn selector_from_input(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() >= 4 {
+        Some(input[..4].to_vec())
+    } else {
+        None
+    }
+}
+
+/// Denormalize `from` from each parent transaction onto its emitted logs. Logs
+/// are joined to txs by `(block_num, tx_idx)`; logs whose parent isn't in the
+/// supplied slice are left with `from = None`. Mirrors `enrich_txs_from_receipts`.
+pub fn enrich_logs_from_txs(logs: &mut [LogRow], txs: &[TxRow]) {
+    use std::collections::HashMap;
+    let from_map: HashMap<(i64, i32), &[u8]> = txs
+        .iter()
+        .map(|t| ((t.block_num, t.idx), t.from.as_slice()))
+        .collect();
+    for log in logs.iter_mut() {
+        if let Some(from) = from_map.get(&(log.block_num, log.tx_idx)) {
+            log.from = Some(from.to_vec());
+        }
     }
 }
 
@@ -230,6 +263,113 @@ mod tests {
         assert_eq!(txs[1].fee_payer, None);
         assert_eq!(txs[2].gas_used, Some(63000));
         assert_eq!(txs[2].fee_payer, Some(vec![0x02; 20]));
+    }
+
+    // ===== selector_from_input (denormalized 4-byte ABI selector) =====
+
+    #[test]
+    fn selector_takes_first_four_bytes_of_input() {
+        let input = vec![0xa9, 0x05, 0x9c, 0xbb, 0x00, 0x01, 0x02];
+        assert_eq!(selector_from_input(&input), Some(vec![0xa9, 0x05, 0x9c, 0xbb]));
+    }
+
+    #[test]
+    fn selector_handles_exactly_four_bytes() {
+        let input = vec![0xa9, 0x05, 0x9c, 0xbb];
+        assert_eq!(selector_from_input(&input), Some(vec![0xa9, 0x05, 0x9c, 0xbb]));
+    }
+
+    #[test]
+    fn selector_is_none_when_input_too_short() {
+        assert_eq!(selector_from_input(&[]), None);
+        assert_eq!(selector_from_input(&[0xa9]), None);
+        assert_eq!(selector_from_input(&[0xa9, 0x05, 0x9c]), None);
+    }
+
+    // ===== enrich_logs_from_txs (denormalize tx.from onto each log) =====
+
+    fn make_log(block_num: i64, tx_idx: i32, log_idx: i32) -> LogRow {
+        LogRow {
+            block_num,
+            tx_idx,
+            log_idx,
+            ..Default::default()
+        }
+    }
+
+    fn make_tx_with_from(block_num: i64, idx: i32, from: Vec<u8>) -> TxRow {
+        TxRow {
+            block_num,
+            idx,
+            from,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enrich_logs_copies_from_address_from_parent_tx() {
+        let txs = vec![
+            make_tx_with_from(100, 0, vec![0xaa; 20]),
+            make_tx_with_from(100, 1, vec![0xbb; 20]),
+        ];
+        let mut logs = vec![
+            make_log(100, 0, 0),
+            make_log(100, 0, 1), // second log of tx 0
+            make_log(100, 1, 0),
+        ];
+
+        enrich_logs_from_txs(&mut logs, &txs);
+
+        assert_eq!(logs[0].from, Some(vec![0xaa; 20]));
+        assert_eq!(logs[1].from, Some(vec![0xaa; 20]));
+        assert_eq!(logs[2].from, Some(vec![0xbb; 20]));
+    }
+
+    #[test]
+    fn enrich_logs_leaves_unmatched_as_none() {
+        let txs = vec![make_tx_with_from(100, 0, vec![0xaa; 20])];
+        let mut logs = vec![
+            make_log(100, 0, 0),
+            make_log(100, 99, 0), // no tx with idx 99 in this block
+            make_log(999, 0, 0),  // wrong block
+        ];
+
+        enrich_logs_from_txs(&mut logs, &txs);
+
+        assert_eq!(logs[0].from, Some(vec![0xaa; 20]));
+        assert_eq!(logs[1].from, None);
+        assert_eq!(logs[2].from, None);
+    }
+
+    #[test]
+    fn enrich_logs_handles_empty_inputs() {
+        let mut logs: Vec<LogRow> = vec![];
+        enrich_logs_from_txs(&mut logs, &[]);
+        assert!(logs.is_empty());
+
+        let mut logs = vec![make_log(1, 0, 0)];
+        enrich_logs_from_txs(&mut logs, &[]);
+        assert_eq!(logs[0].from, None);
+    }
+
+    #[test]
+    fn enrich_logs_multi_block_batch() {
+        let txs = vec![
+            make_tx_with_from(10, 0, vec![0x01; 20]),
+            make_tx_with_from(10, 1, vec![0x02; 20]),
+            make_tx_with_from(11, 0, vec![0x03; 20]),
+        ];
+        let mut logs = vec![
+            make_log(10, 0, 0),
+            make_log(10, 1, 0),
+            make_log(11, 0, 0),
+        ];
+
+        enrich_logs_from_txs(&mut logs, &txs);
+
+        assert_eq!(logs[0].from, Some(vec![0x01; 20]));
+        assert_eq!(logs[1].from, Some(vec![0x02; 20]));
+        assert_eq!(logs[2].from, Some(vec![0x03; 20]));
     }
 }
 

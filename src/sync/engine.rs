@@ -14,7 +14,7 @@ use crate::types::SyncState;
 
 use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, decode_withdrawals,
-    enrich_txs_from_receipts, timestamp_from_secs,
+    enrich_logs_from_txs, enrich_txs_from_receipts, timestamp_from_secs,
 };
 use super::fetcher::{ReceiptFetchMode, RpcClient};
 use super::sink::SinkSet;
@@ -719,7 +719,7 @@ impl SyncEngine {
             })
             .collect();
 
-        let all_logs: Vec<_> = receipts
+        let mut all_logs: Vec<_> = receipts
             .iter()
             .flatten()
             .flat_map(|receipt| {
@@ -750,6 +750,7 @@ impl SyncEngine {
             .collect();
 
         enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+        enrich_logs_from_txs(&mut all_logs, &all_txs);
 
         Ok((
             blocks,
@@ -797,7 +798,7 @@ impl SyncEngine {
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        let log_rows: Vec<_> = receipts
+        let mut log_rows: Vec<_> = receipts
             .iter()
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
@@ -809,6 +810,7 @@ impl SyncEngine {
         let withdrawal_rows = decode_withdrawals(&block);
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
+        enrich_logs_from_txs(&mut log_rows, &txs);
 
         self.sinks
             .write_all(
@@ -1524,7 +1526,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         })
         .collect();
 
-    let all_logs: Vec<_> = receipts
+    let mut all_logs: Vec<_> = receipts
         .iter()
         .flatten()
         .flat_map(|receipt| {
@@ -1555,6 +1557,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         .collect();
 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+    enrich_logs_from_txs(&mut all_logs, &all_txs);
 
     sinks
         .write_all(
@@ -1663,7 +1666,7 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             .collect();
 
         // Decode logs and receipts
-        let all_logs: Vec<_> = receipts
+        let mut all_logs: Vec<_> = receipts
             .iter()
             .flatten()
             .flat_map(|receipt| {

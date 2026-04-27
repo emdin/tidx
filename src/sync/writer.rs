@@ -142,7 +142,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
             gas_limit INT8, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
             gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
             fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
-            valid_after INT8, signature_type INT2
+            valid_after INT8, signature_type INT2, selector BYTEA
         ) ON COMMIT DROP",
         &[],
     )
@@ -171,6 +171,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
         Type::INT8,        // valid_before
         Type::INT8,        // valid_after
         Type::INT2,        // signature_type
+        Type::BYTEA,       // selector
     ];
 
     let sink = tx
@@ -178,7 +179,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
             r#"COPY _staging_txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
                 gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
                 nonce_key, nonce, fee_token, fee_payer, calls, call_count,
-                valid_before, valid_after, signature_type) FROM STDIN BINARY"#,
+                valid_before, valid_after, signature_type, selector) FROM STDIN BINARY"#,
         )
         .await?;
 
@@ -211,6 +212,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
                 &tx.valid_before,
                 &tx.valid_after,
                 &tx.signature_type,
+                &tx.selector,
             ])
             .await?;
     }
@@ -247,7 +249,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         "CREATE TEMP TABLE _staging_logs (
             block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
             tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA, \"from\" BYTEA
         ) ON COMMIT DROP",
         &[],
     )
@@ -266,11 +268,12 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         Type::BYTEA,       // topic2
         Type::BYTEA,       // topic3
         Type::BYTEA,       // data
+        Type::BYTEA,       // from
     ];
 
     let sink = tx
         .copy_in(
-            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, \"from\") FROM STDIN BINARY",
         )
         .await?;
 
@@ -293,6 +296,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
                 &log.topic2,
                 &log.topic3,
                 &log.data,
+                &log.from,
             ])
             .await?;
     }
@@ -596,7 +600,7 @@ pub async fn write_batch(
                 gas_limit INT8, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
                 gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
                 fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
-                valid_after INT8, signature_type INT2
+                valid_after INT8, signature_type INT2, selector BYTEA
             ) ON COMMIT DROP",
             &[],
         )
@@ -625,6 +629,7 @@ pub async fn write_batch(
             Type::INT8,        // valid_before
             Type::INT8,        // valid_after
             Type::INT2,        // signature_type
+            Type::BYTEA,       // selector
         ];
 
         let sink = tx
@@ -632,7 +637,7 @@ pub async fn write_batch(
                 r#"COPY _staging_txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
                 gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
                 nonce_key, nonce, fee_token, fee_payer, calls, call_count,
-                valid_before, valid_after, signature_type) FROM STDIN BINARY"#,
+                valid_before, valid_after, signature_type, selector) FROM STDIN BINARY"#,
             )
             .await?;
 
@@ -665,6 +670,7 @@ pub async fn write_batch(
                     &tx_row.valid_before,
                     &tx_row.valid_after,
                     &tx_row.signature_type,
+                    &tx_row.selector,
                 ])
                 .await?;
         }
@@ -684,7 +690,7 @@ pub async fn write_batch(
             "CREATE TEMP TABLE _staging_logs (
                 block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
                 tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA, \"from\" BYTEA
             ) ON COMMIT DROP",
             &[],
         )
@@ -703,11 +709,12 @@ pub async fn write_batch(
             Type::BYTEA,       // topic2
             Type::BYTEA,       // topic3
             Type::BYTEA,       // data
+            Type::BYTEA,       // from
         ];
 
         let sink = tx
             .copy_in(
-                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, \"from\") FROM STDIN BINARY",
             )
             .await?;
 
@@ -730,6 +737,7 @@ pub async fn write_batch(
                     &log.topic2,
                     &log.topic3,
                     &log.data,
+                    &log.from,
                 ])
                 .await?;
         }

@@ -60,6 +60,7 @@ fn generate_txs(count: usize, block_num: i64) -> Vec<TxRow> {
             valid_before: None,
             valid_after: None,
             signature_type: Some(0),
+            selector: None,
         })
         .collect()
 }
@@ -79,6 +80,7 @@ fn generate_logs(count: usize, block_num: i64) -> Vec<LogRow> {
             topic2: Some(vec![2u8; 32]),
             topic3: None,
             data: vec![0u8; 64],
+            from: None,
         })
         .collect()
 }

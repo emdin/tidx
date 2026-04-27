@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS txs (
     `to`                    Nullable(String),
     value                   String,
     input                   String,
+    selector                String DEFAULT '',
     gas_limit               Int64,
     max_fee_per_gas         String,
     max_priority_fee_per_gas String,
@@ -20,7 +21,9 @@ CREATE TABLE IF NOT EXISTS txs (
     call_count              Int16,
     valid_before            Nullable(Int64),
     valid_after             Nullable(Int64),
-    signature_type          Nullable(Int16)
+    signature_type          Nullable(Int16),
+
+    INDEX idx_selector selector TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)

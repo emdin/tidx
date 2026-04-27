@@ -377,7 +377,7 @@ async fn fetch_txs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Resu
             "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input, \
              gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, \
              nonce_key, nonce, fee_token, fee_payer, calls, call_count, \
-             valid_before, valid_after, signature_type \
+             valid_before, valid_after, signature_type, selector \
              FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
             &[&from, &to],
         )
@@ -408,6 +408,7 @@ async fn fetch_txs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Resu
             valid_before: r.get(19),
             valid_after: r.get(20),
             signature_type: r.get(21),
+            selector: r.get(22),
         })
         .collect())
 }
@@ -416,7 +417,7 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
     let rows = conn
         .query(
             "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, \
-             selector, topic0, topic1, topic2, topic3, data \
+             selector, topic0, topic1, topic2, topic3, data, \"from\" \
              FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
             &[&from, &to],
         )
@@ -437,6 +438,7 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
             topic2: r.get(9),
             topic3: r.get(10),
             data: r.get(11),
+            from: r.get(12),
         })
         .collect())
 }

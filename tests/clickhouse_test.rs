@@ -854,6 +854,7 @@ fn make_tx(block_num: i64, idx: i32) -> TxRow {
         to: Some(vec![0x22; 20]),
         value: "1000000000000000000".to_string(),
         input: vec![0xa9, 0x05, 0x9c, 0xbb],
+        selector: Some(vec![0xa9, 0x05, 0x9c, 0xbb]),
         gas_limit: 21_000,
         max_fee_per_gas: "100000000000".to_string(),
         max_priority_fee_per_gas: "1000000000".to_string(),
@@ -887,6 +888,7 @@ fn make_log(block_num: i64, log_idx: i32) -> LogRow {
         topic2: Some(vec![0x22; 32]),
         topic3: None,
         data: vec![0x00; 32],
+        from: Some(vec![0x11; 20]),
     }
 }
 
@@ -1281,10 +1283,11 @@ async fn test_cte_query_against_sink_data() {
         ],
         selector: Some(topic0.clone()), // full 32-byte topic0 (same as decoder produces)
         topic0: Some(topic0),
-        topic1: Some(from_addr),
+        topic1: Some(from_addr.clone()),
         topic2: Some(to_addr),
         topic3: None,
         data: value_data,
+        from: Some(from_addr),
     };
 
     sink.write_logs(&[log]).await.expect("write_logs failed");
@@ -1346,6 +1349,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            from: Some(addr_a.clone()),
         });
     }
     // 3 logs from addr_b
@@ -1363,6 +1367,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            from: Some(addr_b.clone()),
         });
     }
 

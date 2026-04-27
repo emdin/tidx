@@ -23,3 +23,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_address_topic1 ON logs (topic1, address, blo
 DROP INDEX IF EXISTS idx_logs_topic1;
 CREATE INDEX IF NOT EXISTS idx_logs_topic2 ON logs (topic2);
 CREATE INDEX IF NOT EXISTS idx_logs_topic3 ON logs (topic3);
+
+-- Denormalized parent-tx sender (`txs."from"`). Lets clients filter "all events
+-- emitted by txs sent from address X" without joining `txs`. Populated by the
+-- writer on insert; existing rows are NULL until backfilled.
+ALTER TABLE logs ADD COLUMN IF NOT EXISTS "from" BYTEA;
+CREATE INDEX IF NOT EXISTS idx_logs_from ON logs ("from", block_timestamp DESC) WHERE "from" IS NOT NULL;

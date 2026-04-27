@@ -99,6 +99,12 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 let from_addr = generate_address(rng.random_range(0..10000));
                 let to_addr = generate_address(rng.random_range(0..10000));
 
+                let input = generate_input(&mut rng);
+                let selector = if input.len() >= 4 {
+                    Some(input[..4].to_vec())
+                } else {
+                    None
+                };
                 txs.push(TxRow {
                     block_num,
                     block_timestamp: timestamp,
@@ -108,12 +114,13 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                     from: from_addr.clone(),
                     to: Some(to_addr),
                     value: "0".to_string(),
-                    input: generate_input(&mut rng),
+                    input,
+                    selector,
                     gas_limit: 21000 + rng.random_range(0..100000),
                     max_fee_per_gas: "1000000000".to_string(),
                     max_priority_fee_per_gas: "100000000".to_string(),
                     gas_used: Some(21000 + rng.random_range(0..50000)),
-                    nonce_key: from_addr,
+                    nonce_key: from_addr.clone(),
                     nonce: i64::from(rng.random_range(0..10000)),
                     fee_token: None,
                     fee_payer: None,
@@ -145,6 +152,7 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                         topic2: Some(generate_hash(rng.random(), 0x10C2)),
                         topic3: None,
                         data: vec![0u8; rng.random_range(32..128)],
+                        from: Some(from_addr.clone()),
                     });
                 }
                 logs_written += num_logs as u64;
