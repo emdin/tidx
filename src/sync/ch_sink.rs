@@ -101,8 +101,41 @@ impl ClickHouseSink {
         }
 
         self.ensure_blocks_columns().await?;
+        self.ensure_txs_columns().await?;
+        self.ensure_logs_columns().await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
+        Ok(())
+    }
+
+    async fn ensure_txs_columns(&self) -> Result<()> {
+        // Denormalized 4-byte ABI selector (first 4 bytes of `input`).
+        // String DEFAULT '' so existing rows backfill on next merge.
+        for ddl in [
+            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS selector String DEFAULT '' AFTER input",
+            "ALTER TABLE txs ADD INDEX IF NOT EXISTS idx_selector selector TYPE bloom_filter GRANULARITY 1",
+        ] {
+            self.client
+                .query(ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to alter ClickHouse txs table: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_logs_columns(&self) -> Result<()> {
+        // Denormalized parent-tx sender. Nullable since old rows are NULL until backfilled.
+        for ddl in [
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS `from` Nullable(String) AFTER data",
+            "ALTER TABLE logs ADD INDEX IF NOT EXISTS idx_from `from` TYPE bloom_filter GRANULARITY 1",
+        ] {
+            self.client
+                .query(ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to alter ClickHouse logs table: {e}"))?;
+        }
         Ok(())
     }
 
@@ -411,6 +444,9 @@ struct ChTxWire {
     to: Option<String>,
     value: String,
     input: String,
+    /// Empty string when input is shorter than 4 bytes — matches the CH column
+    /// `String DEFAULT ''` so the bloom_filter index covers the empty case.
+    selector: String,
     gas_limit: i64,
     max_fee_per_gas: String,
     max_priority_fee_per_gas: String,
@@ -438,6 +474,11 @@ impl ChTxWire {
             to: tx.to.as_ref().map(|v| hex_encode(v)),
             value: tx.value.clone(),
             input: hex_encode(&tx.input),
+            selector: tx
+                .selector
+                .as_ref()
+                .map(|v| hex_encode(v))
+                .unwrap_or_default(),
             gas_limit: tx.gas_limit,
             max_fee_per_gas: tx.max_fee_per_gas.clone(),
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas.clone(),
@@ -470,6 +511,9 @@ struct ChLogWire {
     topic2: Option<String>,
     topic3: Option<String>,
     data: String,
+    /// Denormalized parent-tx sender. Nullable so old rows (pre-migration)
+    /// stay queryable while backfill is in flight.
+    from: Option<String>,
 }
 
 impl ChLogWire {
@@ -491,6 +535,7 @@ impl ChLogWire {
             topic2: log.topic2.as_ref().map(|v| hex_encode(v)),
             topic3: log.topic3.as_ref().map(|v| hex_encode(v)),
             data: hex_encode(&log.data),
+            from: log.from.as_ref().map(|v| hex_encode(v)),
         }
     }
 }

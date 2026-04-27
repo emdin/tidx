@@ -89,7 +89,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 col("from", "BYTEA / String", "Sender address (20 bytes). Quote in PG: \"from\" — `from` is reserved"),
                 col("to", "BYTEA / String", "Recipient address; NULL for contract creation"),
                 col("value", "TEXT / String", "Wei value, uint256 as decimal string. Cast in CH with toUInt256OrZero()"),
-                col("input", "BYTEA / String", "Calldata. First 4 bytes = ABI selector"),
+                col("input", "BYTEA / String", "Calldata. First 4 bytes = ABI selector (also denormalized as `selector` for indexed lookups)"),
+                col("selector", "BYTEA / String", "First 4 bytes of `input`. Indexed — filter by method without expression-index cost. NULL when input is shorter than 4 bytes (plain transfers)"),
                 col("gas_limit", "INT8", "Tx gas limit"),
                 col("gas_used", "INT8", "Gas actually consumed (NULL until receipt arrives)"),
                 col("max_fee_per_gas", "TEXT / String", "EIP-1559 max fee per gas (wei, uint256 string)"),
@@ -100,12 +101,12 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
             examples: vec![
                 QueryExample {
-                    description: "All ERC-20 transfer() calls (selector 0xa9059cbb) in the last 1000 blocks (PG)",
-                    sql: "SELECT block_num, encode(hash,'hex') FROM txs WHERE substring(input,1,4) = decode('a9059cbb','hex') AND block_num > (SELECT max(num) FROM blocks) - 1000",
+                    description: "All ERC-20 transfer() calls (selector 0xa9059cbb) — uses the indexed `selector` column",
+                    sql: "SELECT block_num, encode(hash,'hex') FROM txs WHERE selector = decode('a9059cbb','hex') ORDER BY block_num DESC LIMIT 100",
                 },
                 QueryExample {
-                    description: "Same in CH (string LIKE works since input is hex-prefixed)",
-                    sql: "SELECT block_num, hash FROM txs WHERE input LIKE '0xa9059cbb%' ORDER BY block_num DESC LIMIT 100",
+                    description: "Same in CH (selector is hex-prefixed)",
+                    sql: "SELECT block_num, hash FROM txs WHERE selector = '0xa9059cbb' ORDER BY block_num DESC LIMIT 100",
                 },
             ],
         },
@@ -126,6 +127,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 col("topic2", "BYTEA / String", "Indexed parameter 2 (often `to`)"),
                 col("topic3", "BYTEA / String", "Indexed parameter 3"),
                 col("data", "BYTEA / String", "Non-indexed event data (ABI-encoded)"),
+                col("from", "BYTEA / String", "Sender of the parent transaction (denormalized from txs.\"from\"). Indexed — `WHERE \"from\" = decode('...','hex')` returns all events emitted by txs sent from that address, no JOIN needed"),
             ],
             examples: vec![
                 QueryExample {
@@ -135,6 +137,10 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Equivalent without ?signature= — must hash 'Transfer(address,address,uint256)' yourself",
                     sql: "SELECT * FROM logs WHERE selector = decode('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef','hex')",
+                },
+                QueryExample {
+                    description: "All events emitted by txs sent from a specific address (uses denormalized logs.\"from\")",
+                    sql: "SELECT block_num, encode(address,'hex'), encode(selector,'hex') FROM logs WHERE \"from\" = decode('abc123...','hex') ORDER BY block_num DESC LIMIT 100",
                 },
             ],
         },

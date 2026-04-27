@@ -31,4 +31,9 @@ CREATE INDEX IF NOT EXISTS idx_txs_from ON txs ("from", block_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_txs_to ON txs ("to", block_timestamp DESC);
 DROP INDEX IF EXISTS idx_txs_calls;
 CREATE INDEX IF NOT EXISTS idx_txs_calls_partial ON txs USING GIN (calls) WHERE calls IS NOT NULL AND call_count > 1;
-DROP INDEX IF EXISTS idx_txs_selector;
+
+-- Denormalized 4-byte ABI function selector (first 4 bytes of `input`). Lets
+-- clients filter by method without an expression index. Populated by the writer
+-- on insert; existing rows are NULL until backfilled.
+ALTER TABLE txs ADD COLUMN IF NOT EXISTS selector BYTEA;
+CREATE INDEX IF NOT EXISTS idx_txs_selector ON txs (selector, block_timestamp DESC) WHERE selector IS NOT NULL;

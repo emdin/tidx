@@ -33,6 +33,11 @@ pub struct TxRow {
     pub to: Option<Vec<u8>>,
     pub value: String,
     pub input: Vec<u8>,
+    /// First 4 bytes of `input` (the ABI function selector). Denormalized off
+    /// `input` so `WHERE selector = decode('a9059cbb','hex')` hits an index
+    /// instead of a full-table scan with `substring(input,1,4) = ...`.
+    /// `None` when `input` is shorter than 4 bytes (typically plain transfers).
+    pub selector: Option<Vec<u8>>,
     pub gas_limit: i64,
     pub max_fee_per_gas: String,
     pub max_priority_fee_per_gas: String,
@@ -62,6 +67,12 @@ pub struct LogRow {
     pub topic2: Option<Vec<u8>>,
     pub topic3: Option<Vec<u8>>,
     pub data: Vec<u8>,
+    /// Sender of the parent transaction. Denormalized from `txs."from"` so
+    /// "all events sent by address X" doesn't require a JOIN to `txs`.
+    /// Populated post log decode by `decoder::enrich_logs_from_txs`. `None`
+    /// when the parent tx isn't in the same batch (defensive — should not
+    /// happen at runtime).
+    pub from: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]

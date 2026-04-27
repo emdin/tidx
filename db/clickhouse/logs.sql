@@ -11,11 +11,13 @@ CREATE TABLE IF NOT EXISTS logs (
     topic2          Nullable(String),
     topic3          Nullable(String),
     data            String,
+    `from`          Nullable(String),
 
     INDEX idx_selector selector TYPE bloom_filter GRANULARITY 1,
     INDEX idx_address address TYPE bloom_filter GRANULARITY 1,
     INDEX idx_topic1 topic1 TYPE bloom_filter GRANULARITY 1,
-    INDEX idx_topic2 topic2 TYPE bloom_filter GRANULARITY 1
+    INDEX idx_topic2 topic2 TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_from `from` TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (address, selector, block_num, log_idx)
