@@ -3,7 +3,7 @@ use tracing::info;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
+use crate::types::{BlockRow, InternalTxRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
 use super::ch_sink::ClickHouseSink;
 use super::writer;
@@ -87,6 +87,21 @@ impl SinkSet {
             )?;
         } else {
             writer::write_l2_withdrawals(&self.pool, withdrawals).await?;
+        }
+        Ok(())
+    }
+
+    /// Phase 4: callTracer-derived nested calls. Written through a separate
+    /// path from `write_all` because tracing is opt-in and traces are fetched
+    /// per-tx after the block has already been persisted.
+    pub async fn write_internal_txs(&self, internal_txs: &[InternalTxRow]) -> Result<()> {
+        if let Some(ch) = &self.ch {
+            tokio::try_join!(
+                writer::write_internal_txs(&self.pool, internal_txs),
+                ch.write_internal_txs(internal_txs),
+            )?;
+        } else {
+            writer::write_internal_txs(&self.pool, internal_txs).await?;
         }
         Ok(())
     }
