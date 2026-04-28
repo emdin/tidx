@@ -7,11 +7,17 @@ CREATE TABLE IF NOT EXISTS txs (
     `from`                  String,
     `to`                    Nullable(String),
     value                   String,
+    -- UInt256 mirror of `value` so callers can use direct numeric comparisons
+    -- without `toUInt256OrZero()`. DEFAULT auto-converts on read; new rows are
+    -- written with the same string and the DEFAULT applies.
+    value_u256              UInt256 DEFAULT toUInt256OrZero(value),
     input                   String,
     selector                String DEFAULT '',
     gas_limit               Int64,
     max_fee_per_gas         String,
+    max_fee_per_gas_u256    UInt256 DEFAULT toUInt256OrZero(max_fee_per_gas),
     max_priority_fee_per_gas String,
+    max_priority_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_priority_fee_per_gas),
     gas_used                Nullable(Int64),
     nonce_key               String,
     nonce                   Int64,

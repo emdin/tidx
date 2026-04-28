@@ -88,13 +88,16 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 col("type", "INT2", "EIP-2718 tx type (0=legacy, 2=EIP-1559, etc.)"),
                 col("from", "BYTEA / String", "Sender address (20 bytes). Quote in PG: \"from\" — `from` is reserved"),
                 col("to", "BYTEA / String", "Recipient address; NULL for contract creation"),
-                col("value", "TEXT / String", "Wei value, uint256 as decimal string. Cast in CH with toUInt256OrZero()"),
+                col("value", "TEXT / String", "Wei value, uint256 as decimal string. CH also has `value_u256` for direct numeric use (skip the toUInt256OrZero cast)"),
+                col("value_u256", "(CH only) UInt256", "ClickHouse-only mirror of `value` as native UInt256. Use this for numeric comparisons and aggregates without casting. PG: cast `value::numeric` instead"),
                 col("input", "BYTEA / String", "Calldata. First 4 bytes = ABI selector (also denormalized as `selector` for indexed lookups)"),
                 col("selector", "BYTEA / String", "First 4 bytes of `input`. Indexed — filter by method without expression-index cost. NULL when input is shorter than 4 bytes (plain transfers)"),
                 col("gas_limit", "INT8", "Tx gas limit"),
                 col("gas_used", "INT8", "Gas actually consumed (NULL until receipt arrives)"),
-                col("max_fee_per_gas", "TEXT / String", "EIP-1559 max fee per gas (wei, uint256 string)"),
-                col("max_priority_fee_per_gas", "TEXT / String", "EIP-1559 priority fee (wei, uint256 string)"),
+                col("max_fee_per_gas", "TEXT / String", "EIP-1559 max fee per gas (wei, uint256 string). CH mirror: `max_fee_per_gas_u256`"),
+                col("max_fee_per_gas_u256", "(CH only) UInt256", "ClickHouse-only UInt256 mirror of max_fee_per_gas"),
+                col("max_priority_fee_per_gas", "TEXT / String", "EIP-1559 priority fee (wei, uint256 string). CH mirror: `max_priority_fee_per_gas_u256`"),
+                col("max_priority_fee_per_gas_u256", "(CH only) UInt256", "ClickHouse-only UInt256 mirror of max_priority_fee_per_gas"),
                 col("nonce", "INT8", "Sender's nonce"),
                 col("calls", "JSONB / Nullable(String)", "Reserved for internal-call traces; currently always NULL"),
                 col("call_count", "INT2", "Reserved for internal-call traces; currently always 1"),
@@ -158,7 +161,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 col("contract_address", "BYTEA / String", "Created contract address; NULL unless this tx deployed a contract"),
                 col("gas_used", "INT8", "Gas consumed by this tx"),
                 col("cumulative_gas_used", "INT8", "Cumulative gas in block up through this tx"),
-                col("effective_gas_price", "TEXT / String", "Actual gas price paid (wei, uint256 string)"),
+                col("effective_gas_price", "TEXT / String", "Actual gas price paid (wei, uint256 string). CH mirror: `effective_gas_price_u256`"),
+                col("effective_gas_price_u256", "(CH only) Nullable(UInt256)", "ClickHouse-only UInt256 mirror of effective_gas_price"),
                 col("status", "INT2", "1 = success, 0 = failure"),
             ],
             examples: vec![
@@ -293,7 +297,7 @@ pub fn tips() -> Vec<&'static str> {
         "Filter logs by event signature without manually hashing topic0: append `?signature=Transfer(address,address,uint256)` and SELECT FROM the event name as if it were a table — e.g., SELECT * FROM Transfer WHERE topic1 = decode('...','hex')",
         "Pagination: ORDER BY a stable key (block_num DESC, idx) and use LIMIT/OFFSET. Postgres caps each page at 10000 rows; ClickHouse caps at 50000 (use ?engine=clickhouse).",
         "Force the engine with ?engine=postgres or ?engine=clickhouse. Default routing picks one based on the query shape; CH is faster for analytical scans, PG for point lookups.",
-        "uint256 columns (value, max_fee_per_gas, effective_gas_price) are stored as strings because they exceed 64 bits. In ClickHouse, cast with toUInt256OrZero() or compare as strings; in Postgres, cast with ::numeric.",
+        "uint256 columns (value, max_fee_per_gas, effective_gas_price) are stored as strings for portability. ClickHouse also has UInt256 mirror columns (`value_u256`, `max_fee_per_gas_u256`, `max_priority_fee_per_gas_u256`, `effective_gas_price_u256`) so you can write `WHERE value_u256 > 1000000000000000000` directly without `toUInt256OrZero()`. Postgres: cast the string columns with `::numeric` for arithmetic.",
         "BYTEA columns: filter via decode('hex_no_prefix','hex'); display via encode(col,'hex'). In ClickHouse the same columns are hex-prefixed strings (e.g., '0xabc...') so LIKE '0xprefix%' works directly.",
         "internal_txs / call traces are not currently indexed (txs.calls is always NULL). Top-level value transfers are visible as txs.value > 0; internal transfers via contract calls are not.",
     ]
@@ -487,5 +491,48 @@ mod tests {
                 table.name
             );
         }
+    }
+
+    /// Phase 3: ClickHouse-side numeric mirrors of the uint256 string columns.
+    /// These are the natural way to query without `toUInt256OrZero()` casts.
+    #[test]
+    fn clickhouse_uint256_columns_advertised_on_txs() {
+        let tx_table = tables_metadata()
+            .into_iter()
+            .find(|t| t.name == "txs")
+            .expect("txs table missing");
+        let names: Vec<&str> = tx_table.columns.iter().map(|c| c.name).collect();
+        for col in &[
+            "value_u256",
+            "max_fee_per_gas_u256",
+            "max_priority_fee_per_gas_u256",
+        ] {
+            assert!(
+                names.contains(col),
+                "txs.{col} (UInt256 mirror) missing from /tables; have {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_uint256_column_advertised_on_receipts() {
+        let r = tables_metadata()
+            .into_iter()
+            .find(|t| t.name == "receipts")
+            .expect("receipts table missing");
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name).collect();
+        assert!(
+            names.contains(&"effective_gas_price_u256"),
+            "receipts.effective_gas_price_u256 (UInt256 mirror) missing from /tables; have {names:?}"
+        );
+    }
+
+    #[test]
+    fn tips_explain_the_uint256_mirror_columns() {
+        let body = tips().join("\n");
+        assert!(
+            body.contains("_u256") || body.contains("UInt256 mirror"),
+            "tips should mention the *_u256 columns so users know they can skip toUInt256OrZero(); got: {body}"
+        );
     }
 }
