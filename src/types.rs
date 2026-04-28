@@ -91,6 +91,42 @@ pub struct ReceiptRow {
     pub fee_payer: Option<Vec<u8>>,
 }
 
+/// One nested call inside a transaction (depth ≥ 1; the top-level call IS the
+/// tx and is already in `txs`/`receipts`). Captured from
+/// `debug_traceTransaction` with the geth-style `callTracer`.
+#[derive(Debug, Clone, Default)]
+pub struct InternalTxRow {
+    pub block_num: i64,
+    pub block_timestamp: DateTime<Utc>,
+    pub tx_idx: i32,
+    pub tx_hash: Vec<u8>,
+    /// 1 = direct nested call inside the tx; 2 = nested-in-nested; etc.
+    pub depth: i32,
+    /// Sequential index within the tx (DFS pre-order). With `(tx_hash,
+    /// path_idx)` you can reconstruct the call tree's traversal order.
+    pub path_idx: i32,
+    /// `CALL`, `DELEGATECALL`, `STATICCALL`, `CALLCODE`, `CREATE`, `CREATE2`,
+    /// `SELFDESTRUCT`. Stored as TEXT for exact preservation.
+    pub call_type: String,
+    pub from: Vec<u8>,
+    /// `None` only for some `CREATE` frames that fail before address derivation.
+    pub to: Option<Vec<u8>>,
+    /// uint256 wei amount as a decimal string (matches `txs.value` format).
+    pub value: String,
+    /// Calldata of this internal call.
+    pub input: Vec<u8>,
+    /// First 4 bytes of `input` (denormalized like `txs.selector`); `None`
+    /// when input is shorter than 4 bytes.
+    pub input_selector: Option<Vec<u8>>,
+    /// Return data of this internal call. Empty for failed calls.
+    pub output: Vec<u8>,
+    /// Gas consumed by this frame (gas given − gas left). `0` if unknown.
+    pub gas_used: i64,
+    /// EVM-level error string when the call failed (e.g. `"execution
+    /// reverted"`); `None` on success.
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct L2WithdrawalRow {
     pub block_num: i64,

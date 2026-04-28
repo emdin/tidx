@@ -194,6 +194,43 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
         },
         TableInfo {
+            name: "internal_txs",
+            description: "Nested calls inside L2 transactions (depth ≥ 1). Captured from `debug_traceTransaction` with the geth-style callTracer. The top-level call (depth 0) is the tx itself and lives in `txs`/`receipts`. One row per nested frame; use `(tx_hash, path_idx)` to reconstruct DFS pre-order traversal of the call tree.",
+            engines: pg_ch(),
+            columns: vec![
+                col("block_num", "INT8", "Block number containing the parent tx"),
+                col("block_timestamp", "TIMESTAMPTZ / DateTime64", "Block timestamp"),
+                col("tx_idx", "INT4", "Index of the parent tx within the block"),
+                col("tx_hash", "BYTEA / String", "Hash of the parent tx (32 bytes)"),
+                col("depth", "INT4", "1 = direct nested call inside the tx; 2 = nested-in-nested; etc."),
+                col("path_idx", "INT4", "Sequential index within the tx (DFS pre-order). Uniquely identifies a frame when combined with tx_hash"),
+                col("call_type", "TEXT / String", "`CALL`, `DELEGATECALL`, `STATICCALL`, `CALLCODE`, `CREATE`, `CREATE2`, `SELFDESTRUCT`"),
+                col("from", "BYTEA / String", "Caller of this internal frame (quote in PG: \"from\")"),
+                col("to", "BYTEA / String", "Callee; NULL only for some failed CREATE frames"),
+                col("value", "TEXT / String", "uint256 wei amount as decimal string. CH mirror: `value_u256`"),
+                col("value_u256", "(CH only) UInt256", "ClickHouse-only UInt256 mirror of value"),
+                col("input", "BYTEA / String", "Calldata of this internal call"),
+                col("input_selector", "BYTEA / String", "First 4 bytes of `input` (denormalized like txs.selector). Indexed. NULL when input < 4 bytes"),
+                col("output", "BYTEA / String", "Return data of this internal call. Empty for failed calls"),
+                col("gas_used", "INT8", "Gas consumed by this frame (gas given − gas left). 0 if unknown"),
+                col("error", "TEXT", "EVM-level error string when the call failed (e.g. `\"execution reverted\"`); NULL on success"),
+            ],
+            examples: vec![
+                QueryExample {
+                    description: "All ERC-20 transfer() calls made *internally* by contracts (selector 0xa9059cbb)",
+                    sql: "SELECT block_num, encode(tx_hash,'hex'), encode(\"from\",'hex'), encode(\"to\",'hex') FROM internal_txs WHERE input_selector = decode('a9059cbb','hex') ORDER BY block_num DESC LIMIT 100",
+                },
+                QueryExample {
+                    description: "Failed internal calls in the last 1000 blocks",
+                    sql: "SELECT block_num, encode(tx_hash,'hex'), depth, call_type, error FROM internal_txs WHERE error IS NOT NULL AND block_num > (SELECT max(num) FROM blocks) - 1000 ORDER BY block_num DESC LIMIT 100",
+                },
+                QueryExample {
+                    description: "Reconstruct a tx's call tree in traversal order",
+                    sql: "SELECT path_idx, depth, call_type, encode(\"from\",'hex'), encode(\"to\",'hex'), value FROM internal_txs WHERE tx_hash = decode('<tx-hash-hex>','hex') ORDER BY path_idx",
+                },
+            ],
+        },
+        TableInfo {
             name: "kaspa_l2_submissions",
             description: "Confirmed Kaspa L1 transactions that submitted L2 batches to Igra. Promoted from kaspa_pending_l2_submissions after the configured finality delay (12h on mainnet).",
             engines: pg_ch(),
@@ -299,7 +336,7 @@ pub fn tips() -> Vec<&'static str> {
         "Force the engine with ?engine=postgres or ?engine=clickhouse. Default routing picks one based on the query shape; CH is faster for analytical scans, PG for point lookups.",
         "uint256 columns (value, max_fee_per_gas, effective_gas_price) are stored as strings for portability. ClickHouse also has UInt256 mirror columns (`value_u256`, `max_fee_per_gas_u256`, `max_priority_fee_per_gas_u256`, `effective_gas_price_u256`) so you can write `WHERE value_u256 > 1000000000000000000` directly without `toUInt256OrZero()`. Postgres: cast the string columns with `::numeric` for arithmetic.",
         "BYTEA columns: filter via decode('hex_no_prefix','hex'); display via encode(col,'hex'). In ClickHouse the same columns are hex-prefixed strings (e.g., '0xabc...') so LIKE '0xprefix%' works directly.",
-        "internal_txs / call traces are not currently indexed (txs.calls is always NULL). Top-level value transfers are visible as txs.value > 0; internal transfers via contract calls are not.",
+        "Internal calls (CALL, DELEGATECALL, CREATE, etc.) made by contracts inside a tx are indexed in `internal_txs` — captured from debug_traceTransaction's callTracer. Use it to find ERC-20 transfers performed by routers, internal value moves, or to reconstruct a tx's full call tree via (tx_hash, path_idx).",
     ]
 }
 
@@ -336,6 +373,7 @@ mod tests {
             "logs",
             "receipts",
             "l2_withdrawals",
+            "internal_txs",
             "kaspa_provenance_meta",
             "kaspa_sync_state",
             "kaspa_provenance_gaps",
@@ -363,6 +401,7 @@ mod tests {
             "logs",
             "receipts",
             "l2_withdrawals",
+            "internal_txs",
             "kaspa_provenance_meta",
             "kaspa_sync_state",
             "kaspa_provenance_gaps",
@@ -524,6 +563,60 @@ mod tests {
         assert!(
             names.contains(&"effective_gas_price_u256"),
             "receipts.effective_gas_price_u256 (UInt256 mirror) missing from /tables; have {names:?}"
+        );
+    }
+
+    /// Phase 4: internal_txs (callTracer-derived nested calls). The metadata
+    /// must surface the table and its key columns or `/query` consumers won't
+    /// find it. Also assert the tip about internal-call traces is updated to
+    /// reflect that the table now exists.
+    #[test]
+    fn internal_txs_table_advertised_with_key_columns() {
+        let t = tables_metadata()
+            .into_iter()
+            .find(|t| t.name == "internal_txs")
+            .expect("internal_txs missing from /tables");
+
+        let names: Vec<&str> = t.columns.iter().map(|c| c.name).collect();
+        for col in &[
+            "block_num",
+            "tx_hash",
+            "depth",
+            "path_idx",
+            "call_type",
+            "from",
+            "to",
+            "value",
+            "input",
+            "input_selector",
+            "output",
+            "gas_used",
+            "error",
+        ] {
+            assert!(
+                names.contains(col),
+                "internal_txs.{col} missing from /tables; have {names:?}"
+            );
+        }
+
+        // Both engines mirror the table.
+        assert!(t.engines.contains(&"postgres"));
+        assert!(t.engines.contains(&"clickhouse"));
+    }
+
+    #[test]
+    fn tip_about_internal_calls_reflects_the_new_table() {
+        let body = tips().join("\n");
+        // The pre-phase-4 tip claimed internal calls were not indexed; that
+        // line must be updated to point at internal_txs.
+        assert!(
+            body.contains("internal_txs"),
+            "tips should advertise the internal_txs table; got: {body}"
+        );
+        let lower = body.to_lowercase();
+        assert!(
+            !lower.contains("not currently indexed") && !lower.contains("always null"),
+            "tips still claim internal calls aren't indexed; update the tip after phase 4 ships internal_txs. body: {body}"
         );
     }
 
