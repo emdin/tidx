@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         Commands::BackfillReceiptData(args) => cli::backfill_receipt_data::run(args).await,
         Commands::BackfillWithdrawals(args) => cli::backfill_withdrawals::run(args).await,
         Commands::BackfillDenorm(args) => cli::backfill_denorm::run(args).await,
+        Commands::BackfillTraces(args) => cli::backfill_traces::run(args).await,
         Commands::ImportBlockscout(args) => cli::import_blockscout::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
     }
