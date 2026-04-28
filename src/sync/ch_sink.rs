@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::metrics;
-use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
+use crate::types::{BlockRow, InternalTxRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
 /// Schema SQL files embedded at compile time.
 const BLOCKS_SCHEMA: &str = include_str!("../../db/clickhouse/blocks.sql");
@@ -18,6 +18,7 @@ const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
 const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 const L2_WITHDRAWALS_SCHEMA: &str = include_str!("../../db/clickhouse/l2_withdrawals.sql");
+const INTERNAL_TXS_SCHEMA: &str = include_str!("../../db/clickhouse/internal_txs.sql");
 
 /// Idempotent post-create ALTERs for `txs`. Each statement is `ADD COLUMN IF
 /// NOT EXISTS` (or `ADD INDEX IF NOT EXISTS`), followed by `MATERIALIZE COLUMN`
@@ -57,6 +58,13 @@ const RECEIPTS_COLUMN_ALTERS: &[&str] = &[
     "ALTER TABLE receipts ADD COLUMN IF NOT EXISTS effective_gas_price_u256 Nullable(UInt256) DEFAULT toUInt256OrZero(effective_gas_price) AFTER effective_gas_price",
     "ALTER TABLE receipts MATERIALIZE COLUMN effective_gas_price_u256",
 ];
+
+/// Idempotent post-create ALTERs for `internal_txs`. Currently empty because
+/// the table is created with `value_u256` already in the CREATE TABLE
+/// statement, so no parts will pre-date the column. Kept as a hook for future
+/// changes — when adding a column with a DEFAULT expression here, also add a
+/// MATERIALIZE COLUMN entry to avoid lazy recomputation on reads.
+const INTERNAL_TXS_COLUMN_ALTERS: &[&str] = &[];
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 10_000;
@@ -130,6 +138,7 @@ impl ClickHouseSink {
             ("logs", LOGS_SCHEMA),
             ("receipts", RECEIPTS_SCHEMA),
             ("l2_withdrawals", L2_WITHDRAWALS_SCHEMA),
+            ("internal_txs", INTERNAL_TXS_SCHEMA),
         ] {
             self.client
                 .query(ddl)
@@ -143,6 +152,7 @@ impl ClickHouseSink {
         self.ensure_txs_columns().await?;
         self.ensure_logs_columns().await?;
         self.ensure_receipts_columns().await?;
+        self.ensure_internal_txs_columns().await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
@@ -177,6 +187,17 @@ impl ClickHouseSink {
                 .execute()
                 .await
                 .map_err(|e| anyhow!("Failed to alter ClickHouse receipts table: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_internal_txs_columns(&self) -> Result<()> {
+        for ddl in INTERNAL_TXS_COLUMN_ALTERS {
+            self.client
+                .query(ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to alter ClickHouse internal_txs table: {e}"))?;
         }
         Ok(())
     }
@@ -271,6 +292,26 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    pub async fn write_internal_txs(&self, internal_txs: &[InternalTxRow]) -> Result<()> {
+        if internal_txs.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        self.insert_chunked("internal_txs", internal_txs, ChInternalTxWire::from_row)
+            .await?;
+        metrics::record_sink_write_duration(self.name(), "internal_txs", start.elapsed());
+        metrics::record_sink_write_rows(self.name(), "internal_txs", internal_txs.len() as u64);
+        metrics::increment_sink_row_count(
+            self.name(),
+            "internal_txs",
+            internal_txs.len() as u64,
+        );
+        if let Some(max) = internal_txs.iter().map(|r| r.block_num).max() {
+            metrics::update_sink_watermark(self.name(), "internal_txs", max);
+        }
+        Ok(())
+    }
+
     pub async fn write_l2_withdrawals(&self, withdrawals: &[L2WithdrawalRow]) -> Result<()> {
         if withdrawals.is_empty() {
             return Ok(());
@@ -347,7 +388,14 @@ impl ClickHouseSink {
 
     /// Delete all data from a given block number onwards (reorg support).
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
-        let tables = ["logs", "receipts", "txs", "l2_withdrawals", "blocks"];
+        let tables = [
+            "logs",
+            "receipts",
+            "txs",
+            "l2_withdrawals",
+            "internal_txs",
+            "blocks",
+        ];
         let block_col = |t: &str| if t == "blocks" { "num" } else { "block_num" };
 
         for table in &tables {
@@ -648,13 +696,69 @@ impl ChL2WithdrawalWire {
     }
 }
 
+#[derive(Row, Serialize)]
+struct ChInternalTxWire {
+    block_num: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
+    tx_idx: i32,
+    tx_hash: String,
+    depth: i32,
+    path_idx: i32,
+    call_type: String,
+    from: String,
+    to: Option<String>,
+    value: String,
+    input: String,
+    /// Empty string when input is shorter than 4 bytes — matches the CH column
+    /// `String DEFAULT ''` so the bloom_filter index covers the empty case
+    /// (mirrors the txs.selector pattern from phase 2).
+    input_selector: String,
+    output: String,
+    gas_used: i64,
+    error: Option<String>,
+}
+
+impl ChInternalTxWire {
+    fn from_row(r: &InternalTxRow) -> Self {
+        Self {
+            block_num: r.block_num,
+            block_timestamp: r.block_timestamp,
+            tx_idx: r.tx_idx,
+            tx_hash: hex_encode(&r.tx_hash),
+            depth: r.depth,
+            path_idx: r.path_idx,
+            call_type: r.call_type.clone(),
+            from: hex_encode(&r.from),
+            to: r.to.as_ref().map(|v| hex_encode(v)),
+            value: r.value.clone(),
+            input: hex_encode(&r.input),
+            input_selector: r
+                .input_selector
+                .as_ref()
+                .map(|v| hex_encode(v))
+                .unwrap_or_default(),
+            output: hex_encode(&r.output),
+            gas_used: r.gas_used,
+            error: r.error.clone(),
+        }
+    }
+}
+
 /// Hex-encode bytes with 0x prefix.
 fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
 /// Known table names that are safe to interpolate into SQL.
-const KNOWN_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts", "l2_withdrawals"];
+const KNOWN_TABLES: &[&str] = &[
+    "blocks",
+    "txs",
+    "logs",
+    "receipts",
+    "l2_withdrawals",
+    "internal_txs",
+];
 
 /// Validate that a table name is one of the known tables.
 /// Returns the validated name or an error for unknown tables.
@@ -836,6 +940,75 @@ mod tests {
                 "txs.{col}: MATERIALIZE COLUMN at position {mat_pos} comes before ADD COLUMN at {add_pos}"
             );
         }
+    }
+
+    /// Phase 4: ChInternalTxWire mirrors InternalTxRow. Verify hex encoding,
+    /// optional fields, and the empty-output case (failed calls have empty
+    /// return data).
+    #[test]
+    fn internal_tx_wire_round_trip_hex_encoding() {
+        use chrono::TimeZone;
+        let dt = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap();
+        let row = crate::types::InternalTxRow {
+            block_num: 100,
+            block_timestamp: dt,
+            tx_idx: 3,
+            tx_hash: vec![0xaa; 32],
+            depth: 2,
+            path_idx: 5,
+            call_type: "DELEGATECALL".to_string(),
+            from: vec![0xbb; 20],
+            to: Some(vec![0xcc; 20]),
+            value: "1000000000000000000".to_string(),
+            input: vec![0xa9, 0x05, 0x9c, 0xbb, 0xde, 0xad],
+            input_selector: Some(vec![0xa9, 0x05, 0x9c, 0xbb]),
+            output: vec![],
+            gas_used: 21000,
+            error: None,
+        };
+        let wire = ChInternalTxWire::from_row(&row);
+        assert_eq!(wire.block_num, 100);
+        assert_eq!(wire.tx_hash, format!("0x{}", "aa".repeat(32)));
+        assert_eq!(wire.from, format!("0x{}", "bb".repeat(20)));
+        assert_eq!(wire.to.as_deref(), Some(format!("0x{}", "cc".repeat(20))).as_deref());
+        assert_eq!(wire.depth, 2);
+        assert_eq!(wire.path_idx, 5);
+        assert_eq!(wire.call_type, "DELEGATECALL");
+        assert_eq!(wire.value, "1000000000000000000");
+        assert_eq!(wire.input, "0xa9059cbbdead");
+        assert_eq!(wire.input_selector, "0xa9059cbb");
+        assert_eq!(wire.output, "0x");
+        assert_eq!(wire.gas_used, 21000);
+        assert!(wire.error.is_none());
+    }
+
+    /// Failed CREATE frames have None for `to`. Wire format must preserve.
+    #[test]
+    fn internal_tx_wire_handles_none_to_and_error() {
+        use chrono::Utc;
+        let row = crate::types::InternalTxRow {
+            block_num: 1,
+            block_timestamp: Utc::now(),
+            tx_idx: 0,
+            tx_hash: vec![0; 32],
+            depth: 1,
+            path_idx: 0,
+            call_type: "CREATE".to_string(),
+            from: vec![0; 20],
+            to: None,
+            value: "0".to_string(),
+            input: vec![],
+            input_selector: None,
+            output: vec![],
+            gas_used: 0,
+            error: Some("execution reverted".to_string()),
+        };
+        let wire = ChInternalTxWire::from_row(&row);
+        assert!(wire.to.is_none());
+        // input_selector = empty string means "no selector" — matches the CH
+        // schema's `String DEFAULT ''` so the bloom_filter index covers it.
+        assert_eq!(wire.input_selector, "");
+        assert_eq!(wire.error.as_deref(), Some("execution reverted"));
     }
 
     /// `logs."from"` is populated by the writer (no DEFAULT expression), so

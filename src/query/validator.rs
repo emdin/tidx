@@ -14,6 +14,7 @@ const ALLOWED_TABLES: &[&str] = &[
     "logs",
     "receipts",
     "l2_withdrawals",
+    "internal_txs",
     "kaspa_provenance_meta",
     "kaspa_sync_state",
     "kaspa_provenance_gaps",
@@ -783,6 +784,18 @@ mod tests {
     #[test]
     fn test_rejects_sync_state() {
         assert!(validate_query("SELECT * FROM sync_state").is_err());
+    }
+
+    #[test]
+    fn test_allows_internal_txs() {
+        // Phase 4: callTracer-derived nested calls.
+        assert!(validate_query("SELECT * FROM internal_txs").is_ok());
+        assert!(
+            validate_query(
+                "SELECT depth, call_type, \"from\", \"to\" FROM internal_txs WHERE tx_hash = decode('aa', 'hex')"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

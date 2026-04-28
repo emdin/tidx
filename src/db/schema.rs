@@ -63,6 +63,8 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         .await?;
     conn.batch_execute(include_str!("../../db/l2_withdrawals.sql"))
         .await?;
+    conn.batch_execute(include_str!("../../db/internal_txs.sql"))
+        .await?;
     conn.batch_execute(include_str!("../../db/sync_state.sql"))
         .await?;
     conn.batch_execute(include_str!("../../db/explorer.sql"))

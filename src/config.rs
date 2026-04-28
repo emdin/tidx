@@ -154,6 +154,12 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
+    /// Phase 4: index internal calls (debug_traceTransaction → internal_txs).
+    /// Off by default — tracing roughly doubles RPC call volume on the
+    /// realtime path. Use the `backfill-traces` CLI to backfill history.
+    #[serde(default)]
+    pub enable_tracing: bool,
+
     /// Separate PostgreSQL URL for the HTTP API (e.g., a CNPG `-r` read replica).
     /// When set, the API connection pool connects to this URL instead of `pg_url`.
     /// If `api_pg_password_env` is also set, the password is injected into this URL.
@@ -536,6 +542,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            enable_tracing: false,
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
@@ -565,6 +572,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            enable_tracing: false,
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
@@ -593,6 +601,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            enable_tracing: false,
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,

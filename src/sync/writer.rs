@@ -6,7 +6,7 @@ use tokio_postgres::types::Type;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::types::{BlockRow, L2WithdrawalRow, LogRow, ReceiptRow, SyncState, TxRow};
+use crate::types::{BlockRow, InternalTxRow, L2WithdrawalRow, LogRow, ReceiptRow, SyncState, TxRow};
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
@@ -475,6 +475,98 @@ pub async fn write_l2_withdrawals(pool: &Pool, withdrawals: &[L2WithdrawalRow]) 
     metrics::increment_sink_row_count("postgres", "l2_withdrawals", withdrawals.len() as u64);
     if let Some(max) = withdrawals.iter().map(|w| w.block_num).max() {
         metrics::update_sink_watermark("postgres", "l2_withdrawals", max);
+    }
+
+    Ok(())
+}
+
+/// Batch insert internal_txs (callTracer-derived nested calls) using staging
+/// table + ON CONFLICT DO NOTHING. Mirror of write_logs/write_receipts.
+pub async fn write_internal_txs(pool: &Pool, internal_txs: &[InternalTxRow]) -> Result<()> {
+    if internal_txs.is_empty() {
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.execute(
+        "CREATE TEMP TABLE _staging_internal_txs (
+            block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
+            depth INT4, path_idx INT4, call_type TEXT, \"from\" BYTEA, \"to\" BYTEA,
+            value TEXT, input BYTEA, input_selector BYTEA, output BYTEA,
+            gas_used INT8, error TEXT
+        ) ON COMMIT DROP",
+        &[],
+    )
+    .await?;
+
+    let types = &[
+        Type::INT8,        // block_num
+        Type::TIMESTAMPTZ, // block_timestamp
+        Type::INT4,        // tx_idx
+        Type::BYTEA,       // tx_hash
+        Type::INT4,        // depth
+        Type::INT4,        // path_idx
+        Type::TEXT,        // call_type
+        Type::BYTEA,       // from
+        Type::BYTEA,       // to
+        Type::TEXT,        // value
+        Type::BYTEA,       // input
+        Type::BYTEA,       // input_selector
+        Type::BYTEA,       // output
+        Type::INT8,        // gas_used
+        Type::TEXT,        // error
+    ];
+
+    let sink = tx
+        .copy_in(
+            r#"COPY _staging_internal_txs (block_num, block_timestamp, tx_idx, tx_hash, depth,
+                path_idx, call_type, "from", "to", value, input, input_selector, output,
+                gas_used, error) FROM STDIN BINARY"#,
+        )
+        .await?;
+
+    let writer = BinaryCopyInWriter::new(sink, types);
+    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+    for row in internal_txs {
+        pinned_writer
+            .as_mut()
+            .write(&[
+                &row.block_num,
+                &row.block_timestamp,
+                &row.tx_idx,
+                &row.tx_hash,
+                &row.depth,
+                &row.path_idx,
+                &row.call_type,
+                &row.from,
+                &row.to,
+                &row.value,
+                &row.input,
+                &row.input_selector,
+                &row.output,
+                &row.gas_used,
+                &row.error,
+            ])
+            .await?;
+    }
+
+    pinned_writer.as_mut().finish().await?;
+
+    tx.execute(
+        "INSERT INTO internal_txs SELECT * FROM _staging_internal_txs ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
+    tx.commit().await?;
+
+    metrics::record_sink_write_duration("postgres", "internal_txs", start.elapsed());
+    metrics::record_sink_write_rows("postgres", "internal_txs", internal_txs.len() as u64);
+    metrics::increment_sink_row_count("postgres", "internal_txs", internal_txs.len() as u64);
+    if let Some(max) = internal_txs.iter().map(|r| r.block_num).max() {
+        metrics::update_sink_watermark("postgres", "internal_txs", max);
     }
 
     Ok(())
@@ -1200,6 +1292,11 @@ pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
         .await?;
     conn.execute(
         "DELETE FROM l2_withdrawals WHERE block_num >= $1",
+        &[&from_block_i64],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM internal_txs WHERE block_num >= $1",
         &[&from_block_i64],
     )
     .await?;
