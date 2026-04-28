@@ -215,7 +215,9 @@ pub async fn execute_query_postgres(
             metrics::record_query_duration(start.elapsed());
             rows
         }
-        Ok(Err(e)) => return Err(anyhow!("Query error: {}", sanitize_db_error(&e.to_string()))),
+        Ok(Err(e)) => {
+            return Err(anyhow!("Query error: {}", sanitize_db_error(&format_pg_error(&e))));
+        }
         Err(_) => return Err(anyhow!("Query timeout")),
     };
 
@@ -337,6 +339,22 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Extract a meaningful error string from a `tokio_postgres::Error`.
+///
+/// `tokio_postgres::Error`'s `Display` impl is sparse — for SQLSTATE failures
+/// (operator-does-not-exist, syntax errors, etc.) it just renders `"db error"`,
+/// hiding the actual message that PG returned. The real diagnostic lives in
+/// `as_db_error()`, which we surface here. Everything still flows through
+/// `sanitize_db_error` to strip filesystem paths/IPs/connection strings before
+/// leaving the process.
+fn format_pg_error(err: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = err.as_db_error() {
+        format!("{}: {}", db_err.severity(), db_err.message())
+    } else {
+        err.to_string()
     }
 }
 
@@ -511,6 +529,41 @@ mod tests {
         let sanitized = sanitize_db_error(&error);
         assert!(sanitized.len() < 510); // 500 + "..."
         assert!(sanitized.ends_with("..."));
+    }
+
+    /// SQLSTATE-style error messages (severity + diagnostic) MUST survive
+    /// sanitization. Without this guarantee, `/query` falls back to
+    /// `tokio_postgres::Error`'s `Display`, which renders an opaque "db error"
+    /// — exactly the bug an operator hit when filing a bad cast query.
+    /// Regression test for that bug: the diagnostic substring callers need
+    /// to debug the query (operator name, type names) must not be stripped.
+    #[test]
+    fn test_sanitize_preserves_pg_diagnostic_messages() {
+        let error = "ERROR: operator does not exist: bigint * text";
+        let sanitized = sanitize_db_error(error);
+        assert!(
+            sanitized.contains("operator does not exist"),
+            "diagnostic substring stripped from: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("bigint") && sanitized.contains("text"),
+            "type names stripped from: {sanitized}"
+        );
+
+        // Same property for syntax errors and missing-column errors —
+        // the column/keyword the operator typed must reach them.
+        let cases = [
+            "ERROR: syntax error at or near \"FORM\"",
+            "ERROR: column \"foo\" does not exist",
+            "ERROR: invalid input syntax for type integer: \"abc\"",
+        ];
+        for raw in cases {
+            let sanitized = sanitize_db_error(raw);
+            assert!(
+                sanitized.contains("ERROR:"),
+                "severity prefix stripped from: {sanitized}"
+            );
+        }
     }
 
 }
