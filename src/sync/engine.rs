@@ -141,6 +141,10 @@ pub struct SyncEngine {
     head_delay: AdaptiveHeadDelay,
     /// Skip parent hash validation (trust RPC for reorg handling)
     trust_rpc: bool,
+    /// Phase 4: when true, fetch debug_traceTransaction per tx after each
+    /// block range is persisted, flatten the call tree, and write to
+    /// internal_txs. Off by default — tracing roughly doubles RPC volume.
+    enable_tracing: bool,
 }
 
 impl SyncEngine {
@@ -170,6 +174,7 @@ impl SyncEngine {
             backfill_first: false,
             head_delay: AdaptiveHeadDelay::new(30, 100, Duration::from_secs(600)),
             trust_rpc: false,
+            enable_tracing: false,
         })
     }
 
@@ -204,6 +209,11 @@ impl SyncEngine {
 
     pub fn with_trust_rpc(mut self, trust_rpc: bool) -> Self {
         self.trust_rpc = trust_rpc;
+        self
+    }
+
+    pub fn with_tracing(mut self, enable: bool) -> Self {
+        self.enable_tracing = enable;
         self
     }
 
@@ -494,6 +504,8 @@ impl SyncEngine {
             };
 
             let sinks = self.sinks.clone();
+            let realtime_rpc = self.realtime_rpc.clone();
+            let enable_tracing = self.enable_tracing;
             let write_future = async move {
                 let write_start = std::time::Instant::now();
                 sinks
@@ -505,6 +517,11 @@ impl SyncEngine {
                         &all_withdrawals,
                     )
                     .await?;
+                if enable_tracing {
+                    let traces =
+                        super::trace::fetch_and_flatten_traces(&realtime_rpc, &all_txs).await?;
+                    sinks.write_internal_txs(&traces).await?;
+                }
                 let write_ms = write_start.elapsed().as_millis();
                 Ok::<_, anyhow::Error>(write_ms)
             };
@@ -776,6 +793,12 @@ impl SyncEngine {
             )
             .await?;
 
+        if self.enable_tracing {
+            let traces =
+                super::trace::fetch_and_flatten_traces(&self.realtime_rpc, &all_txs).await?;
+            self.sinks.write_internal_txs(&traces).await?;
+        }
+
         Ok(())
     }
 
@@ -821,6 +844,12 @@ impl SyncEngine {
                 &withdrawal_rows,
             )
             .await?;
+
+        if self.enable_tracing {
+            let traces =
+                super::trace::fetch_and_flatten_traces(&self.realtime_rpc, &txs).await?;
+            self.sinks.write_internal_txs(&traces).await?;
+        }
 
         // Update sync state
         let state = load_sync_state(self.pool(), self.chain_id)

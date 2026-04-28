@@ -144,6 +144,43 @@ impl RpcClient {
             .ok_or_else(|| anyhow!("No result for eth_getCode"))
     }
 
+    /// Run `debug_traceTransaction` with the geth-style `callTracer` and return
+    /// the parsed top-level CallFrame. Use `flatten_call_frame` to convert to
+    /// a flat list of `InternalTxRow`s.
+    ///
+    /// `tx_hash` should be a 0x-prefixed hex string (32 bytes). Pass the empty
+    /// `tracerConfig` with `onlyTopCall: false` so nested frames are included
+    /// (we drop the top-level frame ourselves; it's already in `txs`).
+    pub async fn trace_transaction(
+        &self,
+        tx_hash: &str,
+    ) -> Result<crate::sync::trace::CallFrame> {
+        let resp: RpcResponse<crate::sync::trace::CallFrame> = self
+            .call(
+                "debug_traceTransaction",
+                serde_json::json!([
+                    tx_hash,
+                    {
+                        "tracer": "callTracer",
+                        "tracerConfig": {
+                            "onlyTopCall": false,
+                            "withLog": false,
+                        }
+                    }
+                ]),
+            )
+            .await?;
+        if let Some(err) = resp.error {
+            return Err(anyhow!(
+                "debug_traceTransaction({tx_hash}) failed: code={} {}",
+                err.code,
+                err.message
+            ));
+        }
+        resp.result
+            .ok_or_else(|| anyhow!("debug_traceTransaction({tx_hash}) returned no result"))
+    }
+
     pub async fn eth_call(&self, to: &str, data: &str) -> Result<String> {
         let resp: RpcResponse<String> = self
             .call(
@@ -667,6 +704,70 @@ mod tests {
                 .collect();
             Json(Value::Array(responses))
         }
+    }
+
+    /// Phase 4: trace_transaction calls debug_traceTransaction with a callTracer
+    /// config and returns the parsed top-level CallFrame. The mock asserts the
+    /// JSON-RPC params match the expected shape and returns a minimal frame.
+    #[tokio::test]
+    async fn trace_transaction_sends_correct_params_and_parses_response() {
+        use crate::sync::trace::CallFrame;
+
+        let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+        async fn handler(
+            State(captured): State<Arc<Mutex<Option<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            *captured.lock().await = Some(body.clone());
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "type": "CALL",
+                    "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "to":   "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "value": "0x0",
+                    "gas":   "0x5208",
+                    "gasUsed": "0x5208",
+                    "input":  "0x",
+                    "output": "0x",
+                    "calls": []
+                }
+            }))
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test RPC");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", addr.port()));
+        let frame: CallFrame = client
+            .trace_transaction("0xdeadbeef")
+            .await
+            .expect("trace should succeed");
+
+        // Top-level frame parsed
+        assert_eq!(frame.call_type, "CALL");
+        assert!(frame.calls.is_empty());
+
+        // Verify the request shape: method + params[0] = tx hash, params[1] = tracer config
+        let body = captured.lock().await.clone().expect("handler captured request");
+        assert_eq!(body["method"], "debug_traceTransaction");
+        assert_eq!(body["params"][0], "0xdeadbeef");
+        let cfg = &body["params"][1];
+        assert_eq!(cfg["tracer"], "callTracer");
+        // onlyTopCall=false so we get nested calls; default is false but be explicit.
+        assert_eq!(cfg["tracerConfig"]["onlyTopCall"], false);
+
+        server.abort();
     }
 
     #[tokio::test]

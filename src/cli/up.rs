@@ -307,6 +307,7 @@ fn spawn_sync_engine(
 
     let backfill_first = chain.backfill_first;
     let trust_rpc = chain.trust_rpc;
+    let enable_tracing = chain.enable_tracing;
 
     tokio::spawn(async move {
         // Build SinkSet with PG (always) + optional ClickHouse direct-write sink
@@ -435,7 +436,8 @@ fn spawn_sync_engine(
                             chain.max_head_delay_blocks,
                             chain.head_delay_window_secs,
                         )
-                        .with_trust_rpc(trust_rpc);
+                        .with_trust_rpc(trust_rpc)
+                        .with_tracing(enable_tracing);
                 }
                 Err(e) => {
                     warn!(error = %e, chain = %chain.name, "Failed to create sync engine, retrying in 10s");
