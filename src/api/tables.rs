@@ -337,6 +337,8 @@ pub fn tips() -> Vec<&'static str> {
         "uint256 columns (value, max_fee_per_gas, effective_gas_price) are stored as strings for portability. ClickHouse also has UInt256 mirror columns (`value_u256`, `max_fee_per_gas_u256`, `max_priority_fee_per_gas_u256`, `effective_gas_price_u256`) so you can write `WHERE value_u256 > 1000000000000000000` directly without `toUInt256OrZero()`. Postgres: cast the string columns with `::numeric` for arithmetic.",
         "BYTEA columns: filter via decode('hex_no_prefix','hex'); display via encode(col,'hex'). In ClickHouse the same columns are hex-prefixed strings (e.g., '0xabc...') so LIKE '0xprefix%' works directly.",
         "Internal calls (CALL, DELEGATECALL, CREATE, etc.) made by contracts inside a tx are indexed in `internal_txs` — captured from debug_traceTransaction's callTracer. Use it to find ERC-20 transfers performed by routers, internal value moves, or to reconstruct a tx's full call tree via (tx_hash, path_idx).",
+        "internal_txs only stores nested frames (depth ≥ 1). The top-level call IS the tx itself and lives in `txs`/`receipts`. A self-contained payable function (e.g. a bridge `lockForExit` that just credits storage and emits an event) produces ZERO internal_txs rows — that's expected. To track all native-iKAS flows into an address regardless of depth, union over `txs.value` and `internal_txs.value`: `SELECT block_num, value FROM txs WHERE \"to\"=decode('<addr>','hex') AND value::numeric > 0 UNION ALL SELECT block_num, value FROM internal_txs WHERE \"to\"=decode('<addr>','hex') AND value::numeric > 0`.",
+        "PG helpers in the /query allowlist: `format_address(bytea) → text` returns `'0x' || encode(...,'hex')` (use it on every address column to avoid the encode/decode dance), `format_uint(bytea) → text` decodes ABI uint payloads. For numeric arithmetic on uint256 string columns in PG, cast: `CAST(gas_used AS numeric) * CAST(effective_gas_price AS numeric)`. CH: prefer the `_u256` mirror columns and skip the cast entirely.",
     ]
 }
 
@@ -504,6 +506,40 @@ mod tests {
         assert!(
             body.contains("internal") || body.contains("call traces"),
             "tips should warn that internal calls are not indexed yet"
+        );
+    }
+
+    /// Operator-reported pain points after phase 4 went live: dev kept asking
+    /// (a) why bytea address columns require encode()/decode() in every PG
+    /// query and (b) why a bridge tx with `msg.value` produces 0 internal_txs
+    /// rows. Both have answers (`format_address()` exists; depth=0 is the tx
+    /// itself and lives in txs). Tips must surface them so the next operator
+    /// doesn't re-ask.
+    #[test]
+    fn tips_explain_format_address_and_pg_numeric_cast() {
+        let body = tips().join("\n");
+        assert!(
+            body.contains("format_address"),
+            "tips must surface format_address() — operators kept rediscovering encode/decode otherwise; got: {body}"
+        );
+        assert!(
+            body.contains("CAST") && body.contains("numeric"),
+            "tips must show the PG `CAST(... AS numeric)` idiom for uint256 string columns; got: {body}"
+        );
+    }
+
+    #[test]
+    fn tips_clarify_internal_txs_depth_zero_behavior() {
+        let body = tips().join("\n");
+        assert!(
+            body.contains("depth") && body.contains("nested"),
+            "tips must spell out that internal_txs only stores nested frames (not depth=0); got: {body}"
+        );
+        // The union recipe is the canonical "all value transfers to X" query.
+        // Without it the dev would reach for it and not find it.
+        assert!(
+            body.contains("UNION ALL"),
+            "tips must include the txs ⊕ internal_txs union recipe for total value-flows; got: {body}"
         );
     }
 

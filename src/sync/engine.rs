@@ -1082,6 +1082,13 @@ async fn tick_gapfill_parallel(
             update_synced_num(pool, chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Gap sync: fully synced");
         }
+        // The gap-fill loop only ever wrote "lowest block touched in last round"
+        // to `backfill_num`, never `Some(0)`. Without this, /status keeps
+        // reporting a stale backfill_remaining (the lowest block it last
+        // happened to land on), which misleads operators into thinking the
+        // chain is years from done. Mark complete here when convergence is
+        // observed.
+        mark_backfill_complete(pool, &state).await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
     }
@@ -1324,10 +1331,11 @@ async fn tick_gapfill_parallel(
         "Gap sync: completed round"
     );
 
-    // Update backfill_num to track progress (lowest block we've reached)
-    if lowest_block < u64::MAX {
+    // Monotonic descent toward genesis — see next_backfill_num.
+    let new_backfill_num = next_backfill_num(state.backfill_num, lowest_block);
+    if new_backfill_num != state.backfill_num {
         let mut updated_state = state.clone();
-        updated_state.backfill_num = Some(lowest_block);
+        updated_state.backfill_num = new_backfill_num;
         save_sync_state(pool, &updated_state).await?;
     }
 
@@ -1354,6 +1362,8 @@ async fn tick_gapfill_parallel_no_throttle(
             update_synced_num(pool, chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Backfill: fully synced");
         }
+        // Same convergence-marking rationale as tick_gapfill_parallel.
+        mark_backfill_complete(pool, &state).await?;
         return Ok(());
     }
 
@@ -1509,10 +1519,11 @@ async fn tick_gapfill_parallel_no_throttle(
         "Backfill: completed round"
     );
 
-    // Update backfill_num to track progress
-    if lowest_block < u64::MAX {
+    // Monotonic descent toward genesis — see next_backfill_num.
+    let new_backfill_num = next_backfill_num(state.backfill_num, lowest_block);
+    if new_backfill_num != state.backfill_num {
         let mut updated_state = state.clone();
-        updated_state.backfill_num = Some(lowest_block);
+        updated_state.backfill_num = new_backfill_num;
         save_sync_state(pool, &updated_state).await?;
     }
 
@@ -1524,6 +1535,51 @@ async fn tick_gapfill_parallel_no_throttle(
 async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
     let gaps = detect_all_gaps(pool, tip_num).await?;
     Ok(gaps.is_empty())
+}
+
+/// Mark backfill as complete in `sync_state`. The gap-fill loop only ever wrote
+/// "lowest block touched in last round" to `backfill_num`, so this needs to
+/// fire when we observe convergence — otherwise `/status.backfill_remaining`
+/// stays stuck at whatever value the loop last happened to land on. No-op when
+/// already at `Some(0)` so this is cheap to call every convergence tick.
+async fn mark_backfill_complete(pool: &Pool, state: &SyncState) -> Result<()> {
+    if state.backfill_num == Some(0) {
+        return Ok(());
+    }
+    let mut updated = state.clone();
+    updated.backfill_num = Some(0);
+    save_sync_state(pool, &updated).await?;
+    info!(
+        chain_id = state.chain_id,
+        prev_backfill_num = ?state.backfill_num,
+        "Gap sync converged: backfill marked complete (backfill_num=0)"
+    );
+    Ok(())
+}
+
+/// Decide whether a gap-fill round's `lowest_block` should overwrite the
+/// stored `backfill_num`, and to what value. Pure function so the
+/// monotonicity invariant has unit-test coverage independent of a live DB.
+///
+/// Rules:
+///   - `Some(0)` is the terminal "complete" state and is never overwritten.
+///   - `lowest_block == u64::MAX` is the sentinel "no work this round" and
+///     leaves the value unchanged.
+///   - Otherwise, write only if `lowest_block` is strictly LOWER than the
+///     current value (monotonic descent toward genesis).
+fn next_backfill_num(prev: Option<u64>, lowest_block: u64) -> Option<u64> {
+    if prev == Some(0) {
+        return prev;
+    }
+    if lowest_block == u64::MAX {
+        return prev;
+    }
+    let current = prev.unwrap_or(u64::MAX);
+    if lowest_block < current {
+        Some(lowest_block)
+    } else {
+        prev
+    }
 }
 
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
@@ -1848,6 +1904,48 @@ fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backfill-num monotonicity: the gap-fill loop fires every couple of
+    /// seconds and reports the lowest block touched in that round. Naively
+    /// writing that value to `sync_state.backfill_num` after every round
+    /// caused `/status.backfill_remaining` to bounce around recent block
+    /// numbers — the bug an operator hit when filing a "8-year ETA" report
+    /// on a chain that was actually fully synced. The fix: only descend
+    /// (never raise), and `Some(0)` is terminal.
+    #[test]
+    fn next_backfill_num_only_descends_toward_genesis() {
+        // Initial state (None): any real block becomes the new low-water mark.
+        assert_eq!(next_backfill_num(None, 1_000), Some(1_000));
+
+        // Subsequent lower value: descend.
+        assert_eq!(next_backfill_num(Some(1_000), 500), Some(500));
+
+        // Subsequent higher value (the bug we're patching): stay put.
+        // Without this, normal recent-block catch-up (filling small gaps
+        // near the head) would constantly raise backfill_num.
+        assert_eq!(next_backfill_num(Some(500), 5_000_000), Some(500));
+
+        // Equal value: stay put (no needless DB write).
+        assert_eq!(next_backfill_num(Some(500), 500), Some(500));
+    }
+
+    #[test]
+    fn next_backfill_num_treats_zero_as_terminal() {
+        // Some(0) means "complete". A later round with any lowest_block
+        // (including a low or out-of-range value) MUST NOT raise it —
+        // mark_backfill_complete is the only path that should reset state.
+        assert_eq!(next_backfill_num(Some(0), 500), Some(0));
+        assert_eq!(next_backfill_num(Some(0), 0), Some(0));
+        assert_eq!(next_backfill_num(Some(0), u64::MAX), Some(0));
+    }
+
+    #[test]
+    fn next_backfill_num_handles_empty_round_sentinel() {
+        // u64::MAX is the "no work this round" sentinel — never write it
+        // back as the actual value.
+        assert_eq!(next_backfill_num(None, u64::MAX), None);
+        assert_eq!(next_backfill_num(Some(1_000), u64::MAX), Some(1_000));
+    }
 
     #[test]
     fn adaptive_head_delay_increases_and_respects_bounds() {
