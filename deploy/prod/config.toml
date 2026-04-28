@@ -33,6 +33,11 @@ concurrency = 6
 # Keep false unless your devops team decides the RPC should be treated as authoritative.
 trust_rpc = false
 
+# Phase 4: index internal calls (debug_traceTransaction → internal_txs).
+# Roughly doubles RPC volume on the realtime path; history was backfilled
+# via the `tidx backfill-traces` CLI before this flag was flipped on.
+enable_tracing = true
+
 [chains.clickhouse]
 # ClickHouse is part of the production stack. It powers Grafana dashboards,
 # investigation queries, and larger analytical scans.
