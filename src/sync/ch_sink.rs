@@ -19,6 +19,45 @@ const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 const L2_WITHDRAWALS_SCHEMA: &str = include_str!("../../db/clickhouse/l2_withdrawals.sql");
 
+/// Idempotent post-create ALTERs for `txs`. Each statement is `ADD COLUMN IF
+/// NOT EXISTS` (or `ADD INDEX IF NOT EXISTS`), followed by `MATERIALIZE COLUMN`
+/// for any column with a `DEFAULT` expression — without `MATERIALIZE`, CH
+/// recomputes the DEFAULT on every read for parts that pre-date the ADD,
+/// which makes UInt256 mirror queries scan the source String for ~1.3M rows
+/// every time.
+///
+/// `MATERIALIZE COLUMN` is a CH mutation (async, non-blocking). It's
+/// idempotent: once a part has the column materialized, subsequent runs are
+/// no-ops (`parts_to_do=0`).
+const TXS_COLUMN_ALTERS: &[&str] = &[
+    // Phase 2: 4-byte ABI selector denormalized off `input`.
+    "ALTER TABLE txs ADD COLUMN IF NOT EXISTS selector String DEFAULT '' AFTER input",
+    "ALTER TABLE txs ADD INDEX IF NOT EXISTS idx_selector selector TYPE bloom_filter GRANULARITY 1",
+    // Phase 3: UInt256 mirrors of wei-valued string columns.
+    "ALTER TABLE txs ADD COLUMN IF NOT EXISTS value_u256 UInt256 DEFAULT toUInt256OrZero(value) AFTER value",
+    "ALTER TABLE txs ADD COLUMN IF NOT EXISTS max_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_fee_per_gas) AFTER max_fee_per_gas",
+    "ALTER TABLE txs ADD COLUMN IF NOT EXISTS max_priority_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_priority_fee_per_gas) AFTER max_priority_fee_per_gas",
+    // Materialize so reads don't pay the toUInt256OrZero / coalesce cost
+    // every time on parts that pre-date the ADD COLUMN.
+    "ALTER TABLE txs MATERIALIZE COLUMN selector",
+    "ALTER TABLE txs MATERIALIZE COLUMN value_u256",
+    "ALTER TABLE txs MATERIALIZE COLUMN max_fee_per_gas_u256",
+    "ALTER TABLE txs MATERIALIZE COLUMN max_priority_fee_per_gas_u256",
+];
+
+/// Idempotent post-create ALTERs for `logs`. `from` doesn't have a DEFAULT
+/// expression (populated by the writer / backfill), so no MATERIALIZE needed.
+const LOGS_COLUMN_ALTERS: &[&str] = &[
+    "ALTER TABLE logs ADD COLUMN IF NOT EXISTS `from` Nullable(String) AFTER data",
+    "ALTER TABLE logs ADD INDEX IF NOT EXISTS idx_from `from` TYPE bloom_filter GRANULARITY 1",
+];
+
+/// Idempotent post-create ALTERs for `receipts`.
+const RECEIPTS_COLUMN_ALTERS: &[&str] = &[
+    "ALTER TABLE receipts ADD COLUMN IF NOT EXISTS effective_gas_price_u256 Nullable(UInt256) DEFAULT toUInt256OrZero(effective_gas_price) AFTER effective_gas_price",
+    "ALTER TABLE receipts MATERIALIZE COLUMN effective_gas_price_u256",
+];
+
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 10_000;
 
@@ -110,17 +149,7 @@ impl ClickHouseSink {
     }
 
     async fn ensure_txs_columns(&self) -> Result<()> {
-        // Denormalized 4-byte selector + UInt256 mirrors of the wei-valued
-        // string columns so callers can skip `toUInt256OrZero()` casts. The
-        // DEFAULT expression handles existing rows lazily on read; new merges
-        // materialize. Idempotent ADD COLUMN IF NOT EXISTS — safe to re-run.
-        for ddl in [
-            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS selector String DEFAULT '' AFTER input",
-            "ALTER TABLE txs ADD INDEX IF NOT EXISTS idx_selector selector TYPE bloom_filter GRANULARITY 1",
-            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS value_u256 UInt256 DEFAULT toUInt256OrZero(value) AFTER value",
-            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS max_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_fee_per_gas) AFTER max_fee_per_gas",
-            "ALTER TABLE txs ADD COLUMN IF NOT EXISTS max_priority_fee_per_gas_u256 UInt256 DEFAULT toUInt256OrZero(max_priority_fee_per_gas) AFTER max_priority_fee_per_gas",
-        ] {
+        for ddl in TXS_COLUMN_ALTERS {
             self.client
                 .query(ddl)
                 .execute()
@@ -131,11 +160,7 @@ impl ClickHouseSink {
     }
 
     async fn ensure_logs_columns(&self) -> Result<()> {
-        // Denormalized parent-tx sender. Nullable since old rows are NULL until backfilled.
-        for ddl in [
-            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS `from` Nullable(String) AFTER data",
-            "ALTER TABLE logs ADD INDEX IF NOT EXISTS idx_from `from` TYPE bloom_filter GRANULARITY 1",
-        ] {
+        for ddl in LOGS_COLUMN_ALTERS {
             self.client
                 .query(ddl)
                 .execute()
@@ -146,10 +171,7 @@ impl ClickHouseSink {
     }
 
     async fn ensure_receipts_columns(&self) -> Result<()> {
-        // UInt256 mirror of effective_gas_price (Nullable since the source is).
-        for ddl in [
-            "ALTER TABLE receipts ADD COLUMN IF NOT EXISTS effective_gas_price_u256 Nullable(UInt256) DEFAULT toUInt256OrZero(effective_gas_price) AFTER effective_gas_price",
-        ] {
+        for ddl in RECEIPTS_COLUMN_ALTERS {
             self.client
                 .query(ddl)
                 .execute()
@@ -742,5 +764,93 @@ mod tests {
         );
         assert!(ClickHouseSink::new("http://localhost:8123", "123bad", None, None).is_err());
         assert!(ClickHouseSink::new("http://localhost:8123", "", None, None).is_err());
+    }
+
+    /// Every column declared with `DEFAULT` (i.e. computed-from-other-columns)
+    /// MUST be matched by a `MATERIALIZE COLUMN` in the same alter list, or CH
+    /// recomputes the DEFAULT on every read for parts that pre-date the ADD.
+    /// This test enforces that invariant for the txs alter list.
+    #[test]
+    fn txs_alter_list_materializes_every_default_column() {
+        let alters = TXS_COLUMN_ALTERS;
+        for col in &[
+            "selector",
+            "value_u256",
+            "max_fee_per_gas_u256",
+            "max_priority_fee_per_gas_u256",
+        ] {
+            let has_add = alters
+                .iter()
+                .any(|s| s.contains(&format!("ADD COLUMN IF NOT EXISTS {col} ")));
+            let has_materialize = alters
+                .iter()
+                .any(|s| s.contains(&format!("MATERIALIZE COLUMN {col}")));
+            assert!(has_add, "txs.{col}: ADD COLUMN missing");
+            assert!(
+                has_materialize,
+                "txs.{col}: MATERIALIZE COLUMN missing — old parts will recompute DEFAULT on every read"
+            );
+        }
+    }
+
+    #[test]
+    fn receipts_alter_list_materializes_every_default_column() {
+        let alters = RECEIPTS_COLUMN_ALTERS;
+        for col in &["effective_gas_price_u256"] {
+            assert!(
+                alters
+                    .iter()
+                    .any(|s| s.contains(&format!("ADD COLUMN IF NOT EXISTS {col} "))),
+                "receipts.{col}: ADD COLUMN missing"
+            );
+            assert!(
+                alters
+                    .iter()
+                    .any(|s| s.contains(&format!("MATERIALIZE COLUMN {col}"))),
+                "receipts.{col}: MATERIALIZE COLUMN missing"
+            );
+        }
+    }
+
+    /// `MATERIALIZE COLUMN` must come AFTER its corresponding `ADD COLUMN` in
+    /// the alter list — CH parses left-to-right and a MATERIALIZE on a
+    /// not-yet-existing column would fail.
+    #[test]
+    fn txs_alter_list_orders_add_before_materialize() {
+        for col in &[
+            "selector",
+            "value_u256",
+            "max_fee_per_gas_u256",
+            "max_priority_fee_per_gas_u256",
+        ] {
+            let add_pos = TXS_COLUMN_ALTERS
+                .iter()
+                .position(|s| s.contains(&format!("ADD COLUMN IF NOT EXISTS {col} ")))
+                .unwrap_or_else(|| panic!("ADD COLUMN for txs.{col} missing"));
+            let mat_pos = TXS_COLUMN_ALTERS
+                .iter()
+                .position(|s| s.contains(&format!("MATERIALIZE COLUMN {col}")))
+                .unwrap_or_else(|| panic!("MATERIALIZE COLUMN for txs.{col} missing"));
+            assert!(
+                add_pos < mat_pos,
+                "txs.{col}: MATERIALIZE COLUMN at position {mat_pos} comes before ADD COLUMN at {add_pos}"
+            );
+        }
+    }
+
+    /// `logs."from"` is populated by the writer (no DEFAULT expression), so
+    /// MATERIALIZE COLUMN is unnecessary. Asserting the absence prevents a
+    /// well-meaning future change from adding a no-op MATERIALIZE that just
+    /// burns CPU at startup.
+    #[test]
+    fn logs_alter_list_has_no_materialize() {
+        let mat = LOGS_COLUMN_ALTERS
+            .iter()
+            .filter(|s| s.contains("MATERIALIZE COLUMN"))
+            .count();
+        assert_eq!(
+            mat, 0,
+            "logs has no DEFAULT-computed columns; MATERIALIZE shouldn't be needed"
+        );
     }
 }
