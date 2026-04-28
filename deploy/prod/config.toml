@@ -43,10 +43,11 @@ database = "tidx_38833"
 [chains.kaspa]
 enabled = true
 
-# Kaspa L1 Borsh wRPC is expected on the host at 127.0.0.1:17110.
-# The kaspa-wrpc-proxy service exposes it to Docker as host.docker.internal:17111.
-# This is used only for Kaspa provenance, not for L2 block indexing.
-rpc_url = "ws://host.docker.internal:17111"
+# Kaspa L1 Borsh wRPC, operated by devops on a separate host. tidx connects
+# directly — no on-host proxy needed (the legacy kaspa-wrpc-proxy was for
+# the case where kaspad ran on this same machine).
+# Used only for Kaspa provenance, not for L2 block indexing.
+rpc_url = "ws://95.217.73.85:17110"
 txid_prefix = "97b1"
 poll_interval_ms = 1000
 initial_tip_distance = 100
