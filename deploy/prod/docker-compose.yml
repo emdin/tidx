@@ -75,8 +75,6 @@ services:
       - --no-watch
     volumes:
       - ./config.toml:/config/config.toml:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       RUST_LOG: ${RUST_LOG}
@@ -86,16 +84,6 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-      kaspa-wrpc-proxy:
-        condition: service_started
-    restart: unless-stopped
-
-  kaspa-wrpc-proxy:
-    image: alpine/socat:latest
-    command:
-      - "TCP-LISTEN:${KASPA_PROXY_PORT:-17111},fork,reuseaddr,bind=${KASPA_PROXY_BIND_HOST:-0.0.0.0}"
-      - "TCP:127.0.0.1:${KASPA_WRPC_BORSH_PORT:-17110}"
-    network_mode: host
     restart: unless-stopped
 
   blockscout-importer:
