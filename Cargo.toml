@@ -61,6 +61,10 @@ sha3 = "0.10"
 # Kaspa L1 provenance
 kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
 kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+# rustls crypto provider — needed when kaspa-wrpc-client connects to wss:// (TLS) endpoints
+# such as wss://archival.kaspa.ws or other public archival nodes during the backfill CLI.
+# tidx::main installs the default provider once at startup; no-op when only ws:// is used.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 # Error handling
 thiserror = "2"

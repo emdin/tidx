@@ -1,4 +1,5 @@
 pub mod backfill_denorm;
+pub mod backfill_kaspa;
 pub mod backfill_receipt_data;
 pub mod backfill_traces;
 pub mod backfill_withdrawals;
@@ -41,6 +42,10 @@ pub enum Commands {
     BackfillDenorm(backfill_denorm::Args),
     /// Backfill internal_txs (callTracer) for an L2 block range. Resumable.
     BackfillTraces(backfill_traces::Args),
+    /// Backfill kaspa_l2_submissions + kaspa_entries by walking a Kaspa wRPC
+    /// node's virtual chain. Idempotent. Use against local kaspad-archive or
+    /// archival.kaspa.ws to recover provenance pre-dating the tidx deploy.
+    BackfillKaspa(backfill_kaspa::Args),
     /// Import verified contracts from a Blockscout explorer into local explorer metadata
     ImportBlockscout(import_blockscout::Args),
     /// Update tidx to the latest version

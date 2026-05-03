@@ -7,6 +7,12 @@ use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the rustls crypto provider once at process start, so any
+    // wss:// connection (e.g. backfill-kaspa --rpc wss://archival.kaspa.ws)
+    // doesn't panic on first TLS handshake. No-op when only plaintext ws://
+    // is used elsewhere in the binary.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("tidx=info".parse().unwrap());
 
@@ -32,6 +38,7 @@ async fn main() -> Result<()> {
         Commands::BackfillWithdrawals(args) => cli::backfill_withdrawals::run(args).await,
         Commands::BackfillDenorm(args) => cli::backfill_denorm::run(args).await,
         Commands::BackfillTraces(args) => cli::backfill_traces::run(args).await,
+        Commands::BackfillKaspa(args) => cli::backfill_kaspa::run(args).await,
         Commands::ImportBlockscout(args) => cli::import_blockscout::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
     }
