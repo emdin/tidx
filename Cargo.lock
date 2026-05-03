@@ -6885,6 +6885,7 @@ dependencies = [
  "regex-lite",
  "reqwest",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_json",
  "serial_test",
