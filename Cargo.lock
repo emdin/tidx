@@ -6869,6 +6869,7 @@ dependencies = [
  "criterion",
  "deadpool-postgres",
  "dialoguer",
+ "flate2",
  "form_urlencoded",
  "futures",
  "glob",

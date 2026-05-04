@@ -65,6 +65,8 @@ kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag =
 # such as wss://archival.kaspa.ws or other public archival nodes during the backfill CLI.
 # tidx::main installs the default provider once at startup; no-op when only ws:// is used.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# zlib for handling Igra TYPE_ZIPPED_PAYLOAD (0x05) txs — see payload.rs
+flate2 = "1.0"
 
 # Error handling
 thiserror = "2"
