@@ -3,6 +3,7 @@ pub mod backfill_kaspa;
 pub mod backfill_receipt_data;
 pub mod backfill_traces;
 pub mod backfill_withdrawals;
+pub mod enrich_l1_senders;
 pub mod import_blockscout;
 pub mod init;
 pub mod query;
@@ -46,6 +47,11 @@ pub enum Commands {
     /// node's virtual chain. Idempotent. Use against local kaspad-archive or
     /// archival.kaspa.ws to recover provenance pre-dating the tidx deploy.
     BackfillKaspa(backfill_kaspa::Args),
+    /// Populate l1_senders / l1_sender_amounts_sompi columns for kaspa_*
+    /// tables by querying api.kaspa.org for each tx's resolved
+    /// previous-outpoint addresses. Idempotent (only touches rows where
+    /// l1_senders IS NULL).
+    EnrichL1Senders(enrich_l1_senders::Args),
     /// Import verified contracts from a Blockscout explorer into local explorer metadata
     ImportBlockscout(import_blockscout::Args),
     /// Update tidx to the latest version
