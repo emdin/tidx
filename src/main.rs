@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
         Commands::BackfillDenorm(args) => cli::backfill_denorm::run(args).await,
         Commands::BackfillTraces(args) => cli::backfill_traces::run(args).await,
         Commands::BackfillKaspa(args) => cli::backfill_kaspa::run(args).await,
+        Commands::EnrichL1Senders(args) => cli::enrich_l1_senders::run(args).await,
         Commands::ImportBlockscout(args) => cli::import_blockscout::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
     }
