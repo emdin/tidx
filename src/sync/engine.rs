@@ -268,7 +268,14 @@ impl SyncEngine {
             let head_delay_blocks = self.head_delay.current();
             let safe_head = safe_tip_for_head(remote_head, head_delay_blocks);
             metrics::set_sync_head_delay(self.chain_id, head_delay_blocks);
-            update_tip_num(self.pool(), self.chain_id, safe_head, remote_head).await?;
+            update_tip_num(
+                self.pool(),
+                self.chain_id,
+                safe_head,
+                remote_head,
+                Some(head_delay_blocks),
+            )
+            .await?;
 
             // Check for gaps
             let gaps = detect_all_gaps(self.pool(), safe_head).await?;
@@ -539,7 +546,14 @@ impl SyncEngine {
                 fetch_ms = 0;
             }
 
-            update_tip_num(self.pool(), self.chain_id, current_to, remote_head).await?;
+            update_tip_num(
+                self.pool(),
+                self.chain_id,
+                current_to,
+                remote_head,
+                Some(self.head_delay.current()),
+            )
+            .await?;
 
             let batch_ms = batch_start.elapsed().as_millis();
             let block_count = blocks.len();
@@ -670,7 +684,8 @@ impl SyncEngine {
                 );
 
                 // Update tip_num to fork point so realtime sync continues from there
-                update_tip_num(self.pool(), self.chain_id, fork_block, fork_block).await?;
+                update_tip_num(self.pool(), self.chain_id, fork_block, fork_block, None)
+                    .await?;
 
                 Ok(())
             }

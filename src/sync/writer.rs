@@ -1100,20 +1100,41 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
     Ok(())
 }
 
-/// Update only tip_num (for realtime sync - avoids clobbering synced_num)
-pub async fn update_tip_num(pool: &Pool, chain_id: u64, tip_num: u64, head_num: u64) -> Result<()> {
+/// Update only tip_num (for realtime sync - avoids clobbering synced_num).
+///
+/// `head_delay_blocks` is the current adaptive safety window; when `Some`,
+/// stored so `/status` can surface it. Pass `None` on paths that don't have
+/// a live value (e.g. reorg handler); the stored value is preserved via
+/// COALESCE.
+pub async fn update_tip_num(
+    pool: &Pool,
+    chain_id: u64,
+    tip_num: u64,
+    head_num: u64,
+    head_delay_blocks: Option<u64>,
+) -> Result<()> {
     let conn = pool.get().await?;
+
+    let head_delay_i64 = head_delay_blocks.map(|v| v as i64);
 
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num, started_at, updated_at)
-        VALUES ($1, $2, $3, 0, NOW(), NOW())
+        INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num,
+                                head_delay_blocks, started_at, updated_at)
+        VALUES ($1, $2, $3, 0, $4, NOW(), NOW())
         ON CONFLICT (chain_id) DO UPDATE SET
             head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
             tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
+            head_delay_blocks = COALESCE(EXCLUDED.head_delay_blocks,
+                                         sync_state.head_delay_blocks),
             updated_at = NOW()
         "#,
-        &[&(chain_id as i64), &(head_num as i64), &(tip_num as i64)],
+        &[
+            &(chain_id as i64),
+            &(head_num as i64),
+            &(tip_num as i64),
+            &head_delay_i64,
+        ],
     )
     .await?;
 

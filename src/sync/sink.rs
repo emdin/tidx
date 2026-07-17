@@ -132,16 +132,18 @@ impl SinkSet {
 
     /// Delete all data from a given block number onwards (reorg support).
     /// Returns the number of blocks deleted from PostgreSQL.
+    ///
+    /// PG runs first (transactional archive + delete, source of truth). CH
+    /// runs second — running them in parallel would create a state where PG
+    /// rolls back but CH already deleted. If CH fails after PG commits, CH
+    /// temporarily retains rows PG removed; backfill (ReplacingMergeTree
+    /// last-writer-wins) heals it.
     pub async fn delete_from(&self, block_num: u64) -> Result<u64> {
+        let deleted = writer::delete_blocks_from(&self.pool, block_num).await?;
         if let Some(ch) = &self.ch {
-            let (deleted, _) = tokio::try_join!(
-                writer::delete_blocks_from(&self.pool, block_num),
-                ch.delete_from(block_num),
-            )?;
-            Ok(deleted)
-        } else {
-            writer::delete_blocks_from(&self.pool, block_num).await
+            ch.delete_from(block_num).await?;
         }
+        Ok(deleted)
     }
 
     /// Automatically backfill ClickHouse from PostgreSQL if CH is behind.
