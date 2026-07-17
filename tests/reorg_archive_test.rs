@@ -334,10 +334,6 @@ async fn test4_rollback_leaves_state_clean() {
     truncate_all_incl_archive(&db.pool).await;
     seed_canonical_chain(&db.pool, 1, 10).await;
 
-    reorg_archive::ensure_initialized(&db.pool)
-        .await
-        .expect("init");
-
     // Open a tx, run the mutation (succeeds — inside tx), then explicit rollback.
     let mut conn = db.pool.get().await.expect("get conn");
     let tx = conn.transaction().await.expect("begin tx");
@@ -376,6 +372,46 @@ async fn test4_rollback_leaves_state_clean() {
         .expect("count")
         .get(0);
     assert_eq!(reorgs_count, 0, "reorgs row must roll back with the archive");
+}
+
+// ---------------------------------------------------------------------------
+// TEST 6 — depth==0 guard: reorg call with fork_point >= tip must NOT
+// write an empty reorgs row (spurious/no-op calls don't pollute the log).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(db)]
+async fn test6_depth_zero_no_event_row() {
+    use tidx::sync::reorg_archive;
+
+    let db = TestDb::empty().await;
+    truncate_all_incl_archive(&db.pool).await;
+    seed_canonical_chain(&db.pool, 1, 10).await;
+
+    // fork_point == prev_tip → nothing to displace → no event row.
+    let mut conn = db.pool.get().await.expect("get conn");
+    let tx = conn.transaction().await.expect("begin");
+    let result = reorg_archive::apply_reorg_mutation(&tx, 10)
+        .await
+        .expect("depth=0 must succeed as a no-op");
+    tx.commit().await.expect("commit");
+    drop(conn);
+
+    assert_eq!(result.depth, 0);
+    assert_eq!(result.blocks_removed, 0);
+    assert_eq!(result.reorg_id, 0, "no event row assigned");
+
+    let conn2 = db.pool.get().await.expect("get conn");
+    let reorgs_count: i64 = conn2
+        .query_one("SELECT count(*) FROM reorgs", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(reorgs_count, 0, "no reorgs row should be written");
+
+    // Canonical rows untouched.
+    assert_eq!(canonical_count(&db.pool, "blocks").await, 10);
+    assert_eq!(canonical_count(&db.pool, "txs").await, 10);
 }
 
 // ---------------------------------------------------------------------------

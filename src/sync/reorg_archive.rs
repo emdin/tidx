@@ -6,14 +6,20 @@
 //! point; production `delete_blocks_from` opens+commits its own tx.
 //!
 //! Column-order safety: INSERT column lists are read from `information_schema`
-//! once at first call and cached, so `SELECT t.*` (positional binding) is
-//! never used. An unmirrored source column fails the INSERT with a named-column
-//! error instead of silently corrupting positionally.
+//! *every reorg* (not cached), so `SELECT t.*` (positional binding) is never
+//! used AND a live `ALTER TABLE ... ADD COLUMN` on a source table is picked up
+//! on the next reorg without a restart. An unmirrored source column fails the
+//! INSERT with a named-column error instead of silently corrupting positionally.
+//!
+//! Statement construction is six information_schema queries per reorg (one per
+//! table pair). Reorgs are rare; the cost is negligible next to the archive
+//! INSERTs themselves. The startup [`assert_schema_parity`] check still runs so
+//! a drifted migration crashes the boot loop rather than sitting in a state
+//! where the next reorg would archive with the wrong columns.
 
 use anyhow::{Result, anyhow};
 use deadpool_postgres::Transaction;
 use std::collections::HashMap;
-use tokio::sync::OnceCell;
 
 /// (source_table, archive_table, block_num_column_on_source).
 /// `block_num` for every table except `blocks`, which uses `num`.
@@ -26,40 +32,45 @@ const PAIRS: &[(&str, &str, &str)] = &[
     ("blocks", "orphaned_blocks", "num"),
 ];
 
-/// One prepared archive INSERT + its matching DELETE, for a single table pair.
+/// One archive INSERT + its matching DELETE, for a single table pair, built
+/// from live information_schema at reorg time.
 struct ArchiveStmt {
-    /// e.g. `INSERT INTO orphaned_txs (reorg_id, block_num, ..., signature_type)
-    ///        SELECT $1, block_num, ..., signature_type FROM txs WHERE block_num >= $2`
     insert_sql: String,
-    /// e.g. `DELETE FROM txs WHERE block_num >= $1`
     delete_sql: String,
 }
 
-static STMTS: OnceCell<HashMap<&'static str, ArchiveStmt>> = OnceCell::const_new();
-
-/// Build the archive INSERT + DELETE statement pair for one source table by
-/// reading `information_schema.columns` (source cols only — provenance columns
-/// on the archive are supplied by the INSERT itself).
+/// Read the source table's real column layout from `information_schema` and
+/// produce the archive INSERT + source DELETE for it.
+///
+/// Column filter: skip `GENERATED` and `IDENTITY` columns — those aren't
+/// insertable directly and would fail the INSERT if a future migration adds
+/// one. `current_schema()` scopes the read so a duplicate table name in
+/// another schema (e.g. an ops-analytics schema) doesn't cross-contaminate.
 async fn build_stmts_for(
-    conn: &deadpool_postgres::Object,
+    tx: &Transaction<'_>,
     source: &str,
     archive: &str,
     block_col: &str,
 ) -> Result<ArchiveStmt> {
-    let rows = conn
+    let rows = tx
         .query(
             r#"SELECT column_name
                  FROM information_schema.columns
-                WHERE table_name = $1 AND table_schema = current_schema()
+                WHERE table_name = $1
+                  AND table_schema = current_schema()
+                  AND is_generated = 'NEVER'
+                  AND is_identity = 'NO'
                 ORDER BY ordinal_position"#,
             &[&source],
         )
         .await?;
     if rows.is_empty() {
-        return Err(anyhow!("source table {source} not found in information_schema"));
+        return Err(anyhow!(
+            "source table {source} not found in current_schema()"
+        ));
     }
     let cols: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    // Quote every column — some are reserved words (`to`, `from`) or contain them.
+    // Quote every column — some are reserved words (`to`, `from`).
     let quoted: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
     let cols_list = quoted.join(", ");
     let insert_sql = format!(
@@ -73,27 +84,9 @@ async fn build_stmts_for(
     })
 }
 
-async fn init_stmts(pool: &crate::db::Pool) -> Result<HashMap<&'static str, ArchiveStmt>> {
-    let conn = pool.get().await?;
-    let mut out = HashMap::new();
-    for (src, arc, blk) in PAIRS {
-        let stmt = build_stmts_for(&conn, src, arc, blk).await?;
-        out.insert(*src, stmt);
-    }
-    Ok(out)
-}
-
-/// Ensure the statement cache is populated. Idempotent; safe to call on every
-/// reorg. First call reads `information_schema` (six small queries); later
-/// calls are a `OnceCell` fast-path.
-pub async fn ensure_initialized(pool: &crate::db::Pool) -> Result<()> {
-    STMTS
-        .get_or_try_init(|| async { init_stmts(pool).await })
-        .await?;
-    Ok(())
-}
-
 /// Result of one reorg mutation: `reorg_id` written, and per-table row counts.
+/// All counts stay i64 through the API even though `reorgs.*_removed` are
+/// stored as INT4 — the code guards the downcast at the write site.
 pub struct ReorgResult {
     pub reorg_id: i64,
     pub fork_point: i64,
@@ -109,11 +102,13 @@ pub struct ReorgResult {
 
 /// Full reorg mutation on an externally-owned transaction. Order:
 ///   1. `SELECT max(num) FROM blocks` → prev_tip (inside the tx).
-///   2. INSERT into reorgs, RETURNING id.
-///   3. Six archive INSERTs (each source row copied to its orphaned_* twin).
-///   4. Six DELETEs on the source tables.
-///   5. UPDATE reorgs SET counts, count_check_ok.
-///   6. (Caller: rewind sync_state.tip_num inside the same tx if desired,
+///   2. Guard: if depth == 0, return Ok early (no reorgs event row written).
+///   3. Build six per-pair archive stmts from live information_schema.
+///   4. INSERT into reorgs, RETURNING id.
+///   5. Six archive INSERTs (each source row copied to its orphaned_* twin).
+///   6. Six DELETEs on the source tables.
+///   7. UPDATE reorgs SET counts, count_check_ok.
+///   8. (Caller: rewind sync_state.tip_num inside the same tx if desired,
 ///      then commit.)
 ///
 /// `fork_point` is the last common block (kept in canonical); rows with
@@ -123,19 +118,44 @@ pub async fn apply_reorg_mutation<'a>(
     tx: &Transaction<'a>,
     fork_point: i64,
 ) -> Result<ReorgResult> {
-    let stmts = STMTS
-        .get()
-        .ok_or_else(|| anyhow!("reorg_archive::ensure_initialized was not called"))?;
-
     // 1. prev_tip inside the tx (batches may have advanced past mismatch - 1).
     let prev_tip: i64 = tx
         .query_one("SELECT COALESCE(max(num), 0)::bigint FROM blocks", &[])
         .await?
         .get(0);
-    let depth: i32 = (prev_tip - fork_point).max(0) as i32;
+    let depth_i64: i64 = (prev_tip - fork_point).max(0);
     let cut: i64 = fork_point + 1;
 
-    // 2. reorgs row (counts zeroed; step 5 fills them).
+    // 2. depth==0 guard: nothing to displace; skip the event row entirely so
+    //    retried/spurious reorg calls don't pollute the audit log.
+    if depth_i64 == 0 {
+        return Ok(ReorgResult {
+            reorg_id: 0,
+            fork_point,
+            prev_tip,
+            depth: 0,
+            blocks_removed: 0,
+            txs_removed: 0,
+            logs_removed: 0,
+            receipts_removed: 0,
+            internal_txs_removed: 0,
+            withdrawals_removed: 0,
+        });
+    }
+    let depth: i32 = depth_i64.try_into().map_err(|_| {
+        anyhow!("reorg depth {depth_i64} exceeds i32::MAX (schema stores reorgs.depth as INT4)")
+    })?;
+
+    // 3. Build six per-pair statements from *current* information_schema. NOT
+    //    cached — a hot ALTER TABLE ... ADD COLUMN on a source table (mirrored
+    //    on its orphaned_* twin) is picked up on the next reorg without a
+    //    restart. See module docstring for the rationale.
+    let mut stmts: HashMap<&str, ArchiveStmt> = HashMap::with_capacity(PAIRS.len());
+    for (src, arc, blk) in PAIRS {
+        stmts.insert(*src, build_stmts_for(tx, src, arc, blk).await?);
+    }
+
+    // 4. reorgs row (counts zeroed; step 7 fills them).
     let reorg_id: i64 = tx
         .query_one(
             r#"INSERT INTO reorgs
@@ -149,26 +169,37 @@ pub async fn apply_reorg_mutation<'a>(
         .await?
         .get(0);
 
-    // 3. archive INSERTs, in the same order the deletes will run (FK-safe
-    //    since orphaned_* has FK only to reorgs, which now exists).
-    let mut counts: HashMap<&str, i64> = HashMap::new();
+    // 5. archive INSERTs, ordered so any future source→source FKs (none today)
+    //    would be honored on both the archive and the delete side.
+    let mut counts: HashMap<&str, i64> = HashMap::with_capacity(PAIRS.len());
     for (src, _arc, _blk) in PAIRS {
-        let stmt = stmts.get(src).ok_or_else(|| anyhow!("no stmt for {src}"))?;
+        let stmt = stmts.get(src).expect("stmt was inserted just above");
         let n = tx.execute(&stmt.insert_sql, &[&reorg_id, &cut]).await? as i64;
         counts.insert(*src, n);
     }
 
-    // 4. DELETEs, canonical, source order matches archive order above.
+    // 6. DELETEs, same source order.
     for (src, _, _) in PAIRS {
-        let stmt = stmts.get(src).ok_or_else(|| anyhow!("no stmt for {src}"))?;
+        let stmt = stmts.get(src).expect("stmt was inserted just above");
         tx.execute(&stmt.delete_sql, &[&cut]).await?;
     }
 
-    // 5. counts + count_check_ok. blocks_removed should equal depth when the
-    //    canonical head is contiguous (it always is in production). Anomaly is
-    //    logged AND recorded queryable — see reorgs.count_check_ok.
+    // 7. counts + count_check_ok. blocks_removed should equal depth when the
+    //    canonical head is contiguous. Anomaly is logged AND recorded queryable
+    //    via reorgs.count_check_ok; the downcast panics on overflow but is
+    //    bounded by MAX_REORG_DEPTH (128) × per-block row counts in production.
+    fn to_i32(name: &str, n: i64) -> Result<i32> {
+        i32::try_from(n).map_err(|_| {
+            anyhow!("reorg {name} count {n} exceeds i32::MAX (schema stores it as INT4)")
+        })
+    }
     let blocks_removed = *counts.get("blocks").unwrap_or(&0);
-    let count_check_ok = blocks_removed == depth as i64;
+    let txs_removed = *counts.get("txs").unwrap_or(&0);
+    let logs_removed = *counts.get("logs").unwrap_or(&0);
+    let receipts_removed = *counts.get("receipts").unwrap_or(&0);
+    let internal_txs_removed = *counts.get("internal_txs").unwrap_or(&0);
+    let withdrawals_removed = *counts.get("l2_withdrawals").unwrap_or(&0);
+    let count_check_ok = blocks_removed == depth_i64;
     if !count_check_ok {
         tracing::warn!(
             fork_point,
@@ -189,12 +220,12 @@ pub async fn apply_reorg_mutation<'a>(
                  count_check_ok        = $7
            WHERE id = $8"#,
         &[
-            &(blocks_removed as i32),
-            &(counts["txs"] as i32),
-            &(counts["logs"] as i32),
-            &(counts["receipts"] as i32),
-            &(counts["internal_txs"] as i32),
-            &(counts["l2_withdrawals"] as i32),
+            &to_i32("blocks_removed", blocks_removed)?,
+            &to_i32("txs_removed", txs_removed)?,
+            &to_i32("logs_removed", logs_removed)?,
+            &to_i32("receipts_removed", receipts_removed)?,
+            &to_i32("internal_txs_removed", internal_txs_removed)?,
+            &to_i32("withdrawals_removed", withdrawals_removed)?,
             &count_check_ok,
             &reorg_id,
         ],
@@ -207,11 +238,11 @@ pub async fn apply_reorg_mutation<'a>(
         prev_tip,
         depth,
         blocks_removed,
-        txs_removed: counts["txs"],
-        logs_removed: counts["logs"],
-        receipts_removed: counts["receipts"],
-        internal_txs_removed: counts["internal_txs"],
-        withdrawals_removed: counts["l2_withdrawals"],
+        txs_removed,
+        logs_removed,
+        receipts_removed,
+        internal_txs_removed,
+        withdrawals_removed,
     })
 }
 
@@ -221,6 +252,9 @@ pub async fn apply_reorg_mutation<'a>(
 ///
 /// The check is the same DO $$ block as db/reorg_archive.sql's design intent:
 /// ordered, typed column arrays must equal `[reorg_id, orphaned_at] || <source>`.
+/// Filters by `current_schema()` — matches [`build_stmts_for`] so a duplicate
+/// table name in a sibling schema (e.g. an ops-analytics scratch schema)
+/// doesn't cause a bogus mismatch at boot.
 pub async fn assert_schema_parity(pool: &crate::db::Pool) -> Result<()> {
     let conn = pool.get().await?;
     conn.batch_execute(
@@ -241,9 +275,11 @@ pub async fn assert_schema_parity(pool: &crate::db::Pool) -> Result<()> {
           FOR i IN 1..array_length(pairs, 1) LOOP
             src := pairs[i][1]; arc := pairs[i][2];
             SELECT array_agg(column_name || ':' || data_type ORDER BY ordinal_position)
-              INTO src_arr FROM information_schema.columns WHERE table_name = src;
+              INTO src_arr FROM information_schema.columns
+             WHERE table_name = src AND table_schema = current_schema();
             SELECT array_agg(column_name || ':' || data_type ORDER BY ordinal_position)
-              INTO arc_arr FROM information_schema.columns WHERE table_name = arc;
+              INTO arc_arr FROM information_schema.columns
+             WHERE table_name = arc AND table_schema = current_schema();
             want := ARRAY['reorg_id:bigint','orphaned_at:timestamp with time zone'] || src_arr;
             IF arc_arr <> want THEN
               RAISE EXCEPTION

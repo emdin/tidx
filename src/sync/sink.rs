@@ -135,13 +135,35 @@ impl SinkSet {
     ///
     /// PG runs first (transactional archive + delete, source of truth). CH
     /// runs second — running them in parallel would create a state where PG
-    /// rolls back but CH already deleted. If CH fails after PG commits, CH
-    /// temporarily retains rows PG removed; backfill (ReplacingMergeTree
-    /// last-writer-wins) heals it.
+    /// rolls back but CH already deleted.
+    ///
+    /// **CH divergence on failure** (documented, not fully handled):
+    /// - `blocks`, `txs`, `receipts`, `internal_txs`, `l2_withdrawals` — CH
+    ///   ORDER BY is block-key-only (`(num)`, `(block_num, idx)`, etc.), so
+    ///   ReplacingMergeTree merges any re-inserted canonical row on top of
+    ///   the orphaned copy; backfill heals.
+    /// - `logs` — CH ORDER BY is `(address, selector, block_num, log_idx)`,
+    ///   which includes non-block fields. Orphaned and canonical rows at the
+    ///   same block height typically have *different* `(address, selector)`
+    ///   and DO NOT dedupe. If this call errors after the PG tx commits, CH
+    ///   `logs` retains the orphaned events permanently. PG (source of truth)
+    ///   plus the `reorgs` event table let consumers detect + reconcile.
+    ///
+    /// A follow-up will enqueue failed CH deletes for retry so `logs`
+    /// divergence is bounded. Not in this PR.
     pub async fn delete_from(&self, block_num: u64) -> Result<u64> {
         let deleted = writer::delete_blocks_from(&self.pool, block_num).await?;
         if let Some(ch) = &self.ch {
-            ch.delete_from(block_num).await?;
+            if let Err(e) = ch.delete_from(block_num).await {
+                // Log loudly; PG has committed; propagating the error would
+                // trigger a retry that finds nothing to delete on PG. Consumers
+                // must reconcile CH `logs` via the reorgs table.
+                tracing::error!(
+                    from_block = block_num,
+                    error = %e,
+                    "ClickHouse reorg delete failed after PG commit — CH may retain orphaned rows; reconcile via reorgs table"
+                );
+            }
         }
         Ok(deleted)
     }

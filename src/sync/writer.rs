@@ -1305,8 +1305,14 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
 ///
 /// Returns the number of canonical blocks that were removed (matches the
 /// prior contract; equivalent to `reorgs.blocks_removed` for this reorg).
+///
+/// **Atomicity note**: this function's transaction covers only the archive +
+/// event row + DELETEs. The caller-side `sync_state.tip_num` rewind runs in a
+/// separate connection (see engine.rs `handle_reorg`) and can crash between
+/// the two, leaving state divergent until the next tick's gap-fill catches it.
+/// Folding the tip rewind inside the reorg tx requires a caller-owns-tx
+/// refactor of `sinks.delete_from`; documented as a follow-up.
 pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
-    crate::sync::reorg_archive::ensure_initialized(pool).await?;
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     let fork_point = (from_block as i64).saturating_sub(1);
