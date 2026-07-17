@@ -1100,20 +1100,41 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
     Ok(())
 }
 
-/// Update only tip_num (for realtime sync - avoids clobbering synced_num)
-pub async fn update_tip_num(pool: &Pool, chain_id: u64, tip_num: u64, head_num: u64) -> Result<()> {
+/// Update only tip_num (for realtime sync - avoids clobbering synced_num).
+///
+/// `head_delay_blocks` is the current adaptive safety window; when `Some`,
+/// stored so `/status` can surface it. Pass `None` on paths that don't have
+/// a live value (e.g. reorg handler); the stored value is preserved via
+/// COALESCE.
+pub async fn update_tip_num(
+    pool: &Pool,
+    chain_id: u64,
+    tip_num: u64,
+    head_num: u64,
+    head_delay_blocks: Option<u64>,
+) -> Result<()> {
     let conn = pool.get().await?;
+
+    let head_delay_i64 = head_delay_blocks.map(|v| v as i64);
 
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num, started_at, updated_at)
-        VALUES ($1, $2, $3, 0, NOW(), NOW())
+        INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num,
+                                head_delay_blocks, started_at, updated_at)
+        VALUES ($1, $2, $3, 0, $4, NOW(), NOW())
         ON CONFLICT (chain_id) DO UPDATE SET
             head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
             tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
+            head_delay_blocks = COALESCE(EXCLUDED.head_delay_blocks,
+                                         sync_state.head_delay_blocks),
             updated_at = NOW()
         "#,
-        &[&(chain_id as i64), &(head_num as i64), &(tip_num as i64)],
+        &[
+            &(chain_id as i64),
+            &(head_num as i64),
+            &(tip_num as i64),
+            &head_delay_i64,
+        ],
     )
     .await?;
 
@@ -1273,38 +1294,31 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
     Ok(gaps)
 }
 
-/// Delete all blocks (and related txs, logs, receipts, withdrawals) from a given block number onwards.
-/// Used for reorg handling - removes orphaned blocks so they can be re-synced.
-/// Returns the number of blocks deleted.
+/// Displace all rows at or after `from_block` — archive them into `orphaned_*`,
+/// record a `reorgs` event, delete from the source tables — all in one
+/// transaction. Callers that need to bundle a `sync_state` rewind or other
+/// side effects should use [`apply_reorg_mutation`] directly on their own
+/// transaction.
+///
+/// Interpretation of `from_block`: the first block to displace, i.e.
+/// `fork_point + 1`. Kept as `u64` for callsite compatibility.
+///
+/// Returns the number of canonical blocks that were removed (matches the
+/// prior contract; equivalent to `reorgs.blocks_removed` for this reorg).
+///
+/// **Atomicity note**: this function's transaction covers only the archive +
+/// event row + DELETEs. The caller-side `sync_state.tip_num` rewind runs in a
+/// separate connection (see engine.rs `handle_reorg`) and can crash between
+/// the two, leaving state divergent until the next tick's gap-fill catches it.
+/// Folding the tip rewind inside the reorg tx requires a caller-owns-tx
+/// refactor of `sinks.delete_from`; documented as a follow-up.
 pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
-    let conn = pool.get().await?;
-    let from_block_i64 = from_block as i64;
-
-    // Delete in order: logs, receipts, txs, withdrawals, blocks (foreign key order)
-    conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
-        .await?;
-    conn.execute(
-        "DELETE FROM receipts WHERE block_num >= $1",
-        &[&from_block_i64],
-    )
-    .await?;
-    conn.execute("DELETE FROM txs WHERE block_num >= $1", &[&from_block_i64])
-        .await?;
-    conn.execute(
-        "DELETE FROM l2_withdrawals WHERE block_num >= $1",
-        &[&from_block_i64],
-    )
-    .await?;
-    conn.execute(
-        "DELETE FROM internal_txs WHERE block_num >= $1",
-        &[&from_block_i64],
-    )
-    .await?;
-    let deleted = conn
-        .execute("DELETE FROM blocks WHERE num >= $1", &[&from_block_i64])
-        .await?;
-
-    Ok(deleted)
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let fork_point = (from_block as i64).saturating_sub(1);
+    let result = crate::sync::reorg_archive::apply_reorg_mutation(&tx, fork_point).await?;
+    tx.commit().await?;
+    Ok(result.blocks_removed as u64)
 }
 
 /// Find the fork point by walking back from a mismatch until we find a matching hash.

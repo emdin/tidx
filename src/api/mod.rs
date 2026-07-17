@@ -425,6 +425,7 @@ fn empty_status(chain_id: u64) -> SyncStatus {
         synced_num: 0,
         tip_num: 0,
         lag: 0,
+        head_delay_blocks: None,
         gap_blocks: 0,
         gaps: Vec::new(),
         backfill_num: None,

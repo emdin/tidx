@@ -13,6 +13,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
 -- Persisted in PG so it survives restarts and isn't fooled by realtime sync writing ahead.
 ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS ch_backfill_block INT8 NOT NULL DEFAULT 0;
 
+-- Current adaptive safety head-delay. Written each sync tick by update_tip_num.
+-- Consumers (VIL, explorer) read this via /status to decide when a block is
+-- "landed enough" to classify. It moves between config's head_delay_blocks
+-- (default 30) and max_head_delay_blocks (default 100).
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS head_delay_blocks INT8;
+
 COMMENT ON COLUMN sync_state.synced_num IS 'Highest contiguous block synced from genesis (no gaps up to here)';
 COMMENT ON COLUMN sync_state.tip_num IS 'Highest block synced near chain head (may have gaps below)';
 COMMENT ON COLUMN sync_state.backfill_num IS 'Lowest block synced going backwards (NULL=not started, 0=complete)';

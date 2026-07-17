@@ -324,6 +324,122 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
             examples: vec![],
         },
+        TableInfo {
+            name: "reorgs",
+            description: "Reorg event log. One row per handled L2 reorg. Written atomically with the corresponding orphaned_* rows.",
+            engines: pg(),
+            columns: vec![
+                col("id", "INT8", "Reorg event id, referenced by orphaned_*.reorg_id. IDENTITY-backed; gaps may appear on aborted reorg transactions."),
+                col("fork_point", "INT8", "Last common block (kept in canonical). Blocks above this were displaced."),
+                col("prev_tip", "INT8", "Stored tip_num just before deletes (read inside the reorg tx)."),
+                col("depth", "INT4", "prev_tip - fork_point. The reorg's depth from the tip."),
+                col("blocks_removed", "INT4", "Row count copied into orphaned_blocks."),
+                col("txs_removed", "INT4", "Row count copied into orphaned_txs."),
+                col("logs_removed", "INT4", "Row count copied into orphaned_logs."),
+                col("receipts_removed", "INT4", "Row count copied into orphaned_receipts."),
+                col("internal_txs_removed", "INT4", "Row count copied into orphaned_internal_txs."),
+                col("withdrawals_removed", "INT4", "Row count copied into orphaned_l2_withdrawals."),
+                col("count_check_ok", "BOOLEAN", "False if blocks_removed != depth (non-contiguous canonical head — anomaly; investigate)."),
+                col("occurred_at", "TIMESTAMPTZ", "Wall-clock time of the reorg transaction (server clock, transaction start)."),
+            ],
+            examples: vec![
+                QueryExample {
+                    description: "Most recent reorgs",
+                    sql: "SELECT id, fork_point, depth, blocks_removed, occurred_at FROM reorgs ORDER BY id DESC LIMIT 20",
+                },
+            ],
+        },
+        TableInfo {
+            name: "orphaned_blocks",
+            description: "Blocks displaced by a reorg. Mirrors the `blocks` schema with `reorg_id` + `orphaned_at` prepended.",
+            engines: pg(),
+            columns: vec![
+                col("reorg_id", "INT8", "FK to reorgs.id"),
+                col("orphaned_at", "TIMESTAMPTZ", "Transaction-start wall-clock when the reorg landed"),
+                col("num", "INT8", "Block number on the orphaned chain"),
+                col("hash", "BYTEA", "Block hash on the orphaned chain"),
+                col("parent_hash", "BYTEA", "Parent hash on the orphaned chain"),
+                col("timestamp", "TIMESTAMPTZ", "Block timestamp"),
+                col("miner", "BYTEA", "Block producer address"),
+            ],
+            examples: vec![
+                QueryExample {
+                    description: "Which canonical block replaced an orphaned one",
+                    sql: "SELECT ob.num, encode(ob.hash,'hex') AS orphaned_hash, encode(b.hash,'hex') AS replaced_by FROM orphaned_blocks ob LEFT JOIN blocks b ON b.num = ob.num WHERE ob.reorg_id = $1",
+                },
+            ],
+        },
+        TableInfo {
+            name: "orphaned_txs",
+            description: "Transactions displaced by a reorg. Mirrors `txs` with `reorg_id` + `orphaned_at` prepended. A resubmitted tx with the same hash can also be present in canonical `txs`.",
+            engines: pg(),
+            columns: vec![
+                col("reorg_id", "INT8", "FK to reorgs.id"),
+                col("orphaned_at", "TIMESTAMPTZ", "When the reorg landed"),
+                col("block_num", "INT8", "Block number on the orphaned chain"),
+                col("hash", "BYTEA", "Transaction hash"),
+                col("from", "BYTEA", "Sender address (quote in PG: \"from\")"),
+                col("to", "BYTEA", "Recipient address"),
+                col("value", "TEXT", "Wei value (uint256 as decimal string)"),
+            ],
+            examples: vec![
+                QueryExample {
+                    description: "Full history of a tx: canonical or orphaned + depth",
+                    sql: "SELECT 'canonical' AS st, block_num, NULL::bigint AS reorg_id, NULL::int AS depth FROM txs WHERE hash=decode($1,'hex') UNION ALL SELECT 'orphaned', o.block_num, r.id, r.depth FROM orphaned_txs o JOIN reorgs r ON r.id=o.reorg_id WHERE o.hash=decode($1,'hex')",
+                },
+            ],
+        },
+        TableInfo {
+            name: "orphaned_logs",
+            description: "Event logs displaced by a reorg. Mirrors `logs` with reorg_id + orphaned_at prepended.",
+            engines: pg(),
+            columns: vec![
+                col("reorg_id", "INT8", "FK to reorgs.id"),
+                col("orphaned_at", "TIMESTAMPTZ", "When the reorg landed"),
+                col("tx_hash", "BYTEA", "Transaction hash"),
+                col("address", "BYTEA", "Log emitter address"),
+                col("topic0", "BYTEA", "Event signature topic"),
+            ],
+            examples: vec![],
+        },
+        TableInfo {
+            name: "orphaned_receipts",
+            description: "Receipts displaced by a reorg. Mirrors `receipts` with reorg_id + orphaned_at prepended. Useful for citing what a tx's status was before the reorg removed it.",
+            engines: pg(),
+            columns: vec![
+                col("reorg_id", "INT8", "FK to reorgs.id"),
+                col("orphaned_at", "TIMESTAMPTZ", "When the reorg landed"),
+                col("tx_hash", "BYTEA", "Transaction hash"),
+                col("status", "INT2", "Receipt status at time of removal (1=success, 0=failure)"),
+                col("gas_used", "INT8", "Gas consumed by the tx at time of removal"),
+            ],
+            examples: vec![],
+        },
+        TableInfo {
+            name: "orphaned_internal_txs",
+            description: "Internal calls displaced by a reorg. Mirrors `internal_txs` with reorg_id + orphaned_at prepended.",
+            engines: pg(),
+            columns: vec![
+                col("reorg_id", "INT8", "FK to reorgs.id"),
+                col("orphaned_at", "TIMESTAMPTZ", "When the reorg landed"),
+                col("tx_hash", "BYTEA", "Enclosing transaction hash"),
+                col("depth", "INT4", "Call depth"),
+            ],
+            examples: vec![],
+        },
+        TableInfo {
+            name: "orphaned_l2_withdrawals",
+            description: "L2 withdrawals (= Igra L1→L2 entries — see `l2_withdrawals` note) displaced by a reorg. Mirrors `l2_withdrawals` with reorg_id + orphaned_at prepended.",
+            engines: pg(),
+            columns: vec![
+                col("reorg_id", "INT8", "FK to reorgs.id"),
+                col("orphaned_at", "TIMESTAMPTZ", "When the reorg landed"),
+                col("block_num", "INT8", "Block number on the orphaned chain"),
+                col("address", "BYTEA", "L2 recipient (see l2_withdrawals — this is an entry, not an exit)"),
+                col("amount_sompi", "INT8", "Entry amount in sompi"),
+            ],
+            examples: vec![],
+        },
     ]
 }
 
@@ -383,6 +499,13 @@ mod tests {
             "kaspa_pending_entries",
             "kaspa_l2_submissions",
             "kaspa_entries",
+            "reorgs",
+            "orphaned_blocks",
+            "orphaned_txs",
+            "orphaned_logs",
+            "orphaned_receipts",
+            "orphaned_internal_txs",
+            "orphaned_l2_withdrawals",
         ] {
             assert!(
                 names.contains(allowed),
@@ -411,6 +534,13 @@ mod tests {
             "kaspa_pending_entries",
             "kaspa_l2_submissions",
             "kaspa_entries",
+            "reorgs",
+            "orphaned_blocks",
+            "orphaned_txs",
+            "orphaned_logs",
+            "orphaned_receipts",
+            "orphaned_internal_txs",
+            "orphaned_l2_withdrawals",
         ]
         .into_iter()
         .collect();

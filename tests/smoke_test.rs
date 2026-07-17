@@ -464,7 +464,7 @@ async fn test_sync_state_tip_num_and_synced_num() {
     assert!(state.is_none(), "Should have no state initially");
 
     // Update tip_num (simulates realtime sync)
-    update_tip_num(&db.pool, chain_id, 100, 105).await.expect("Failed to update tip_num");
+    update_tip_num(&db.pool, chain_id, 100, 105, None).await.expect("Failed to update tip_num");
 
     let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
     assert_eq!(state.tip_num, 100, "tip_num should be 100");
@@ -479,7 +479,7 @@ async fn test_sync_state_tip_num_and_synced_num() {
     assert_eq!(state.synced_num, 50, "synced_num should be 50");
 
     // Update tip_num again (realtime advances)
-    update_tip_num(&db.pool, chain_id, 150, 155).await.expect("Failed to update tip_num");
+    update_tip_num(&db.pool, chain_id, 150, 155, None).await.expect("Failed to update tip_num");
 
     let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
     assert_eq!(state.tip_num, 150, "tip_num should advance to 150");
@@ -502,11 +502,11 @@ async fn test_sync_state_only_increases() {
     let chain_id = 99999u64;
 
     // Set initial state
-    update_tip_num(&db.pool, chain_id, 100, 100).await.expect("Failed");
+    update_tip_num(&db.pool, chain_id, 100, 100, None).await.expect("Failed");
     update_synced_num(&db.pool, chain_id, 50).await.expect("Failed");
 
     // Try to set lower values - should be ignored (GREATEST in SQL)
-    update_tip_num(&db.pool, chain_id, 80, 80).await.expect("Failed");
+    update_tip_num(&db.pool, chain_id, 80, 80, None).await.expect("Failed");
     update_synced_num(&db.pool, chain_id, 30).await.expect("Failed");
 
     let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();

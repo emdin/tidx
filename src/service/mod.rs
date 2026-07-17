@@ -17,6 +17,14 @@ pub struct SyncStatus {
     pub synced_num: i64,
     pub tip_num: i64,
     pub lag: i64,
+    /// Current adaptive safety window: a block only enters tidx once it is
+    /// `head_delay_blocks` deep. Consumers (VIL, explorer) should classify
+    /// canonical/orphaned only after a submission's height has passed this
+    /// threshold below the current tip. Distinct from `lag` (which is the
+    /// observed `head - tip` and can spike during backfill). Null on chains
+    /// whose sync loop hasn't ticked since this field landed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_delay_blocks: Option<i64>,
     pub gap_blocks: i64,
     /// Detected gaps in the blocks table: [(start, end), ...]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -60,7 +68,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, head_delay_blocks FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -107,6 +115,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 synced_num,
                 tip_num,
                 lag: row.get::<_, i64>(1) - tip_num, // lag from head to tip (realtime)
+                head_delay_blocks: row.get(7),
                 gap_blocks,
                 gaps: gaps_i64.clone(),
                 backfill_num,
