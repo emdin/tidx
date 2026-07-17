@@ -22,6 +22,13 @@ const ALLOWED_TABLES: &[&str] = &[
     "kaspa_pending_entries",
     "kaspa_l2_submissions",
     "kaspa_entries",
+    "reorgs",
+    "orphaned_blocks",
+    "orphaned_txs",
+    "orphaned_logs",
+    "orphaned_receipts",
+    "orphaned_internal_txs",
+    "orphaned_l2_withdrawals",
 ];
 
 const MAX_QUERY_LENGTH: usize = 65_536;
