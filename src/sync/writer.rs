@@ -1273,38 +1273,25 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
     Ok(gaps)
 }
 
-/// Delete all blocks (and related txs, logs, receipts, withdrawals) from a given block number onwards.
-/// Used for reorg handling - removes orphaned blocks so they can be re-synced.
-/// Returns the number of blocks deleted.
+/// Displace all rows at or after `from_block` — archive them into `orphaned_*`,
+/// record a `reorgs` event, delete from the source tables — all in one
+/// transaction. Callers that need to bundle a `sync_state` rewind or other
+/// side effects should use [`apply_reorg_mutation`] directly on their own
+/// transaction.
+///
+/// Interpretation of `from_block`: the first block to displace, i.e.
+/// `fork_point + 1`. Kept as `u64` for callsite compatibility.
+///
+/// Returns the number of canonical blocks that were removed (matches the
+/// prior contract; equivalent to `reorgs.blocks_removed` for this reorg).
 pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
-    let conn = pool.get().await?;
-    let from_block_i64 = from_block as i64;
-
-    // Delete in order: logs, receipts, txs, withdrawals, blocks (foreign key order)
-    conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
-        .await?;
-    conn.execute(
-        "DELETE FROM receipts WHERE block_num >= $1",
-        &[&from_block_i64],
-    )
-    .await?;
-    conn.execute("DELETE FROM txs WHERE block_num >= $1", &[&from_block_i64])
-        .await?;
-    conn.execute(
-        "DELETE FROM l2_withdrawals WHERE block_num >= $1",
-        &[&from_block_i64],
-    )
-    .await?;
-    conn.execute(
-        "DELETE FROM internal_txs WHERE block_num >= $1",
-        &[&from_block_i64],
-    )
-    .await?;
-    let deleted = conn
-        .execute("DELETE FROM blocks WHERE num >= $1", &[&from_block_i64])
-        .await?;
-
-    Ok(deleted)
+    crate::sync::reorg_archive::ensure_initialized(pool).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let fork_point = (from_block as i64).saturating_sub(1);
+    let result = crate::sync::reorg_archive::apply_reorg_mutation(&tx, fork_point).await?;
+    tx.commit().await?;
+    Ok(result.blocks_removed as u64)
 }
 
 /// Find the fork point by walking back from a mismatch until we find a matching hash.

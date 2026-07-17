@@ -80,5 +80,10 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/extensions.sql"))
         .await?;
 
+    drop(conn);
+    // Fail fast at boot if a source-table migration has drifted from its
+    // orphaned_* twin: the reorg handler would corrupt at 3 a.m. otherwise.
+    crate::sync::reorg_archive::assert_schema_parity(pool).await?;
+
     Ok(())
 }

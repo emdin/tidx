@@ -327,11 +327,55 @@ async fn test3_resubmitted_hash_no_conflict() {
 
 #[tokio::test]
 #[serial(db)]
-#[ignore = "requires apply_reorg_mutation(&Transaction, ...) — added in P3"]
 async fn test4_rollback_leaves_state_clean() {
-    // Deferred: exercises tx.rollback() midway through apply_reorg_mutation,
-    // asserts (a) canonical rows intact, (b) zero orphaned_* rows,
-    // (c) zero reorgs rows. See P3 commit.
+    use tidx::sync::reorg_archive;
+
+    let db = TestDb::empty().await;
+    truncate_all_incl_archive(&db.pool).await;
+    seed_canonical_chain(&db.pool, 1, 10).await;
+
+    reorg_archive::ensure_initialized(&db.pool)
+        .await
+        .expect("init");
+
+    // Open a tx, run the mutation (succeeds — inside tx), then explicit rollback.
+    let mut conn = db.pool.get().await.expect("get conn");
+    let tx = conn.transaction().await.expect("begin tx");
+    let result = reorg_archive::apply_reorg_mutation(&tx, 5)
+        .await
+        .expect("mutation must succeed before rollback exercise");
+    assert_eq!(result.depth, 5);
+    assert_eq!(result.blocks_removed, 5);
+
+    // Simulate caller-side abort (equivalent to any error path after the
+    // mutation completed but before commit).
+    tx.rollback().await.expect("rollback");
+    drop(conn);
+
+    // Canonical rows untouched.
+    assert_eq!(canonical_count(&db.pool, "blocks").await, 10);
+    assert_eq!(canonical_count(&db.pool, "txs").await, 10);
+    assert_eq!(canonical_count(&db.pool, "logs").await, 10);
+    assert_eq!(canonical_count(&db.pool, "receipts").await, 10);
+    assert_eq!(canonical_count(&db.pool, "internal_txs").await, 10);
+    assert_eq!(canonical_count(&db.pool, "l2_withdrawals").await, 10);
+
+    // Archive rows gone (the tx that inserted them rolled back).
+    assert_eq!(archive_count(&db.pool, "orphaned_blocks").await, 0);
+    assert_eq!(archive_count(&db.pool, "orphaned_txs").await, 0);
+    assert_eq!(archive_count(&db.pool, "orphaned_logs").await, 0);
+    assert_eq!(archive_count(&db.pool, "orphaned_receipts").await, 0);
+    assert_eq!(archive_count(&db.pool, "orphaned_internal_txs").await, 0);
+    assert_eq!(archive_count(&db.pool, "orphaned_l2_withdrawals").await, 0);
+
+    // reorgs event row gone too — no orphan reorg_id references.
+    let conn2 = db.pool.get().await.expect("get conn");
+    let reorgs_count: i64 = conn2
+        .query_one("SELECT count(*) FROM reorgs", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(reorgs_count, 0, "reorgs row must roll back with the archive");
 }
 
 // ---------------------------------------------------------------------------
