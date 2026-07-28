@@ -17,9 +17,13 @@ port = 9090
 name = "igra"
 chain_id = 38833
 
-# Igra L2 Ethereum-compatible JSON-RPC. This is the source for L2 blocks,
-# transactions, receipts, logs, balances, and contract bytecode.
-rpc_url = "https://rpc.igralabs.com:8545"
+# Igra L2 Ethereum-compatible JSON-RPC. Goes through the local Caddy
+# failover proxy on :18545 (see Caddyfile), which load-balances with
+# lb_policy=first across operator's own node (fastest) then Igra Labs
+# official. Automatic failover; ~1 ms hop overhead.
+# Disaster fallback (manual swap if Caddy fails): "https://nrs.pub/38833"
+# (much slower, but multi-upstream discovery service).
+rpc_url = "http://caddy:18545"
 pg_url = "postgres://tidx@postgres:5432/tidx_igra"
 pg_password_env = "POSTGRES_PASSWORD"
 backfill = true
