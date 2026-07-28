@@ -21,6 +21,49 @@
 	handle /grafana* {
 		reverse_proxy grafana:3000
 	}
+	handle_path /briefs/* {
+		root * /srv/briefs
+		file_server
+		@md path *.md
+		header @md Content-Type "text/markdown; charset=utf-8"
+	}
 	redir / /explore
 	reverse_proxy tidx:8080
+}
+
+bubundler.jobberwocky.co {
+	reverse_proxy 172.18.0.1:4338
+}
+
+domiki.jobberwocky.co {
+	reverse_proxy 172.18.0.1:8000
+}
+
+genesis-api.igralabs.com {
+	reverse_proxy 172.18.0.1:3010
+}
+
+# Internal-only JSON-RPC failover proxy for Igra L2.
+# Reachable from inside iidx-prod_default at http://caddy:18545.
+# Order: operator's own node (fastest, p99 ~45 ms) -> Igra Labs
+# official. lb_policy=first keeps tidx on the fastest healthy
+# upstream. Passive health: 2 fails in 30 s = skip that upstream
+# for 30 s before re-trying.
+# NOTE: nrs.pub/38833 is NOT in the upstream list — Caddy's
+# reverse_proxy doesn't support upstream URLs with a path component
+# ("only scheme, host, and port"). nrs.pub remains as documented
+# manual-swap-during-disaster only.
+http://:18545 {
+	reverse_proxy https://igra-mainnet.jobberwocky.co https://rpc.igralabs.com:8545 {
+		lb_policy first
+		lb_try_duration 5s
+		lb_try_interval 250ms
+		fail_duration 30s
+		max_fails 2
+		# Both upstreams are virtual-hosted — without rewriting Host
+		# they return 404 because they see "caddy:18545" / "tidx" /
+		# whatever the client sent. {upstream_hostport} resolves to
+		# the upstream's own host:port per request.
+		header_up Host {upstream_hostport}
+	}
 }
