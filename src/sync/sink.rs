@@ -221,7 +221,24 @@ impl SinkSet {
         // walking. If there ARE gaps (rare — realtime tick failures leaving
         // holes), fall through to the normal walk from `cursor + 1` so the
         // gaps get filled.
-        let ch_max = ch.max_block_num().await?.unwrap_or(0);
+        // Take the minimum max-block across the four DENSE backfilled tables
+        // (every canonical block has entries in blocks/txs/logs/receipts under
+        // normal operation; l2_withdrawals is skipped — sparse Igra-entry table
+        // with ~6k rows across 13M blocks). If any dense table lags — because
+        // realtime crashed mid-write, or a past partial-fill left it behind —
+        // the guard won't advance past that table's max, preserving the
+        // existing recovery-via-rewalk behavior for those blocks. An empty
+        // table (None) pins ch_max=0 so backfill walks from the persisted cursor.
+        let (blocks_max, txs_max, logs_max, receipts_max) = tokio::try_join!(
+            ch.max_block_in_table("blocks"),
+            ch.max_block_in_table("txs"),
+            ch.max_block_in_table("logs"),
+            ch.max_block_in_table("receipts"),
+        )?;
+        let ch_max = match (blocks_max, txs_max, logs_max, receipts_max) {
+            (Some(b), Some(t), Some(l), Some(r)) => b.min(t).min(l).min(r),
+            _ => 0,
+        };
         if ch_max > cursor {
             let expected = (ch_max - cursor) as u64;
             let present = ch.unique_blocks_in_range(cursor + 1, ch_max).await?;

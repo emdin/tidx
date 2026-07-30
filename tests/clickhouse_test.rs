@@ -1758,3 +1758,160 @@ async fn test_backfill_idempotent() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
     assert_eq!(ch.table_count("txs").await.unwrap(), 10);
 }
+
+/// Regression for the CH row-count inflation bug: when realtime has already
+/// written past the persisted cursor with a contiguous range, backfill must
+/// advance the cursor without re-walking (which would double every block via
+/// ReplacingMergeTree's async merge).
+///
+/// Failure mode without the guard: `backfill_clickhouse` would walk from
+/// cursor+1=6 to pg_max=20, re-writing blocks 6..=15 that CH already has,
+/// leaving 10 pre-merge duplicates observable to `SELECT count()`.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_advances_cursor_past_realtime_writes() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    // PG has full data for 1..=20 (source of truth for backfill).
+    let blocks: Vec<BlockRow> = (1..=20).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=20).map(|b| make_tx(b, 0)).collect();
+    let logs: Vec<LogRow> = (1..=20).map(|b| make_log(b, 0)).collect();
+    let receipts: Vec<ReceiptRow> = (1..=20).map(|b| make_receipt(b, 0)).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    // Simulate realtime already writing 1..=15 across ALL four dense tables
+    // (matches production behavior — realtime's write_all is transactional
+    // across tables). The guard is intentionally conservative: it only
+    // advances when every dense table has caught up, so this all-4 writer
+    // is required to exercise the fast path.
+    let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).unwrap();
+    let rt_blocks: Vec<BlockRow> = (1..=15).map(make_block).collect();
+    let rt_txs: Vec<TxRow> = (1..=15).map(|b| make_tx(b, 0)).collect();
+    let rt_logs: Vec<LogRow> = (1..=15).map(|b| make_log(b, 0)).collect();
+    let rt_receipts: Vec<ReceiptRow> = (1..=15).map(|b| make_receipt(b, 0)).collect();
+    ch_sink.write_blocks(&rt_blocks).await.unwrap();
+    ch_sink.write_txs(&rt_txs).await.unwrap();
+    ch_sink.write_logs(&rt_logs).await.unwrap();
+    ch_sink.write_receipts(&rt_receipts).await.unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 15);
+
+    // Cursor is behind — as if a past restart persisted a stale value.
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 5).await;
+
+    // Stop merges on the `blocks` table so any duplicate INSERTs from the
+    // backfill remain observable to `count()`. Without this, CH's async merge
+    // on a small table collapses ReplacingMergeTree duplicates before our
+    // assertion — the count check would pass falsely.
+    ch.query_raw(&format!("SYSTEM STOP MERGES {SINK_DB}.blocks"))
+        .await
+        .unwrap();
+
+    // Run backfill. With the guard: cursor advances 5→15 without walking, then
+    // walks 16..=20 normally. Total INSERTs land 5 new blocks. CH `blocks`
+    // should be exactly 20 rows (15 from realtime + 5 from backfill).
+    // WITHOUT the guard: backfill walks 6..=20, re-INSERTing 6..=15 which are
+    // already in CH. With merges stopped, that's 15 + 15 = 30 rows (dupes on
+    // 6..=15). The count assertion below catches this.
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
+
+    let ch_count = ch.table_count("blocks").await.unwrap();
+    // Restart merges before assert so cleanup after failure is clean.
+    ch.query_raw(&format!("SYSTEM START MERGES {SINK_DB}.blocks"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ch_count, 20,
+        "no duplicates: guard should have skipped re-writing 6..=15 \
+         (got {ch_count} instead of 20 — inflation bug reintroduced?)"
+    );
+
+    // Cursor should have advanced to pg_max (20).
+    let conn = pool.get().await.unwrap();
+    let cursor: i64 = conn
+        .query_one(
+            "SELECT ch_backfill_block FROM sync_state WHERE chain_id = $1",
+            &[&(TEST_CHAIN_ID as i64)],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(cursor, 20, "cursor should end at pg_max after full walk");
+}
+
+/// The guard's safety fallback: when CH has GAPS above the cursor (realtime
+/// tick failures leaving holes), the cursor must NOT jump past them — walk
+/// normally so the gaps get filled. Duplicates on already-written blocks
+/// are the acceptable cost of the safety fallback (ReplacingMergeTree
+/// eventually folds them).
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_walks_when_ch_has_gaps() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    // PG has 1..=20 across all dense tables.
+    let blocks: Vec<BlockRow> = (1..=20).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=20).map(|b| make_tx(b, 0)).collect();
+    let logs: Vec<LogRow> = (1..=20).map(|b| make_log(b, 0)).collect();
+    let receipts: Vec<ReceiptRow> = (1..=20).map(|b| make_receipt(b, 0)).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    // Simulate realtime writing 1..=15 across all dense tables with a gap at
+    // 7..=9 in `blocks` only (tick failed to fetch just the header for those).
+    // Guard should see 12 unique blocks in [1,15] vs expected 15, fall through
+    // to the walk from cursor+1 so the gap gets filled.
+    let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).unwrap();
+    let gappy_blocks: Vec<BlockRow> = (1..=15)
+        .filter(|n| !(7..=9).contains(n))
+        .map(make_block)
+        .collect();
+    let rt_txs: Vec<TxRow> = (1..=15).map(|b| make_tx(b, 0)).collect();
+    let rt_logs: Vec<LogRow> = (1..=15).map(|b| make_log(b, 0)).collect();
+    let rt_receipts: Vec<ReceiptRow> = (1..=15).map(|b| make_receipt(b, 0)).collect();
+    ch_sink.write_blocks(&gappy_blocks).await.unwrap();
+    ch_sink.write_txs(&rt_txs).await.unwrap();
+    ch_sink.write_logs(&rt_logs).await.unwrap();
+    ch_sink.write_receipts(&rt_receipts).await.unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 12); // 15 - 3 gap
+
+    // Cursor lags behind, gap exists above it.
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 5).await;
+
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
+
+    // Because there was a gap, the guard falls through to walking from
+    // cursor+1=6. That fills the missing 7..=9 AND re-writes the already-
+    // present 6, 10..=15 (dupes there are the safety trade-off; FINAL
+    // reconciles them). uniqExact(num) is what actually matters.
+    let unique_blocks = ch_sink.unique_blocks_in_range(1, 20).await.unwrap();
+    assert_eq!(
+        unique_blocks, 20,
+        "all 20 unique block heights should be present after gap-fill walk"
+    );
+
+    let conn = pool.get().await.unwrap();
+    let cursor: i64 = conn
+        .query_one(
+            "SELECT ch_backfill_block FROM sync_state WHERE chain_id = $1",
+            &[&(TEST_CHAIN_ID as i64)],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(cursor, 20, "cursor should still reach pg_max after walk");
+}
