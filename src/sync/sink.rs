@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -170,13 +170,28 @@ impl SinkSet {
 
     /// Automatically backfill ClickHouse from PostgreSQL if CH is behind.
     ///
-    /// Uses a persistent cursor (`ch_backfill_block`) in the PG `sync_state` table
-    /// to track progress. This avoids the race condition where realtime sync writes
-    /// blocks ahead of the backfill position, causing `max(block_num)` to skip gaps.
+    /// Uses a persistent cursor (`ch_backfill_block`) in the PG `sync_state`
+    /// table to track backfill-side progress. This avoids the race where
+    /// realtime writes to CH would push `max(block_num)` ahead of the last
+    /// backfilled block, causing the backfill to skip an unfinished range
+    /// after a crash (fixed in PR #107).
     ///
-    /// All four tables (blocks, txs, logs, receipts) are backfilled together per
-    /// block range. The cursor advances only after all tables succeed for that range.
-    /// Tables use ReplacingMergeTree so re-inserts after a crash are safe.
+    /// PR #107 introduced a symmetrical bug: the cursor only advances when
+    /// backfill itself writes, so on any restart where realtime has written
+    /// far past the persisted cursor, backfill re-walks the whole range and
+    /// double-writes every block. ReplacingMergeTree merges are async so
+    /// duplicates stay observable to `COUNT`/`SUM` queries until a merge
+    /// (or `FINAL`) folds them.
+    ///
+    /// Guard added here: before walking, check whether CH already contains
+    /// every block in `[cursor+1, ch_max]` contiguously. If so, bump the
+    /// persisted cursor to `ch_max` without walking. If gaps exist, walk
+    /// normally so they get filled.
+    ///
+    /// All five backfilled tables (blocks, txs, logs, receipts,
+    /// l2_withdrawals) are written together per batch. The cursor advances
+    /// only after all tables succeed for that batch. Tables use
+    /// ReplacingMergeTree so re-inserts after a crash are (eventually) safe.
     pub async fn backfill_clickhouse(&self, chain_id: u64) -> Result<()> {
         let ch = match &self.ch {
             Some(ch) => ch,
@@ -189,8 +204,47 @@ impl SinkSet {
             None => return Ok(()), // PG is empty, nothing to backfill
         };
 
-        // Load persisted cursor from PG (survives restarts)
-        let cursor = load_ch_backfill_cursor(&self.pool, chain_id).await?;
+        // Load persisted cursor from PG (survives restarts).
+        let mut cursor = load_ch_backfill_cursor(&self.pool, chain_id).await?;
+
+        // Guard against re-walking blocks that realtime already wrote to CH.
+        // The persistent cursor is only advanced by the backfill loop's own
+        // writes (see `save_ch_backfill_cursor`). Realtime writes CH concurrently
+        // and doesn't touch the cursor, so on any restart where realtime has
+        // caught up while the cursor lagged, the naive `from = cursor + 1`
+        // re-walks the whole range and writes a duplicate row per block
+        // (ReplacingMergeTree merges are async so the dupes stay observable
+        // to COUNT queries — dev-facing bug: CH counts inflate 40-50%).
+        //
+        // Safe advance: if CH already contains every block in [cursor+1, ch_max]
+        // contiguously, bump the persisted cursor past `ch_max` without
+        // walking. If there ARE gaps (rare — realtime tick failures leaving
+        // holes), fall through to the normal walk from `cursor + 1` so the
+        // gaps get filled.
+        let ch_max = ch.max_block_num().await?.unwrap_or(0);
+        if ch_max > cursor {
+            let expected = (ch_max - cursor) as u64;
+            let present = ch.unique_blocks_in_range(cursor + 1, ch_max).await?;
+            if present == expected {
+                info!(
+                    chain_id,
+                    old_cursor = cursor,
+                    ch_max,
+                    "Advancing CH backfill cursor past realtime's contiguous writes"
+                );
+                save_ch_backfill_cursor(&self.pool, chain_id, ch_max).await?;
+                cursor = ch_max;
+            } else {
+                warn!(
+                    chain_id,
+                    cursor,
+                    ch_max,
+                    missing = expected - present,
+                    "Realtime CH has gaps above cursor; walking from cursor+1 (will re-write present blocks and rely on ReplacingMergeTree)"
+                );
+            }
+        }
+
         let from_block = cursor + 1;
 
         if from_block > pg_max {
