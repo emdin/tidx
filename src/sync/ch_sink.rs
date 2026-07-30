@@ -376,6 +376,24 @@ impl ClickHouseSink {
         Ok(Some(max))
     }
 
+    /// Count how many distinct block heights are present in `blocks` between
+    /// `from..=to`. Used by the backfill loop to check whether realtime has
+    /// already written a contiguous range past the persisted cursor — if the
+    /// count equals `to - from + 1` there are no gaps and the cursor can
+    /// advance without re-walking.
+    pub async fn unique_blocks_in_range(&self, from: i64, to: i64) -> Result<u64> {
+        let sql = format!(
+            "SELECT uniqExact(num) FROM blocks WHERE num >= {from} AND num <= {to}"
+        );
+        let n: u64 = self
+            .client
+            .query(&sql)
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(n)
+    }
+
     /// Query the row count for a specific table.
     pub async fn row_count(&self, table: &str) -> Result<u64> {
         let table = validate_table_name(table)?;
