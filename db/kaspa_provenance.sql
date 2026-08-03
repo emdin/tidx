@@ -95,6 +95,56 @@ ALTER TABLE kaspa_l2_submissions
     ADD COLUMN IF NOT EXISTS l1_sender_amounts_sompi INT8[],
     ADD COLUMN IF NOT EXISTS l1_enriched_at          TIMESTAMPTZ;
 
+-- L1 miner fee, in sompi, paid by the carrier tx = sum(inputs) - sum(outputs).
+-- Filled either at insertion time by the realtime writer (from the block data
+-- it already has) or after-the-fact by the enrich-l1-fees CLI walking kaspad.
+-- Nullable — NULL means "not enriched yet." Backfill is scoped to whatever
+-- kaspad-mainnet's retention window covers (default 30d, currently 130d).
+ALTER TABLE kaspa_entries
+    ADD COLUMN IF NOT EXISTS l1_fee_sompi         INT8,
+    ADD COLUMN IF NOT EXISTS l1_fee_enriched_at   TIMESTAMPTZ;
+
+ALTER TABLE kaspa_l2_submissions
+    ADD COLUMN IF NOT EXISTS l1_fee_sompi         INT8,
+    ADD COLUMN IF NOT EXISTS l1_fee_enriched_at   TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_kaspa_entries_fee_pending
+    ON kaspa_entries (kaspa_txid)
+    WHERE l1_fee_sompi IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_kaspa_l2_submissions_fee_pending
+    ON kaspa_l2_submissions (kaspa_txid)
+    WHERE l1_fee_sompi IS NULL;
+
+-- kaspa_tx_index: (txid → block_hash) mapping for every Kaspa tx we observe.
+-- The minimum missing primitive vs kaspad's native RPC: without this we can
+-- only get a tx by walking blocks, but *with* this any tx-by-id lookup is
+-- one PG query + one kaspad getBlock. Enables local fee computation
+-- (fee = sum(inputs.previousOutpoint amounts) - sum(outputs.amounts))
+-- without an external API dependency.
+--
+-- Populated by:
+--  (1) realtime sync — every block processed, upsert its full tx list
+--  (2) backfill CLI — walk kaspad backward for the retention window
+--
+-- Storage: ~40 bytes/row (txid + block_hash + PK overhead). At ~5 txs/block
+-- × Kaspa's ~10 bps, that's ~4M rows/day = ~160 MB/day. 30-day window ~5 GB.
+CREATE TABLE IF NOT EXISTS kaspa_tx_index (
+    txid       BYTEA PRIMARY KEY,
+    block_hash BYTEA NOT NULL,
+    -- The accepting block's daaScore, if known. Helps age-based pruning +
+    -- retention-boundary checks (skip enrichment for txs below the window).
+    daa_score  INT8,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_kaspa_tx_index_block_hash
+    ON kaspa_tx_index (block_hash);
+
+CREATE INDEX IF NOT EXISTS idx_kaspa_tx_index_daa_score
+    ON kaspa_tx_index (daa_score)
+    WHERE daa_score IS NOT NULL;
+
 -- GIN partial indexes for "find all enriched rows that involve L1 address X".
 CREATE INDEX IF NOT EXISTS idx_kaspa_entries_l1_senders_gin
     ON kaspa_entries USING gin (l1_senders)
