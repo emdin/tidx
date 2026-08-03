@@ -4,6 +4,7 @@ pub mod backfill_kaspa_tx_index;
 pub mod backfill_receipt_data;
 pub mod backfill_traces;
 pub mod backfill_withdrawals;
+pub mod enrich_l1_fees;
 pub mod enrich_l1_senders;
 pub mod import_blockscout;
 pub mod init;
@@ -57,6 +58,11 @@ pub enum Commands {
     /// previous-outpoint addresses. Idempotent (only touches rows where
     /// l1_senders IS NULL).
     EnrichL1Senders(enrich_l1_senders::Args),
+    /// Populate l1_fee_sompi columns on kaspa_* tables via LOCAL kaspad
+    /// + kaspa_tx_index (no external API). Requires kaspa_tx_index to be
+    /// populated first (`tidx backfill-kaspa-tx-index`). Idempotent (only
+    /// touches rows where l1_fee_sompi IS NULL).
+    EnrichL1Fees(enrich_l1_fees::Args),
     /// Import verified contracts from a Blockscout explorer into local explorer metadata
     ImportBlockscout(import_blockscout::Args),
     /// Update tidx to the latest version
