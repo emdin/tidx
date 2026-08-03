@@ -60,6 +60,19 @@ pub struct Args {
     /// Don't write; only count rows that would be inserted.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// After the initial walk catches up, keep polling kaspad for new
+    /// chain blocks and index them as they arrive. Runs forever until
+    /// killed. Use as a lightweight sidecar to the main indexer — cheap
+    /// (a few block fetches every 10s in steady state) and decoupled
+    /// from the sync hot path.
+    #[arg(long)]
+    pub follow: bool,
+
+    /// In `--follow` mode: seconds between polls of `get_block_dag_info`
+    /// once caught up.
+    #[arg(long, default_value = "10")]
+    pub follow_interval_secs: u64,
 }
 
 #[derive(Default, Debug)]
@@ -128,6 +141,12 @@ pub async fn run(args: Args) -> Result<()> {
         warn!("DRY RUN — counts only, no writes to the database.");
     }
 
+    let follow_interval = if args.follow {
+        Some(Duration::from_secs(args.follow_interval_secs))
+    } else {
+        None
+    };
+
     let stats = walk_and_index(
         &client,
         pool.as_ref(),
@@ -135,6 +154,7 @@ pub async fn run(args: Args) -> Result<()> {
         args.max_blocks,
         args.batch_size,
         args.dry_run,
+        follow_interval,
     )
     .await?;
 
@@ -161,6 +181,7 @@ async fn walk_and_index(
     max_blocks: Option<u64>,
     batch_size: usize,
     dry_run: bool,
+    follow_interval: Option<Duration>,
 ) -> Result<WalkStats> {
     let mut stats = WalkStats::default();
     let mut cursor = start_hash;
@@ -175,7 +196,28 @@ async fn walk_and_index(
             .with_context(|| format!("get_virtual_chain_from_block from {cursor}"))?;
 
         if resp.added_chain_block_hashes.is_empty() {
-            break;
+            // Caught up to the sink. Flush any buffered rows, then either
+            // exit (one-shot mode) or sleep and poll again (follow mode).
+            flush(pool, dry_run, &mut pending, &mut stats).await?;
+            match follow_interval {
+                None => break,
+                Some(dt) => {
+                    info!(
+                        cursor = %cursor,
+                        sleep_secs = dt.as_secs(),
+                        visited_dropped = visited.len(),
+                        "caught up; sleeping before next follow poll"
+                    );
+                    // Bound memory over long follow runs. The dedup was
+                    // only correct-critical within one page (chain block
+                    // + mergeset overlap); across polls we'd only save
+                    // wasted RPCs on rare mergeset re-appearance —
+                    // negligible vs unbounded HashSet growth.
+                    visited.clear();
+                    tokio::time::sleep(dt).await;
+                    continue;
+                }
+            }
         }
 
         for chain_block_hash in &resp.added_chain_block_hashes {
