@@ -2,13 +2,21 @@
 //! Kaspa wRPC node's virtual chain (chain blocks + mergeset blocks) and
 //! upserting every tx's `(txid, block_hash, daa_score)`.
 //!
-//! Why this exists: kaspad's native gRPC/wRPC does not expose a "get tx by
-//! id" method. Its `getBlock(hash, true)` returns tx inputs as
-//! `previousOutpoint` references with NO resolved amounts. To compute
-//! `fee = sum(inputs) - sum(outputs)` locally we need a txid → block_hash
-//! mapping, so we can then `getBlock` on that hash and read the referenced
-//! output amount. This CLI populates that mapping for a historical window;
-//! realtime sync keeps it fresh going forward.
+//! Why this exists: kaspad's RPC exposes `GetBlock(hash, true)` which
+//! returns a tx with inputs as bare `previousOutpoint` refs (no resolved
+//! amounts), and `GetUtxoReturnAddress(txid, daa)` which returns only one
+//! address. Neither returns a confirmed tx's inputs with resolved amounts,
+//! which is what `fee = sum(inputs) - sum(outputs)` needs. Our
+//! `kaspa_tx_index` bridges the gap: (txid → block_hash) lets us walk
+//! each input's prev tx via `getBlock` and read the output at the
+//! referenced index locally.
+//!
+//! The walk is two-phase to cover kaspad's full retention window:
+//!   1. Backward pass: from pruning_point through `selected_parent_hash`
+//!      until we've covered `--walk-back-days` (default 30) or hit the
+//!      retention floor.
+//!   2. Forward pass: from pruning_point via `get_virtual_chain_from_block`
+//!      up to the current sink. Plus `--follow` mode for realtime.
 //!
 //! Idempotent: `ON CONFLICT (txid) DO NOTHING`. Safe to re-run over any
 //! overlapping window.
@@ -73,6 +81,16 @@ pub struct Args {
     /// once caught up.
     #[arg(long, default_value = "10")]
     pub follow_interval_secs: u64,
+
+    /// How many days of history to walk BACKWARD from the pruning point
+    /// via `selected_parent_hash` before the forward pass. Kaspad's
+    /// `--retention-period-days` extends `GetBlock` beyond the pruning
+    /// point; without this pass we'd only index the ~1-2 days between
+    /// pruning_point and virtual sink. 0 = skip the backward pass.
+    /// Set higher than kaspad's actual retention → walk stops naturally
+    /// when kaspad returns "block not found."
+    #[arg(long, default_value = "30.0")]
+    pub walk_back_days: f64,
 }
 
 #[derive(Default, Debug)]
@@ -147,7 +165,42 @@ pub async fn run(args: Args) -> Result<()> {
         None
     };
 
-    let stats = walk_and_index(
+    // Phase 1 — backward walk. Only relevant when the user asked for it and
+    // when start_hash is at the pruning point (the natural place to walk
+    // back from). If the user supplied an explicit --start-hash, skip
+    // backward: the caller knows what they want.
+    let mut aggregate = WalkStats::default();
+    if args.walk_back_days > 0.0 && args.start_hash.is_none() {
+        // 10 blocks/s × 86400 s/day = 864_000 DAA/day. Kaspa's BPS may
+        // vary; the exact conversion isn't safety-critical — walk stops
+        // when kaspad no longer serves a hash regardless of DAA.
+        let max_daa_span = (args.walk_back_days * 864_000.0).ceil() as u64;
+        info!(
+            walk_back_days = args.walk_back_days,
+            max_daa_span, "starting backward walk from pruning point"
+        );
+        let back = walk_backward_and_index(
+            &client,
+            pool.as_ref(),
+            start_hash,
+            max_daa_span,
+            args.batch_size,
+            args.dry_run,
+        )
+        .await?;
+        info!(
+            chain_blocks = back.chain_blocks,
+            mergeset_blocks = back.mergeset_blocks,
+            txs_seen = back.txs_seen,
+            rows_inserted = back.rows_inserted,
+            "Backward walk complete"
+        );
+        merge_stats(&mut aggregate, &back);
+    }
+
+    // Phase 2 — forward walk from pruning point (or the user-supplied
+    // start_hash) to the sink, then optional --follow.
+    let fwd = walk_and_index(
         &client,
         pool.as_ref(),
         start_hash,
@@ -157,15 +210,23 @@ pub async fn run(args: Args) -> Result<()> {
         follow_interval,
     )
     .await?;
+    merge_stats(&mut aggregate, &fwd);
 
     info!(
-        chain_blocks = stats.chain_blocks,
-        mergeset_blocks = stats.mergeset_blocks,
-        txs_seen = stats.txs_seen,
-        rows_inserted = stats.rows_inserted,
-        "Backfill complete"
+        chain_blocks = aggregate.chain_blocks,
+        mergeset_blocks = aggregate.mergeset_blocks,
+        txs_seen = aggregate.txs_seen,
+        rows_inserted = aggregate.rows_inserted,
+        "Backfill complete (backward + forward)"
     );
     Ok(())
+}
+
+fn merge_stats(into: &mut WalkStats, from: &WalkStats) {
+    into.chain_blocks += from.chain_blocks;
+    into.mergeset_blocks += from.mergeset_blocks;
+    into.txs_seen += from.txs_seen;
+    into.rows_inserted += from.rows_inserted;
 }
 
 /// Walk the virtual chain forward from `start_hash`, fetch every chain
@@ -272,6 +333,125 @@ async fn walk_and_index(
     }
 
     // Final flush.
+    flush(pool, dry_run, &mut pending, &mut stats).await?;
+    Ok(stats)
+}
+
+/// Walk BACKWARD from `start_hash` via `verbose_data.selected_parent_hash`,
+/// indexing each visited chain block + its mergeset. Stops when kaspad
+/// stops serving a hash (natural retention-floor detection) or when we've
+/// covered `max_daa_span` DAA units below the start.
+///
+/// Mergeset block fetch failures are non-fatal — the mergeset may span
+/// slightly past the retention floor, and we don't want a stray missing
+/// block to halt the whole walk. The chain-parent fetch failure IS
+/// terminal (we can't walk further back without the block's own verbose
+/// data).
+async fn walk_backward_and_index(
+    client: &kaspa_wrpc_client::KaspaRpcClient,
+    pool: Option<&db::Pool>,
+    start_hash: RpcHash,
+    max_daa_span: u64,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<WalkStats> {
+    let mut stats = WalkStats::default();
+    let mut cursor = start_hash;
+    let mut visited: HashSet<[u8; 32]> = HashSet::new();
+    let mut pending: Vec<TxIndexRow> = Vec::with_capacity(batch_size);
+    let mut start_daa: Option<u64> = None;
+    let mut last_progress_log = std::time::Instant::now();
+
+    loop {
+        // Fetch the current chain block with transactions AND verbose data.
+        // `include_transactions=true` gives us both in one round-trip.
+        let block = match client.get_block(cursor, true).await {
+            Ok(b) => b,
+            Err(e) => {
+                info!(
+                    hash = %cursor,
+                    err = %e,
+                    "backward walk stopping at retention floor (kaspad no longer serves this hash)"
+                );
+                break;
+            }
+        };
+
+        let daa = block.header.daa_score;
+        let start = *start_daa.get_or_insert(daa);
+        let covered = start.saturating_sub(daa);
+        if covered > max_daa_span {
+            info!(
+                covered_daa = covered,
+                max_daa_span, "backward walk reached configured max DAA span"
+            );
+            break;
+        }
+
+        stats.chain_blocks += 1;
+
+        // Chain block itself.
+        if visited.insert(cursor.as_bytes()) {
+            let daa_i64 = i64::try_from(daa).ok();
+            let rows = tx_index::extract_rows(cursor.as_bytes(), daa_i64, &block.transactions);
+            stats.txs_seen += rows.len() as u64;
+            pending.extend(rows);
+        }
+
+        // Extract mergeset hashes + selected parent from verbose_data.
+        let Some(verbose) = block.verbose_data else {
+            warn!(
+                hash = %cursor,
+                "block missing verbose_data; cannot walk further back"
+            );
+            break;
+        };
+
+        // Mergeset — non-fatal on missing.
+        for mh in verbose
+            .merge_set_blues_hashes
+            .iter()
+            .chain(verbose.merge_set_reds_hashes.iter())
+            .copied()
+        {
+            stats.mergeset_blocks += 1;
+            if let Err(e) = index_block(client, mh, &mut visited, &mut pending, &mut stats).await
+            {
+                warn!(
+                    hash = %mh,
+                    err = %e,
+                    "mergeset block unfetchable during backward walk (likely spans retention floor); skipping"
+                );
+            }
+        }
+
+        // Flush batches as they fill.
+        if pending.len() >= batch_size {
+            flush(pool, dry_run, &mut pending, &mut stats).await?;
+        }
+
+        if last_progress_log.elapsed() >= Duration::from_secs(20) {
+            info!(
+                chain_blocks = stats.chain_blocks,
+                mergeset_blocks = stats.mergeset_blocks,
+                txs_seen = stats.txs_seen,
+                rows_inserted = stats.rows_inserted,
+                current_daa = daa,
+                covered_daa = covered,
+                cursor = %cursor,
+                "backward progress"
+            );
+            last_progress_log = std::time::Instant::now();
+        }
+
+        // Step: walk to the selected parent. All-zeros hash = genesis.
+        if verbose.selected_parent_hash.as_bytes() == [0u8; 32] {
+            info!("backward walk hit genesis (null selected_parent)");
+            break;
+        }
+        cursor = verbose.selected_parent_hash;
+    }
+
     flush(pool, dry_run, &mut pending, &mut stats).await?;
     Ok(stats)
 }
