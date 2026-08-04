@@ -124,7 +124,7 @@ async fn run_once(
         }
 
         let update = if use_v2 {
-            fetch_chain_update_v2(&client, &checkpoint, tip_distance).await?
+            fetch_chain_update_v2(&client, &checkpoint, tip_distance, parser.as_ref()).await?
         } else {
             fetch_chain_update_v1(&client, &checkpoint, parser.as_ref()).await?
         };
@@ -198,6 +198,11 @@ fn parse_kaspa_version(s: &str) -> Option<(u16, u16, u16)> {
 /// keeping only those whose Kaspa txid begins with the configured Igra prefix. Chain
 /// blocks with no prefix-matching accepted txs are absent from the result entirely so
 /// callers can skip the per-block `get_block` round-trip.
+///
+/// **Kept only for tests and historical reference.** Live sync no longer uses this —
+/// the accepted-txid filter was too restrictive (missed ~20% of 97b1-prefix L1 txs
+/// that live in mergeset-red blocks; see [`collect_prefix_txs_from_slice`]).
+#[cfg_attr(not(test), allow(dead_code))]
 fn group_prefixed_accepted_txids(
     response: &kaspa_rpc_core::GetVirtualChainFromBlockResponse,
     parser: &IgraPayloadParser,
@@ -218,9 +223,105 @@ fn group_prefixed_accepted_txids(
     out
 }
 
+/// Scan a slice of `RpcTransaction` and append every one whose txid starts with
+/// the Igra prefix to `out`. Uses `visited` to dedup within a single chain-block
+/// unit (chain block + all its mergeset blocks) — a tx included both in the
+/// chain block body and in a mergeset gets appended only once.
+///
+/// Why this replaces `drain_matching_txs`: the older code filtered by whether
+/// the txid was in kaspad's `accepted_transaction_ids` list. But that list only
+/// includes txs the chain block VOTED FOR (blue mergeset + own body). Igra L2
+/// processes EVERY 97b1-prefix Kaspa tx in the DAG, including ones in
+/// mergeset-red blocks that never got chain-accepted. Filtering by
+/// accepted_transaction_ids drops ~20% of production 97b1 traffic — measured
+/// against tidx.igralabs.com on 2026-08-04: 26,591 of 134,614 recent
+/// 97b1-prefix txs never made it into `kaspa_l2_submissions`. The txs are
+/// on-chain, the parser accepts them (0x4/0x5), and the L2 tx hashes they
+/// carry exist in `txs` — they just weren't in `accepted_transaction_ids`.
+fn collect_prefix_txs_from_slice(
+    txs: &[kaspa_rpc_core::RpcTransaction],
+    parser: &IgraPayloadParser,
+    visited: &mut HashSet<[u8; 32]>,
+    out: &mut Vec<AcceptedTx>,
+) {
+    for tx in txs {
+        let Some(verbose) = &tx.verbose_data else {
+            continue;
+        };
+        let txid: [u8; 32] = verbose.transaction_id.as_bytes();
+        if !parser.txid_matches(&txid) {
+            continue;
+        }
+        if !visited.insert(txid) {
+            continue;
+        }
+        out.push(AcceptedTx {
+            txid,
+            payload: tx.payload.clone(),
+        });
+    }
+}
+
+/// Fetch a chain block and every block in its mergeset (blues + reds), then
+/// collect every 97b1-prefix tx from any of them. Returns `(accepted_at,
+/// daa_score, txs)`.
+///
+/// This is the sole "which Kaspa L1 txs did this chain block introduce to the
+/// Igra L2's view" primitive. Both the v1 and v2 fetch paths call it for each
+/// added chain block.
+async fn expand_and_collect_igra_txs(
+    client: &KaspaRpcClient,
+    chain_block_hash: kaspa_rpc_core::RpcHash,
+    parser: &IgraPayloadParser,
+) -> Result<(DateTime<Utc>, u64, Vec<AcceptedTx>)> {
+    let chain_block = client
+        .get_block(chain_block_hash, true)
+        .await
+        .with_context(|| {
+            format!(
+                "get_block failed for chain block {}",
+                chain_block_hash
+            )
+        })?;
+
+    let accepted_at = i64::try_from(chain_block.header.timestamp)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or_else(Utc::now);
+    let daa_score = chain_block.header.daa_score;
+
+    let mut visited: HashSet<[u8; 32]> = HashSet::new();
+    let mut out: Vec<AcceptedTx> = Vec::new();
+    collect_prefix_txs_from_slice(&chain_block.transactions, parser, &mut visited, &mut out);
+
+    if let Some(verbose) = &chain_block.verbose_data {
+        let mergeset_hashes: Vec<_> = verbose
+            .merge_set_blues_hashes
+            .iter()
+            .chain(verbose.merge_set_reds_hashes.iter())
+            .copied()
+            .collect();
+        for mh in mergeset_hashes {
+            let merged = client.get_block(mh, true).await.with_context(|| {
+                format!(
+                    "get_block failed for mergeset block {}",
+                    hex::encode(mh.as_bytes())
+                )
+            })?;
+            collect_prefix_txs_from_slice(&merged.transactions, parser, &mut visited, &mut out);
+        }
+    }
+
+    Ok((accepted_at, daa_score, out))
+}
+
 /// Drain `wanted` of any txids found in the provided iterator, appending matching
 /// (txid, payload) pairs to `out`. Items whose txid is `None` (e.g. RpcTransaction
 /// without verbose_data) are skipped; the iterator stops early once `wanted` empties.
+///
+/// **Kept only for tests and historical reference.** Live sync no longer uses this —
+/// see [`collect_prefix_txs_from_slice`] for why.
+#[cfg_attr(not(test), allow(dead_code))]
 fn drain_matching_txs<'a, I>(
     txs: I,
     wanted: &mut HashSet<[u8; 32]>,
@@ -244,22 +345,12 @@ fn drain_matching_txs<'a, I>(
     }
 }
 
-/// Adapter that projects a slice of `RpcTransaction` into the `(Option<txid>, &payload)`
-/// view that `drain_matching_txs` consumes. Keeping this thin so tests can construct
-/// the same view directly without building full `RpcTransaction` fixtures.
-fn rpc_txs_view(
-    txs: &[kaspa_rpc_core::RpcTransaction],
-) -> impl Iterator<Item = (Option<[u8; 32]>, &[u8])> {
-    txs.iter().map(|tx| {
-        let txid = tx.verbose_data.as_ref().map(|v| v.transaction_id.as_bytes());
-        (txid, tx.payload.as_slice())
-    })
-}
 
 async fn fetch_chain_update_v2(
     client: &KaspaRpcClient,
     checkpoint: &[u8; 32],
     tip_distance: u64,
+    parser: &IgraPayloadParser,
 ) -> Result<ChainUpdate> {
     let response = client
         .get_virtual_chain_from_block_v2(
@@ -281,48 +372,33 @@ async fn fetch_chain_update_v2(
         .map(|h| h.as_bytes())
         .collect();
 
+    // We can't trust `group.accepted_transactions` alone — v2's response only
+    // contains chain-accepted txs, which excludes ~20% of 97b1-prefix L1 txs
+    // that live in mergeset-red blocks (see `collect_prefix_txs_from_slice`).
+    // For each chain block, do the full chain-body + mergeset walk via
+    // `expand_and_collect_igra_txs`. We DO use the v2 header data (hash, daa)
+    // as-is — that's free and saves one extra `get_block` when it's provided.
     let mut added: Vec<AddedChainBlock> = Vec::with_capacity(
         response.chain_block_accepted_transactions.len(),
     );
+    let mut last_daa_score: Option<u64> = None;
     for group in response.chain_block_accepted_transactions.iter() {
-        let hash = group
+        let hash_rpc = group
             .chain_block_header
             .hash
-            .ok_or_else(|| anyhow!("V2 response missing chain block hash"))?
-            .as_bytes();
-        let accepted_at = group
-            .chain_block_header
-            .timestamp
-            .and_then(|ms| i64::try_from(ms).ok())
-            .and_then(DateTime::<Utc>::from_timestamp_millis)
-            .unwrap_or_else(Utc::now);
-        let mut accepted_transactions: Vec<AcceptedTx> = Vec::new();
-        for tx in &group.accepted_transactions {
-            let Some(verbose) = &tx.verbose_data else {
-                continue;
-            };
-            let Some(txid) = verbose.transaction_id else {
-                continue;
-            };
-            let Some(payload) = &tx.payload else {
-                continue;
-            };
-            accepted_transactions.push(AcceptedTx {
-                txid: txid.as_bytes(),
-                payload: payload.clone(),
-            });
-        }
+            .ok_or_else(|| anyhow!("V2 response missing chain block hash"))?;
+        let hash = hash_rpc.as_bytes();
+
+        let (accepted_at, daa_score, accepted_transactions) =
+            expand_and_collect_igra_txs(client, hash_rpc, parser).await?;
+        last_daa_score = Some(daa_score);
+
         added.push(AddedChainBlock {
             hash,
             accepted_at,
             accepted_transactions,
         });
     }
-
-    let last_daa_score = response
-        .chain_block_accepted_transactions
-        .last()
-        .and_then(|g| g.chain_block_header.daa_score);
 
     Ok(ChainUpdate {
         removed,
@@ -352,10 +428,6 @@ async fn fetch_chain_update_v1(
         .map(|h| h.as_bytes())
         .collect();
 
-    // Prefix filtering happens here (not later) so we can skip the expensive
-    // get_block round-trips for chain blocks with no Igra-relevant activity.
-    let prefix_accepted_by_block = group_prefixed_accepted_txids(&response, parser);
-
     let added_hashes: Vec<[u8; 32]> = response
         .added_chain_block_hashes
         .iter()
@@ -367,84 +439,17 @@ async fn fetch_chain_update_v1(
     let mut last_daa_score: Option<u64> = None;
 
     for block_hash in &added_hashes {
-        let accepted_txid_set = prefix_accepted_by_block.get(block_hash);
         let is_last = Some(*block_hash) == last_hash;
 
-        if accepted_txid_set.is_none() && !is_last {
-            // No Igra-prefixed accepted txs — skip the RPC, no pending rows will result.
-            added.push(AddedChainBlock {
-                hash: *block_hash,
-                accepted_at: Utc::now(),
-                accepted_transactions: Vec::new(),
-            });
-            continue;
-        }
+        // Fetch chain block + mergeset, collect ALL 97b1-prefix txs.
+        // No pre-filter by `accepted_transaction_ids`: Igra L2 processes every
+        // 97b1 Kaspa tx it sees, including mergeset-reds. See
+        // `collect_prefix_txs_from_slice` docstring for the diagnosis.
+        let (accepted_at, daa_score, accepted_transactions) =
+            expand_and_collect_igra_txs(client, (*block_hash).into(), parser).await?;
 
-        let chain_block = client
-            .get_block((*block_hash).into(), true)
-            .await
-            .with_context(|| {
-                format!(
-                    "get_block failed for chain block {}",
-                    hex::encode(block_hash)
-                )
-            })?;
-
-        let accepted_at = i64::try_from(chain_block.header.timestamp)
-            .ok()
-            .and_then(DateTime::<Utc>::from_timestamp_millis)
-            .unwrap_or_else(Utc::now);
         if is_last {
-            last_daa_score = Some(chain_block.header.daa_score);
-        }
-
-        let mut accepted_transactions: Vec<AcceptedTx> = Vec::new();
-        if let Some(txid_list) = accepted_txid_set {
-            let mut remaining: HashSet<[u8; 32]> = txid_list.iter().copied().collect();
-
-            drain_matching_txs(
-                rpc_txs_view(&chain_block.transactions),
-                &mut remaining,
-                &mut accepted_transactions,
-            );
-
-            if !remaining.is_empty() {
-                if let Some(verbose) = &chain_block.verbose_data {
-                    let mergeset_hashes: Vec<_> = verbose
-                        .merge_set_blues_hashes
-                        .iter()
-                        .chain(verbose.merge_set_reds_hashes.iter())
-                        .copied()
-                        .collect();
-                    for mh in mergeset_hashes {
-                        if remaining.is_empty() {
-                            break;
-                        }
-                        let merged = client
-                            .get_block(mh, true)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "get_block failed for merged block {}",
-                                    hex::encode(mh.as_bytes())
-                                )
-                            })?;
-                        drain_matching_txs(
-                            rpc_txs_view(&merged.transactions),
-                            &mut remaining,
-                            &mut accepted_transactions,
-                        );
-                    }
-                }
-            }
-
-            if !remaining.is_empty() {
-                warn!(
-                    chain_block = %hex::encode(block_hash),
-                    missing = remaining.len(),
-                    "Kaspa v1 fallback: accepted Igra txs not found in chain block or mergeset"
-                );
-            }
+            last_daa_score = Some(daa_score);
         }
 
         added.push(AddedChainBlock {
@@ -786,5 +791,122 @@ mod tests {
             "should have stopped early; observed {} of 256",
             observed_count.get()
         );
+    }
+
+    // ---------- collect_prefix_txs_from_slice ----------
+    // These tests document the invariant that ALL 97b1-prefix txs get collected,
+    // not just the ones the chain block voted for. Regressions on this filter
+    // would silently drop L1→L2 links (see 2026-08-04 diagnosis).
+
+    use kaspa_rpc_core::{
+        RpcSubnetworkId, RpcTransactionInput, RpcTransactionOutpoint, RpcTransactionOutput,
+        RpcTransactionVerboseData,
+    };
+
+    fn make_tx(txid_first_bytes: &[u8], payload: Vec<u8>) -> kaspa_rpc_core::RpcTransaction {
+        let empty_spk: kaspa_rpc_core::RpcScriptPublicKey =
+            serde_json::from_str(r#"{"version":0,"script":""}"#).unwrap();
+        let mut id = [0u8; 32];
+        id[..txid_first_bytes.len()].copy_from_slice(txid_first_bytes);
+        // Extra padding after the prefix to make each txid unique when tests
+        // pass the same prefix — the last byte varies with the length of prefix.
+        id[31] = txid_first_bytes.len() as u8;
+        kaspa_rpc_core::RpcTransaction {
+            version: 0,
+            inputs: vec![RpcTransactionInput {
+                previous_outpoint: RpcTransactionOutpoint {
+                    transaction_id: [0u8; 32].into(),
+                    index: 0,
+                },
+                signature_script: vec![],
+                sequence: 0,
+                sig_op_count: 0,
+                verbose_data: None,
+            }],
+            outputs: vec![RpcTransactionOutput {
+                value: 0,
+                script_public_key: empty_spk,
+                verbose_data: None,
+            }],
+            lock_time: 0,
+            subnetwork_id: RpcSubnetworkId::from_byte(0),
+            gas: 0,
+            payload,
+            mass: 0,
+            verbose_data: Some(RpcTransactionVerboseData {
+                transaction_id: id.into(),
+                hash: id.into(),
+                compute_mass: 0,
+                block_hash: [0u8; 32].into(),
+                block_time: 0,
+            }),
+        }
+    }
+
+    /// The load-bearing regression test for the 2026-08-04 diagnosis: a 97b1 tx
+    /// in a mergeset-red block (never chain-accepted, never in
+    /// accepted_transaction_ids) MUST still be collected. The old
+    /// `drain_matching_txs` path silently dropped these, causing ~20% of L1→L2
+    /// linkages to go missing forever.
+    #[test]
+    fn collect_prefix_txs_captures_non_accepted_mergeset_tx() {
+        let parser = parser();
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+        let mut out: Vec<AcceptedTx> = Vec::new();
+
+        // Simulate a mergeset-red block containing a 97b1 tx that was never
+        // in any chain block's accepted_transaction_ids.
+        let mergeset_red_txs = vec![make_tx(&[0x97, 0xb1, 0xff], b"payload".to_vec())];
+        collect_prefix_txs_from_slice(&mergeset_red_txs, &parser, &mut visited, &mut out);
+
+        assert_eq!(out.len(), 1, "the non-accepted mergeset 97b1 tx MUST be collected");
+        assert!(out[0].txid.starts_with(&[0x97, 0xb1]));
+    }
+
+    #[test]
+    fn collect_prefix_txs_filters_non_igra() {
+        let parser = parser();
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+        let mut out: Vec<AcceptedTx> = Vec::new();
+
+        let txs = vec![
+            make_tx(&[0x97, 0xb1, 0x01], b"igra-1".to_vec()),
+            make_tx(&[0x42, 0x00, 0x00], b"not-igra".to_vec()), // random Kaspa tx
+            make_tx(&[0x97, 0xb1, 0x02], b"igra-2".to_vec()),
+        ];
+        collect_prefix_txs_from_slice(&txs, &parser, &mut visited, &mut out);
+
+        assert_eq!(out.len(), 2, "only 97b1 txs should land");
+        assert!(out.iter().all(|t| t.txid.starts_with(&[0x97, 0xb1])));
+    }
+
+    #[test]
+    fn collect_prefix_txs_dedupes_across_chain_body_and_mergeset() {
+        let parser = parser();
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+        let mut out: Vec<AcceptedTx> = Vec::new();
+
+        // Same tx appearing in chain block body + a mergeset block (common in
+        // Kaspa DAG — a tx can be included in multiple concurrent blocks).
+        let chain_body = vec![make_tx(&[0x97, 0xb1, 0xAA], b"payload".to_vec())];
+        let mergeset_body = vec![make_tx(&[0x97, 0xb1, 0xAA], b"payload".to_vec())];
+
+        collect_prefix_txs_from_slice(&chain_body, &parser, &mut visited, &mut out);
+        collect_prefix_txs_from_slice(&mergeset_body, &parser, &mut visited, &mut out);
+
+        assert_eq!(out.len(), 1, "duplicate visits of the same txid must be deduped");
+    }
+
+    #[test]
+    fn collect_prefix_txs_skips_txs_without_verbose_data() {
+        let parser = parser();
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+        let mut out: Vec<AcceptedTx> = Vec::new();
+
+        let mut tx = make_tx(&[0x97, 0xb1, 0x01], b"payload".to_vec());
+        tx.verbose_data = None;
+        collect_prefix_txs_from_slice(&[tx], &parser, &mut visited, &mut out);
+
+        assert!(out.is_empty(), "tx without verbose_data has no txid — must skip");
     }
 }
