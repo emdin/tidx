@@ -124,3 +124,73 @@ async fn indexes_a_handful_of_recent_blocks_end_to_end() {
         hex::encode(probe_txid)
     );
 }
+
+/// Verifies the core invariant behind `--walk-back-days`: kaspad DOES serve
+/// blocks below the pruning point via `GetBlock`, and their verbose_data
+/// contains `selected_parent_hash` we can chain-walk with.
+///
+/// If this test breaks (kaspad's retention behavior changes), the backward
+/// walk in `backfill-kaspa-tx-index` will silently narrow to just the
+/// forward window again.
+#[tokio::test]
+#[ignore]
+async fn kaspad_serves_blocks_below_pruning_point_and_exposes_selected_parent() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let client = connect_borsh_wrpc(&kaspad_url())
+        .await
+        .expect("connect to local kaspad");
+    let dag = client
+        .get_block_dag_info()
+        .await
+        .expect("get_block_dag_info");
+
+    // Step 1: fetch pruning point block. It's always queryable.
+    let pp = client
+        .get_block(dag.pruning_point_hash, true)
+        .await
+        .expect("kaspad must serve its own pruning point");
+    let verbose = pp
+        .verbose_data
+        .as_ref()
+        .expect("pruning point block must have verbose_data");
+    let pp_daa = pp.header.daa_score;
+
+    // Step 2: walk backward via selected_parent 100 chain blocks.
+    // Every step must succeed OR the test fails (documenting that kaspad
+    // stopped serving history at a particular depth).
+    let mut cursor = verbose.selected_parent_hash;
+    let mut steps = 0usize;
+    let mut deepest_daa = pp_daa;
+    while steps < 100 {
+        let block = client
+            .get_block(cursor, true)
+            .await
+            .unwrap_or_else(|e| panic!(
+                "kaspad stopped serving at step {steps} (hash {cursor}): {e}. \
+                 Expected at least 100 chain blocks below the pruning point."
+            ));
+        let v = block
+            .verbose_data
+            .as_ref()
+            .expect("verbose_data must be present on a getBlock response");
+        deepest_daa = block.header.daa_score;
+        if v.selected_parent_hash.as_bytes() == [0u8; 32] {
+            // Reached genesis before 100 steps — unlikely on mainnet but ok.
+            break;
+        }
+        cursor = v.selected_parent_hash;
+        steps += 1;
+    }
+
+    // Step 3: we should be materially below the pruning point.
+    let daa_delta = pp_daa.saturating_sub(deepest_daa);
+    assert!(
+        daa_delta > 0,
+        "backward walk didn't move DAA at all — pp_daa={pp_daa}, deepest={deepest_daa}"
+    );
+    eprintln!(
+        "backward walk: {steps} steps below PP, DAA delta {daa_delta} (~{:.2}h at 10 BPS)",
+        daa_delta as f64 / 10.0 / 3600.0
+    );
+}
