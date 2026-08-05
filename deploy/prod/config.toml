@@ -52,11 +52,14 @@ database = "tidx_38833"
 [chains.kaspa]
 enabled = true
 
-# Kaspa L1 Borsh wRPC, operated by devops on a separate host. tidx connects
-# directly — no on-host proxy needed (the legacy kaspa-wrpc-proxy was for
-# the case where kaspad ran on this same machine).
-# Used only for Kaspa provenance, not for L2 block indexing.
-rpc_url = "ws://95.217.73.85:17110"
+# Kaspa L1 Borsh wRPC — points at our local kaspad-mainnet sidecar
+# (loopback via iidx-prod_default docker network) as of 2026-08-05.
+# Previously ws://95.217.73.85:17110 (devops's remote node); switched
+# to local after devops kaspad's behavior appeared to change on
+# 2026-08-04 20:00 UTC, silently stalling kaspa provenance sync inserts.
+# Local kaspad-mainnet: v2.0.0 Toccata, retention 30d, always healthy
+# under our control. Used only for Kaspa provenance, not L2 EVM sync.
+rpc_url = "ws://kaspad-mainnet:17110"
 txid_prefix = "97b1"
 poll_interval_ms = 1000
 initial_tip_distance = 100
