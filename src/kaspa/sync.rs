@@ -15,6 +15,14 @@ use crate::kaspa::client::connect_borsh_wrpc;
 use crate::kaspa::payload::{IgraKaspaPayload, IgraPayloadParser};
 use crate::kaspa::writer::{KaspaProvenanceWriter, PendingEntry, PendingL2Submission};
 
+/// Upper bound for `tip_distance` — the batch cap passed to
+/// `get_virtual_chain_from_block_v2`. Prevents runaway growth after long
+/// operation (each reorg adds 1, never shrinks). At the observed prod value
+/// of ~412k the v2 server silently returns empty accepted_transactions and
+/// sync stalls invisibly. 1000 = 10× the default `initial_tip_distance` of
+/// 100, generous headroom above any realistic reorg storm.
+const TIP_DISTANCE_MAX: u64 = 1000;
+
 /// Unified view of a single virtual-chain progression round. Both the v2 server
 /// path and the v1 fallback produce this shape so downstream code stays protocol-agnostic.
 struct ChainUpdate {
@@ -111,7 +119,20 @@ async fn run_once(
     let mut checkpoint = state
         .checkpoint_hash
         .unwrap_or_else(|| dag_info.pruning_point_hash.as_bytes());
-    let mut tip_distance = state.tip_distance.max(1);
+    // tip_distance is passed to `get_virtual_chain_from_block_v2` as the
+    // response batch cap. It grows by 1 on every reorg (see saturating_add
+    // below) and never shrinks, so on a long-running node it can drift into
+    // pathological territory — 2026-08-04 20:00 UTC, prod had grown to
+    // 412,848 over ~5 months, at which point kaspad's v2 responses came
+    // back with empty accepted_transactions (server silently caps the
+    // response), and sync appeared to progress (checkpoint advanced) while
+    // inserting zero rows for hours. Cap keeps growth bounded — we still
+    // allow generous headroom above the 100 default so real reorg storms
+    // aren't clipped.
+    let mut tip_distance = state
+        .tip_distance
+        .max(1)
+        .min(TIP_DISTANCE_MAX);
     let poll_interval = Duration::from_millis(kaspa.poll_interval_ms.max(100));
 
     loop {
@@ -142,7 +163,7 @@ async fn run_once(
 
         let deleted = writer.delete_pending_for_removed_blocks(&removed).await?;
         if deleted > 0 {
-            tip_distance = tip_distance.saturating_add(1);
+            tip_distance = tip_distance.saturating_add(1).min(TIP_DISTANCE_MAX);
             warn!(
                 chain_id = chain.chain_id,
                 deleted,
@@ -895,6 +916,40 @@ mod tests {
         collect_prefix_txs_from_slice(&mergeset_body, &parser, &mut visited, &mut out);
 
         assert_eq!(out.len(), 1, "duplicate visits of the same txid must be deduped");
+    }
+
+    // ---------- tip_distance cap ----------
+
+    /// If persisted `tip_distance` is above the cap (typically from months of
+    /// accumulated reorg increments), the sync must load it clamped. Prevents
+    /// the 2026-08-04 silent-stall class of bug from recurring on any node
+    /// that inherits a runaway state row.
+    #[test]
+    fn tip_distance_cap_clamps_pathological_saved_state() {
+        let saved: u64 = 412_848; // exact value observed in prod on 2026-08-04
+        let effective = saved.max(1).min(TIP_DISTANCE_MAX);
+        assert_eq!(
+            effective, TIP_DISTANCE_MAX,
+            "pathological saved tip_distance must clamp to cap"
+        );
+    }
+
+    /// Reorg-increment path must also clamp — else we could clip on load but
+    /// grow past the cap during a reorg storm.
+    #[test]
+    fn tip_distance_cap_clamps_reorg_increment_at_ceiling() {
+        let td: u64 = TIP_DISTANCE_MAX;
+        let after_reorg = td.saturating_add(1).min(TIP_DISTANCE_MAX);
+        assert_eq!(after_reorg, TIP_DISTANCE_MAX);
+    }
+
+    /// Small values pass through untouched — no regression for normal load.
+    #[test]
+    fn tip_distance_cap_lets_normal_values_through() {
+        for saved in [1u64, 100, 500, TIP_DISTANCE_MAX - 1] {
+            let effective = saved.max(1).min(TIP_DISTANCE_MAX);
+            assert_eq!(effective, saved, "normal value {saved} should pass through");
+        }
     }
 
     #[test]
