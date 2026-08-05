@@ -66,6 +66,8 @@ pub fn is_retriable_status(s: StatusCode) -> bool {
 pub struct ApiTransaction {
     #[serde(default)]
     pub inputs: Vec<ApiInput>,
+    #[serde(default)]
+    pub outputs: Vec<ApiOutput>,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq)]
@@ -76,12 +78,19 @@ pub struct ApiInput {
     pub previous_outpoint_amount: Option<i64>,
 }
 
-/// Build the api.kaspa.org URL for resolving one tx's previous-outpoint
-/// senders. Pure function so it's directly unit-testable. Trailing slashes
-/// on the base URL are stripped so the path is canonical.
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+pub struct ApiOutput {
+    #[serde(default)]
+    pub amount: Option<i64>,
+}
+
+/// Build the api.kaspa.org URL for resolving one tx's inputs (with
+/// previous-outpoint address + amount) AND its outputs (with amounts).
+/// One request populates both senders (`l1_senders`) and fee
+/// (`l1_fee_sompi = sum(inputs) - sum(outputs)`).
 pub fn build_tx_url(rest_base: &str, txid: &[u8]) -> String {
     format!(
-        "{}/transactions/{}?inputs=true&outputs=false&resolve_previous_outpoints=light",
+        "{}/transactions/{}?inputs=true&outputs=true&resolve_previous_outpoints=light",
         rest_base.trim_end_matches('/'),
         hex::encode(txid),
     )
@@ -91,43 +100,77 @@ pub fn build_tx_url(rest_base: &str, txid: &[u8]) -> String {
 /// interpolated (allowed because callers pass a known table name from a
 /// CLI enum, not user-supplied free text), so this isn't a SQL-injection
 /// vector. Returned as a `String` for testability.
+///
+/// COALESCE lets each field be set only if it's currently NULL — so a row
+/// that already has senders but no fee gets its fee filled without
+/// re-touching the sender data (and vice versa). Matching WHERE clause
+/// picks up rows missing EITHER field.
 pub fn build_update_sql(table: &str) -> String {
     format!(
         "UPDATE {table}
-         SET l1_senders = $2,
-             l1_sender_amounts_sompi = $3,
-             l1_enriched_at = now()
+         SET l1_senders             = COALESCE(l1_senders, $2),
+             l1_sender_amounts_sompi = COALESCE(l1_sender_amounts_sompi, $3),
+             l1_enriched_at          = COALESCE(l1_enriched_at, now()),
+             l1_fee_sompi            = COALESCE(l1_fee_sompi, $4),
+             l1_fee_enriched_at      = COALESCE(l1_fee_enriched_at, now())
          WHERE kaspa_txid = $1
-           AND l1_senders IS NULL"
+           AND (l1_senders IS NULL OR l1_fee_sompi IS NULL)"
     )
 }
 
-/// Fetch one tx's resolved sender info from api.kaspa.org. Returns
-/// `(senders, amounts)` aligned by input index. On non-2xx HTTP, returns
-/// `Err` so the caller can soft-skip and retry on next pass.
+/// Compute the miner fee from a fetched tx: sum(inputs.previous_outpoint_amount)
+/// - sum(outputs.amount). Returns `None` if the arithmetic underflows (coinbase
+/// tx, where sum(inputs) = 0 < sum(outputs)) or if the tx has no inputs at all
+/// (also coinbase-shaped). Missing per-field amounts are treated as 0, which is
+/// the safe convention for the light-resolution response.
+pub fn compute_fee_from_api_tx(tx: &ApiTransaction) -> Option<i64> {
+    if tx.inputs.is_empty() {
+        return None;
+    }
+    let sum_in: i64 = tx.inputs.iter().map(|i| i.previous_outpoint_amount.unwrap_or(0)).sum();
+    let sum_out: i64 = tx.outputs.iter().map(|o| o.amount.unwrap_or(0)).sum();
+    if sum_out > sum_in {
+        return None;
+    }
+    Some(sum_in - sum_out)
+}
+
+/// Data extracted from one tx's api.kaspa.org response, ready to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichedTx {
+    pub senders: Vec<String>,
+    pub sender_amounts: Vec<i64>,
+    /// `None` for coinbase (no inputs) — the caller skips writing the fee
+    /// column in that case.
+    pub fee_sompi: Option<i64>,
+}
+
+/// Fetch one tx's resolved sender + output data from api.kaspa.org and
+/// derive `l1_senders` + `l1_fee_sompi`. On non-2xx HTTP, returns `Err`
+/// so the caller can soft-skip and retry on next pass.
 ///
 /// Convenience wrapper using the default retry policy.
-pub async fn fetch_senders(
+pub async fn fetch_enrichment(
     client: &Client,
     url: &str,
     txid: &[u8],
-) -> Result<(Vec<String>, Vec<i64>)> {
-    fetch_senders_with_retry(client, url, txid, RetryPolicy::default_polite()).await
+) -> Result<EnrichedTx> {
+    fetch_enrichment_with_retry(client, url, txid, RetryPolicy::default_polite()).await
 }
 
-/// Same as `fetch_senders` but with an explicit retry policy. Transient
+/// Same as `fetch_enrichment` but with an explicit retry policy. Transient
 /// errors (5xx, 408, 429, network errors) are retried with exponential
 /// backoff up to `policy.max_attempts`; permanent errors (other 4xx)
 /// abort immediately.
-pub async fn fetch_senders_with_retry(
+pub async fn fetch_enrichment_with_retry(
     client: &Client,
     url: &str,
     txid: &[u8],
     policy: RetryPolicy,
-) -> Result<(Vec<String>, Vec<i64>)> {
+) -> Result<EnrichedTx> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..policy.max_attempts {
-        match try_fetch_senders_once(client, url, txid).await {
+        match try_fetch_enrichment_once(client, url, txid).await {
             Ok(parsed) => return Ok(parsed),
             Err(FetchError::Permanent(e)) => return Err(e),
             Err(FetchError::Transient(e)) => {
@@ -146,7 +189,7 @@ pub async fn fetch_senders_with_retry(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("fetch_senders: out of retries with no error")))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("fetch_enrichment: out of retries with no error")))
 }
 
 /// Internal classification of fetch errors so the retry loop knows
@@ -158,11 +201,11 @@ enum FetchError {
     Transient(anyhow::Error),
 }
 
-async fn try_fetch_senders_once(
+async fn try_fetch_enrichment_once(
     client: &Client,
     url: &str,
     txid: &[u8],
-) -> std::result::Result<(Vec<String>, Vec<i64>), FetchError> {
+) -> std::result::Result<EnrichedTx, FetchError> {
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         // Network-level errors (DNS, connect, etc) — transient
@@ -184,12 +227,13 @@ async fn try_fetch_senders_once(
         Err(e) => return Err(FetchError::Transient(e)),
     };
     let mut senders = Vec::with_capacity(parsed.inputs.len());
-    let mut amounts = Vec::with_capacity(parsed.inputs.len());
-    for input in parsed.inputs {
-        senders.push(input.previous_outpoint_address.unwrap_or_default());
-        amounts.push(input.previous_outpoint_amount.unwrap_or(0));
+    let mut sender_amounts = Vec::with_capacity(parsed.inputs.len());
+    for input in &parsed.inputs {
+        senders.push(input.previous_outpoint_address.clone().unwrap_or_default());
+        sender_amounts.push(input.previous_outpoint_amount.unwrap_or(0));
     }
-    Ok((senders, amounts))
+    let fee_sompi = compute_fee_from_api_tx(&parsed);
+    Ok(EnrichedTx { senders, sender_amounts, fee_sompi })
 }
 
 /// Outcome of a full enrichment run on one table.
@@ -217,14 +261,19 @@ pub async fn enrich_table(
     let mut stats = EnrichmentStats::default();
 
     loop {
-        // Pull the next batch of un-enriched txids.
+        // Pull the next batch of un-enriched txids. Widened WHERE clause to
+        // include rows missing EITHER senders OR fee — so an already-senders-
+        // enriched row without a fee gets picked up on this next sweep.
+        // ORDER BY accepted_at DESC to give researchers a monotonic
+        // "everything from date X back is enriched" guarantee: partial
+        // completion is always usable for recent windows.
         let conn = pool.get().await?;
         let rows = conn
             .query(
                 &format!(
                     "SELECT kaspa_txid FROM {table}
-                     WHERE l1_senders IS NULL
-                     ORDER BY kaspa_txid
+                     WHERE l1_senders IS NULL OR l1_fee_sompi IS NULL
+                     ORDER BY created_at DESC
                      LIMIT $1"
                 ),
                 &[&(batch_size as i64)],
@@ -248,18 +297,18 @@ pub async fn enrich_table(
             let txid = txid.clone();
             tasks.push(tokio::spawn(async move {
                 let _permit = permit; // dropped at task end → releases semaphore slot
-                fetch_senders(&client, &url, &txid).await.map(|s| (txid, s))
+                fetch_enrichment(&client, &url, &txid).await.map(|e| (txid, e))
             }));
         }
 
-        let mut updates: Vec<(Vec<u8>, Vec<String>, Vec<i64>)> = Vec::new();
+        let mut updates: Vec<(Vec<u8>, EnrichedTx)> = Vec::new();
         for t in tasks {
             match t.await {
-                Ok(Ok((txid, (senders, amounts)))) => {
-                    if senders.is_empty() {
+                Ok(Ok((txid, enriched))) => {
+                    if enriched.senders.is_empty() {
                         stats.no_inputs += 1;
                     }
-                    updates.push((txid, senders, amounts));
+                    updates.push((txid, enriched));
                 }
                 Ok(Err(e)) => {
                     debug!(err = %e, "fetch failed; will retry on next pass");
@@ -276,9 +325,12 @@ pub async fn enrich_table(
             let mut conn = pool.get().await?;
             let tx = conn.transaction().await?;
             let sql = build_update_sql(table);
-            for (txid, senders, amounts) in &updates {
-                tx.execute(&sql, &[&txid.as_slice(), &senders, &amounts])
-                    .await?;
+            for (txid, e) in &updates {
+                tx.execute(
+                    &sql,
+                    &[&txid.as_slice(), &e.senders, &e.sender_amounts, &e.fee_sompi],
+                )
+                .await?;
             }
             tx.commit().await?;
             stats.enriched += updates.len();
@@ -365,7 +417,7 @@ mod tests {
         let url = build_tx_url("https://api.kaspa.org", &txid);
         assert_eq!(
             url,
-            "https://api.kaspa.org/transactions/97b167d4318621a9abb91003b2d5bd1a6f20aa638124644b356faecbb13c4f5e?inputs=true&outputs=false&resolve_previous_outpoints=light"
+            "https://api.kaspa.org/transactions/97b167d4318621a9abb91003b2d5bd1a6f20aa638124644b356faecbb13c4f5e?inputs=true&outputs=true&resolve_previous_outpoints=light"
         );
     }
 
@@ -376,7 +428,7 @@ mod tests {
         assert!(!url.contains("//transactions"), "double-slash: {url}");
         assert_eq!(
             url,
-            "https://api.kaspa.org/transactions/aa?inputs=true&outputs=false&resolve_previous_outpoints=light"
+            "https://api.kaspa.org/transactions/aa?inputs=true&outputs=true&resolve_previous_outpoints=light"
         );
     }
 
@@ -386,19 +438,26 @@ mod tests {
     fn build_update_sql_targets_the_named_table() {
         let sql = build_update_sql("kaspa_l2_submissions");
         assert!(sql.contains("UPDATE kaspa_l2_submissions"), "{sql}");
-        assert!(sql.contains("l1_senders = $2"), "{sql}");
-        assert!(sql.contains("l1_sender_amounts_sompi = $3"), "{sql}");
-        assert!(sql.contains("l1_enriched_at = now()"), "{sql}");
+        assert!(sql.contains("l1_senders"), "{sql}");
+        assert!(sql.contains("l1_sender_amounts_sompi"), "{sql}");
+        assert!(sql.contains("l1_enriched_at"), "{sql}");
+        assert!(sql.contains("l1_fee_sompi"), "{sql}");
+        assert!(sql.contains("l1_fee_enriched_at"), "{sql}");
         assert!(sql.contains("WHERE kaspa_txid = $1"), "{sql}");
-        // Idempotency: must not overwrite already-enriched rows on a re-run.
-        assert!(sql.contains("AND l1_senders IS NULL"), "{sql}");
+        // Idempotency: only touch rows still missing at least one column;
+        // COALESCE preserves already-populated fields.
+        assert!(sql.contains("l1_senders IS NULL"), "{sql}");
+        assert!(sql.contains("l1_fee_sompi IS NULL"), "{sql}");
+        assert!(sql.contains("COALESCE(l1_senders"), "{sql}");
+        assert!(sql.contains("COALESCE(l1_fee_sompi"), "{sql}");
     }
 
     #[test]
     fn build_update_sql_works_for_kaspa_entries_too() {
         let sql = build_update_sql("kaspa_entries");
         assert!(sql.contains("UPDATE kaspa_entries"), "{sql}");
-        assert!(sql.contains("AND l1_senders IS NULL"), "{sql}");
+        assert!(sql.contains("l1_senders IS NULL"), "{sql}");
+        assert!(sql.contains("l1_fee_sompi IS NULL"), "{sql}");
     }
 
     // ---------- fetch_senders end-to-end (local TCP) ----------
@@ -432,67 +491,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_senders_round_trips_real_api_shape() {
+    async fn fetch_enrichment_round_trips_real_api_shape() {
+        // Real tx: 1 input at 10985439355 sompi, 1 output at 10985437381,
+        // fee = 1974 sompi.
         let body = br#"{
             "inputs": [
                 {
                     "transaction_id": "97b167d4...",
-                    "index": 0,
-                    "previous_outpoint_hash": "97b1dd88...",
-                    "previous_outpoint_index": "0",
                     "previous_outpoint_address": "kaspa:qq5xkhfdmm4zzwc25udlmkcg24vefhc54snklphd3slrvcrexspcg40fvxxh4",
                     "previous_outpoint_amount": 10985439355
                 }
+            ],
+            "outputs": [
+                { "amount": 10985437381 }
             ]
         }"#;
         let addr = spawn_canned_http_server(body, "200 OK").await;
         let url = format!("http://{addr}/transactions/foo");
         let client = Client::builder().build().unwrap();
         let txid = vec![0x97, 0xb1];
-        let (senders, amounts) = fetch_senders(&client, &url, &txid).await.unwrap();
-        assert_eq!(senders.len(), 1);
-        assert_eq!(amounts.len(), 1);
+        let e = fetch_enrichment(&client, &url, &txid).await.unwrap();
+        assert_eq!(e.senders.len(), 1);
+        assert_eq!(e.sender_amounts, vec![10985439355i64]);
         assert_eq!(
-            senders[0],
+            e.senders[0],
             "kaspa:qq5xkhfdmm4zzwc25udlmkcg24vefhc54snklphd3slrvcrexspcg40fvxxh4"
         );
-        assert_eq!(amounts[0], 10985439355);
+        assert_eq!(e.fee_sompi, Some(1974));
     }
 
     #[tokio::test]
-    async fn fetch_senders_handles_404_as_error() {
+    async fn fetch_enrichment_handles_404_as_error() {
         let addr = spawn_canned_http_server(b"not found", "404 Not Found").await;
         let url = format!("http://{addr}/transactions/foo");
         let client = Client::builder().build().unwrap();
         let txid = vec![0x97, 0xb1];
-        let result = fetch_senders(&client, &url, &txid).await;
+        let result = fetch_enrichment(&client, &url, &txid).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("HTTP 404"), "expected HTTP 404 in: {msg}");
     }
 
     #[tokio::test]
-    async fn fetch_senders_handles_zero_input_response() {
-        let body = br#"{ "inputs": [] }"#;
+    async fn fetch_enrichment_handles_coinbase_shape() {
+        // Zero inputs + non-zero outputs = coinbase. Fee undefined.
+        let body = br#"{ "inputs": [], "outputs": [ {"amount": 50000000000} ] }"#;
         let addr = spawn_canned_http_server(body, "200 OK").await;
         let url = format!("http://{addr}/transactions/foo");
         let client = Client::builder().build().unwrap();
         let txid = vec![0x97, 0xb1];
-        let (senders, amounts) = fetch_senders(&client, &url, &txid).await.unwrap();
-        assert!(senders.is_empty());
-        assert!(amounts.is_empty());
+        let e = fetch_enrichment(&client, &url, &txid).await.unwrap();
+        assert!(e.senders.is_empty());
+        assert!(e.sender_amounts.is_empty());
+        assert_eq!(e.fee_sompi, None);
     }
 
     #[tokio::test]
-    async fn fetch_senders_substitutes_defaults_for_missing_optional_fields() {
-        let body = br#"{ "inputs": [ {}, {"previous_outpoint_amount": 42} ] }"#;
+    async fn fetch_enrichment_substitutes_defaults_for_missing_optional_fields() {
+        let body = br#"{
+            "inputs":  [ {}, {"previous_outpoint_amount": 42} ],
+            "outputs": [ {}, {"amount": 5} ]
+        }"#;
         let addr = spawn_canned_http_server(body, "200 OK").await;
         let url = format!("http://{addr}/transactions/foo");
         let client = Client::builder().build().unwrap();
         let txid = vec![0x97, 0xb1];
-        let (senders, amounts) = fetch_senders(&client, &url, &txid).await.unwrap();
-        assert_eq!(senders, vec!["".to_string(), "".to_string()]);
-        assert_eq!(amounts, vec![0i64, 42i64]);
+        let e = fetch_enrichment(&client, &url, &txid).await.unwrap();
+        assert_eq!(e.senders, vec!["".to_string(), "".to_string()]);
+        assert_eq!(e.sender_amounts, vec![0i64, 42i64]);
+        assert_eq!(e.fee_sompi, Some(37)); // sum(0+42) - sum(0+5) = 37
+    }
+
+    // ---------- compute_fee_from_api_tx (pure) ----------
+
+    #[test]
+    fn compute_fee_normal_positive() {
+        let tx = ApiTransaction {
+            inputs: vec![ApiInput {
+                previous_outpoint_address: Some("k".into()),
+                previous_outpoint_amount: Some(1000),
+            }],
+            outputs: vec![ApiOutput { amount: Some(900) }],
+        };
+        assert_eq!(compute_fee_from_api_tx(&tx), Some(100));
+    }
+
+    #[test]
+    fn compute_fee_coinbase_returns_none() {
+        let tx = ApiTransaction {
+            inputs: vec![],
+            outputs: vec![ApiOutput { amount: Some(50_000_000_000) }],
+        };
+        assert_eq!(compute_fee_from_api_tx(&tx), None);
+    }
+
+    #[test]
+    fn compute_fee_outputs_exceed_inputs_returns_none() {
+        // Invalid on real chain — prefer None over inserting a wraparound.
+        let tx = ApiTransaction {
+            inputs: vec![ApiInput {
+                previous_outpoint_address: None,
+                previous_outpoint_amount: Some(100),
+            }],
+            outputs: vec![ApiOutput { amount: Some(200) }],
+        };
+        assert_eq!(compute_fee_from_api_tx(&tx), None);
+    }
+
+    #[test]
+    fn compute_fee_zero_fee_is_valid() {
+        let tx = ApiTransaction {
+            inputs: vec![ApiInput {
+                previous_outpoint_address: None,
+                previous_outpoint_amount: Some(1000),
+            }],
+            outputs: vec![ApiOutput { amount: Some(1000) }],
+        };
+        assert_eq!(compute_fee_from_api_tx(&tx), Some(0));
     }
 
     // ---------- retry policy / status classification ----------
@@ -608,11 +723,11 @@ mod tests {
             max_backoff: Duration::from_millis(10),
         };
         let txid = vec![0x97, 0xb1];
-        let (senders, amounts) = fetch_senders_with_retry(&client, &url, &txid, policy)
+        let e = fetch_enrichment_with_retry(&client, &url, &txid, policy)
             .await
             .expect("should recover from 2 503s");
-        assert_eq!(senders, vec!["kaspa:ok".to_string()]);
-        assert_eq!(amounts, vec![7]);
+        assert_eq!(e.senders, vec!["kaspa:ok".to_string()]);
+        assert_eq!(e.sender_amounts, vec![7]);
     }
 
     #[tokio::test]
@@ -627,7 +742,7 @@ mod tests {
             max_backoff: Duration::from_millis(10),
         };
         let txid = vec![0x97, 0xb1];
-        let result = fetch_senders_with_retry(&client, &url, &txid, policy).await;
+        let result = fetch_enrichment_with_retry(&client, &url, &txid, policy).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("HTTP 503"), "expected HTTP 503 in: {msg}");
@@ -649,7 +764,7 @@ mod tests {
         };
         let start = std::time::Instant::now();
         let txid = vec![0x97, 0xb1];
-        let result = fetch_senders_with_retry(&client, &url, &txid, policy).await;
+        let result = fetch_enrichment_with_retry(&client, &url, &txid, policy).await;
         let elapsed = start.elapsed();
         assert!(result.is_err());
         assert!(
