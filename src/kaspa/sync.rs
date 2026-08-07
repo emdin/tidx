@@ -37,9 +37,13 @@ struct AddedChainBlock {
     accepted_transactions: Vec<AcceptedTx>,
 }
 
-struct AcceptedTx {
-    txid: [u8; 32],
-    payload: Vec<u8>,
+/// One prefix-matching Kaspa tx collected from a chain block + its mergeset.
+/// Public so the archive backfill CLI reuses the exact same collection
+/// semantics as realtime sync (see PR #18 — any independent implementation
+/// risks re-introducing the accepted-txids filter bug).
+pub struct AcceptedTx {
+    pub txid: [u8; 32],
+    pub payload: Vec<u8>,
 }
 
 pub async fn run_kaspa_provenance_sync(
@@ -259,7 +263,7 @@ fn group_prefixed_accepted_txids(
 /// 97b1-prefix txs never made it into `kaspa_l2_submissions`. The txs are
 /// on-chain, the parser accepts them (0x4/0x5), and the L2 tx hashes they
 /// carry exist in `txs` — they just weren't in `accepted_transaction_ids`.
-fn collect_prefix_txs_from_slice(
+pub fn collect_prefix_txs_from_slice(
     txs: &[kaspa_rpc_core::RpcTransaction],
     parser: &IgraPayloadParser,
     visited: &mut HashSet<[u8; 32]>,
@@ -290,7 +294,7 @@ fn collect_prefix_txs_from_slice(
 /// This is the sole "which Kaspa L1 txs did this chain block introduce to the
 /// Igra L2's view" primitive. Both the v1 and v2 fetch paths call it for each
 /// added chain block.
-async fn expand_and_collect_igra_txs(
+pub async fn expand_and_collect_igra_txs(
     client: &KaspaRpcClient,
     chain_block_hash: kaspa_rpc_core::RpcHash,
     parser: &IgraPayloadParser,
