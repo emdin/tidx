@@ -297,6 +297,7 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/explore/{*path}", get(explorer::index))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
+        .route("/status/kaspa-coverage", get(handle_kaspa_coverage))
         .route("/tables", get(tables::handle_tables))
         .route("/query", get(handle_query))
         .route("/views", get(views::list_views).post(views::create_view))
@@ -416,6 +417,104 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         rev: GIT_REV,
         chains: all_chains,
     }))
+}
+
+/// L1-provenance coverage floor + per-month linkage/fee coverage, so
+/// "since genesis" queries can fail loudly instead of silently
+/// under-reporting (dev request, 2026-08-08). The underlying JOIN over
+/// txs × kaspa_l2_submissions is too heavy per-request, so results are
+/// cached in-process for 15 minutes; `computed_at` tells consumers how
+/// fresh the numbers are.
+async fn handle_kaspa_coverage(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, serde_json::Value)>>> =
+        OnceLock::new();
+    const TTL: std::time::Duration = std::time::Duration::from_secs(900);
+
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().await;
+    if let Some((at, val)) = guard.as_ref() {
+        if at.elapsed() < TTL {
+            return Ok(Json(val.clone()));
+        }
+    }
+
+    let pools = state.pools.read().await;
+    let (chain_id, pool) = pools
+        .iter()
+        .next()
+        .ok_or_else(|| ApiError::QueryError("no chains configured".into()))?;
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::QueryError(format!("pool: {e}")))?;
+
+    // Serial plan: the parallel one needs more /dev/shm than the prod
+    // container has (see 2026-08-04 shared-memory errors).
+    conn.batch_execute("SET max_parallel_workers_per_gather = 0")
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?;
+
+    let floor = conn
+        .query_one(
+            "SELECT min(b.num) AS first_linked_block,
+                    min(b.timestamp) AS first_linked_at
+             FROM txs t
+             JOIN blocks b ON b.num = t.block_num
+             JOIN kaspa_l2_submissions k ON k.l2_tx_hash = t.hash",
+            &[],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?;
+
+    let months = conn
+        .query(
+            "SELECT date_trunc('month', b.timestamp)::date::text AS month,
+                    count(*) AS l2_txs,
+                    count(k.l2_tx_hash) AS linked,
+                    count(k.l1_fee_sompi) AS with_fee
+             FROM txs t
+             JOIN blocks b ON b.num = t.block_num
+             LEFT JOIN kaspa_l2_submissions k ON k.l2_tx_hash = t.hash
+             GROUP BY 1 ORDER BY 1",
+            &[],
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?;
+
+    let monthly: Vec<serde_json::Value> = months
+        .iter()
+        .map(|r| {
+            let total: i64 = r.get("l2_txs");
+            let linked: i64 = r.get("linked");
+            let with_fee: i64 = r.get("with_fee");
+            serde_json::json!({
+                "month": r.get::<_, String>("month"),
+                "l2_txs": total,
+                "linked": linked,
+                "linked_pct": if total > 0 { (linked as f64 / total as f64 * 1000.0).round() / 10.0 } else { 0.0 },
+                "with_fee": with_fee,
+                "fee_pct": if total > 0 { (with_fee as f64 / total as f64 * 1000.0).round() / 10.0 } else { 0.0 },
+            })
+        })
+        .collect();
+
+    let val = serde_json::json!({
+        "chain_id": chain_id,
+        // Below this block there is NO L1 provenance — "since genesis"
+        // consumers must treat results before this point as absent, not zero.
+        "first_linked_block": floor.get::<_, Option<i64>>("first_linked_block"),
+        "first_linked_at": floor.get::<_, Option<chrono::DateTime<Utc>>>("first_linked_at"),
+        "monthly": monthly,
+        "computed_at": Utc::now(),
+        "cache_ttl_secs": TTL.as_secs(),
+        "note": "linked/fee coverage by L2 block month; rows in kaspa_pending_l2_submissions (12h promotion delay) are not counted as linked",
+    });
+    *guard = Some((std::time::Instant::now(), val.clone()));
+    Ok(Json(val))
 }
 
 fn empty_status(chain_id: u64) -> SyncStatus {

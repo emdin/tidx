@@ -161,9 +161,22 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Walk the virtual chain forward from `start_hash`, fetching block bodies for
-/// any chain block that contains at least one `97b1`-prefix txid, parsing the
-/// igra payload, and inserting into the final tables (idempotent).
+/// Walk the virtual chain forward from `start_hash`, fetch every chain
+/// block AND its full mergeset (blues + reds), collect every prefix-matching
+/// tx, parse payloads, insert into the final tables (idempotent).
+///
+/// Uses the SAME collection helper as realtime sync
+/// (`kaspa::sync::expand_and_collect_igra_txs`) — the previous
+/// implementation filtered by `accepted_transaction_ids`, which only covers
+/// chain body + mergeset BLUES and permanently missed ~20% of production
+/// 97b1 txs living in mergeset REDS (see PR #18 for the sync-side fix and
+/// the measurement). Any walk that pre-filters by acceptance re-introduces
+/// that hole; do not "optimize" this back without reading PR #18.
+///
+/// Perf note: every chain block now costs 1 + N_mergeset `get_block` calls
+/// (no acceptance short-circuit is possible — red txs never appear in the
+/// accepted list). Against a loopback archive kaspad this is ~5-15 ms per
+/// chain block; a 35-day archive window walks in roughly a day.
 async fn walk_and_insert(
     client: &kaspa_wrpc_client::KaspaRpcClient,
     parser: &IgraPayloadParser,
@@ -177,100 +190,53 @@ async fn walk_and_insert(
     let mut last_progress_log = std::time::Instant::now();
 
     loop {
-        // Page through the virtual chain. include_accepted_transaction_ids = true
-        // gives us per-chain-block lists of txids accepted at that point.
+        // Page through the virtual chain. Accepted txid lists are NOT
+        // requested — they are not used for filtering (see docstring).
         let resp = client
-            .get_virtual_chain_from_block(cursor, true, None)
+            .get_virtual_chain_from_block(cursor, false, None)
             .await
-            .with_context(|| {
-                format!("get_virtual_chain_from_block from {cursor}")
-            })?;
+            .with_context(|| format!("get_virtual_chain_from_block from {cursor}"))?;
 
         // Empty page means we caught up to the sink.
         if resp.added_chain_block_hashes.is_empty() {
             break;
         }
 
-        // Build a hash → accepted txid set map for the page.
-        // accepted_transaction_ids is in the same order as added_chain_block_hashes.
-        let txid_sets: std::collections::HashMap<RpcHash, Vec<RpcHash>> = resp
-            .accepted_transaction_ids
-            .into_iter()
-            .map(|a| (a.accepting_block_hash, a.accepted_transaction_ids))
-            .collect();
-
         for chain_block_hash in &resp.added_chain_block_hashes {
             stats.chain_blocks += 1;
 
-            // Only fetch the block body if at least one accepted txid in this
-            // chain block matches the igra prefix. Most chain blocks have no
-            // igra txs, so this short-circuit is the bulk of the speedup.
-            let accepted_ids = txid_sets
-                .get(chain_block_hash)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let has_igra_candidate = accepted_ids
-                .iter()
-                .any(|id| parser.txid_matches(&id.as_bytes()));
-            if !has_igra_candidate {
-                cursor = *chain_block_hash;
-                if let Some(cap) = max_blocks {
-                    if stats.chain_blocks >= cap {
-                        return Ok(stats);
-                    }
-                }
-                continue;
+            let (_accepted_at, _daa, collected) = tidx::kaspa::sync::expand_and_collect_igra_txs(
+                client,
+                *chain_block_hash,
+                parser,
+            )
+            .await?;
+
+            if !collected.is_empty() {
+                stats.blocks_with_igra += 1;
             }
-            stats.blocks_with_igra += 1;
 
-            let chain_block = client
-                .get_block(*chain_block_hash, true)
-                .await
-                .with_context(|| format!("get_block {chain_block_hash}"))?;
-
-            // Track only the `97b1`-prefix txids accepted at this chain block.
-            // We drain them as we find them — first from the chain block's own
-            // body, then (if any are still missing) from each mergeset block.
-            // In Kaspa BlockDAG, most user txs live in mergeset blocks rather
-            // than the chain block itself, so the mergeset pass is the bulk
-            // of the matches.
-            let mut remaining: std::collections::HashSet<[u8; 32]> = accepted_ids
-                .iter()
-                .map(|h| h.as_bytes())
-                .filter(|t| parser.txid_matches(t))
-                .collect();
             let mut igra_txs: Vec<IgraTx> = Vec::new();
-            drain_block_txs(&chain_block.transactions, &mut remaining, parser, &mut igra_txs);
-
-            if !remaining.is_empty() {
-                if let Some(verbose) = &chain_block.verbose_data {
-                    let mergeset: Vec<RpcHash> = verbose
-                        .merge_set_blues_hashes
-                        .iter()
-                        .chain(verbose.merge_set_reds_hashes.iter())
-                        .copied()
-                        .collect();
-                    for mh in mergeset {
-                        if remaining.is_empty() {
-                            break;
-                        }
-                        let merged = client
-                            .get_block(mh, true)
-                            .await
-                            .with_context(|| format!("get_block (mergeset) {mh}"))?;
-                        drain_block_txs(&merged.transactions, &mut remaining, parser, &mut igra_txs);
+            for tx in &collected {
+                let parsed = match parser.parse(&tx.txid, &tx.payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            kaspa_txid = %hex::encode(tx.txid),
+                            err = %e,
+                            "skipping malformed igra payload"
+                        );
+                        continue;
                     }
-                }
-                if !remaining.is_empty() {
-                    warn!(
-                        chain_block = %chain_block_hash,
-                        missing = remaining.len(),
-                        "accepted Igra txids not found in chain block or its mergeset"
-                    );
+                };
+                if let Some(payload) = parsed {
+                    igra_txs.push(IgraTx {
+                        kaspa_txid: tx.txid,
+                        payload,
+                    });
                 }
             }
 
-            // Tally + write.
             for itx in &igra_txs {
                 match itx.payload {
                     IgraKaspaPayload::L2Submission { .. } => stats.submissions_seen += 1,
@@ -308,43 +274,6 @@ async fn walk_and_insert(
     }
 
     Ok(stats)
-}
-
-/// Drain igra-relevant txs from `block_txs` whose txid is in `remaining`.
-/// Removes hits from `remaining` and appends parsed payloads to `out`.
-/// Only `97b1`-prefix txs are checked; everything else is skipped.
-fn drain_block_txs(
-    block_txs: &[kaspa_rpc_core::RpcTransaction],
-    remaining: &mut std::collections::HashSet<[u8; 32]>,
-    parser: &IgraPayloadParser,
-    out: &mut Vec<IgraTx>,
-) {
-    for tx in block_txs {
-        let Some(verbose) = &tx.verbose_data else {
-            continue;
-        };
-        let txid: [u8; 32] = verbose.transaction_id.as_bytes();
-        if !remaining.remove(&txid) {
-            continue;
-        }
-        let parsed = match parser.parse(&txid, &tx.payload) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    kaspa_txid = %hex::encode(txid),
-                    err = %e,
-                    "skipping malformed igra payload"
-                );
-                continue;
-            }
-        };
-        if let Some(payload) = parsed {
-            out.push(IgraTx {
-                kaspa_txid: txid,
-                payload,
-            });
-        }
-    }
 }
 
 /// Insert a batch of igra txs into the final tables. Idempotent via

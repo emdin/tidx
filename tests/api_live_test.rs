@@ -419,3 +419,50 @@ fn test_inject_block_filter_where_keyword_in_string_literal() {
     assert!(filtered.contains("txs.block_num = 100"), "got: {filtered}");
     assert!(filtered.contains("'WHERE clause test'"), "should preserve string literal");
 }
+
+#[tokio::test]
+#[serial(db)]
+async fn test_kaspa_coverage_endpoint_shape_and_floor_semantics() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/status/kaspa-coverage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Contract fields the dev's "fail loudly" check depends on.
+    assert!(v.get("first_linked_block").is_some(), "{v}");
+    assert!(v.get("first_linked_at").is_some(), "{v}");
+    assert!(v.get("monthly").is_some_and(|m| m.is_array()), "{v}");
+    assert!(v.get("computed_at").is_some(), "{v}");
+    assert!(v.get("cache_ttl_secs").is_some(), "{v}");
+
+    // On an empty/unlinked DB the floor must be null (absent data reads as
+    // "no provenance", never as block 0) — that IS the loud-failure
+    // semantic: consumers must treat null floor as "nothing linked".
+    if v["monthly"].as_array().unwrap().is_empty() {
+        assert!(v["first_linked_block"].is_null());
+        assert!(v["first_linked_at"].is_null());
+    }
+
+    // Monthly entries, when present, carry the full per-month contract.
+    if let Some(first) = v["monthly"].as_array().unwrap().first() {
+        for key in ["month", "l2_txs", "linked", "linked_pct", "with_fee", "fee_pct"] {
+            assert!(first.get(key).is_some(), "monthly entry missing {key}: {first}");
+        }
+    }
+}
