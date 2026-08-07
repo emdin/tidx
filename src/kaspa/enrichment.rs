@@ -9,9 +9,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::db;
@@ -59,11 +57,16 @@ pub fn is_retriable_status(s: StatusCode) -> bool {
         || s.is_server_error()
 }
 
-/// Subset of api.kaspa.org's `/transactions/{id}` response that we care
-/// about. Other fields (verbose data, signature scripts, mass, etc.) are
-/// intentionally not bound — serde will ignore them.
+/// Subset of api.kaspa.org's `/transactions/{id}` (and the batch
+/// `/transactions/search`) response that we care about. Other fields
+/// (verbose data, signature scripts, mass, etc.) are intentionally not
+/// bound — serde will ignore them.
 #[derive(Deserialize, Debug, PartialEq, Eq)]
 pub struct ApiTransaction {
+    /// Present in batch responses — used to key results back to the
+    /// requested txids (response order is NOT guaranteed).
+    #[serde(default)]
+    pub transaction_id: Option<String>,
     #[serde(default)]
     pub inputs: Vec<ApiInput>,
     #[serde(default)]
@@ -94,6 +97,27 @@ pub fn build_tx_url(rest_base: &str, txid: &[u8]) -> String {
         rest_base.trim_end_matches('/'),
         hex::encode(txid),
     )
+}
+
+/// Batch endpoint: one POST resolves up to [`MAX_SEARCH_BATCH`] txs with
+/// previous outpoints, ~1000× cheaper per row than the per-tx GET (probed
+/// 2026-08-08: 500 cold-storage txs in 0.75s vs ~1s per tx on the GET
+/// path — the GET cost is per-request overhead, not data temperature).
+pub fn build_search_url(rest_base: &str) -> String {
+    format!(
+        "{}/transactions/search?resolve_previous_outpoints=light",
+        rest_base.trim_end_matches('/'),
+    )
+}
+
+/// Server-side cap on /transactions/search batch size (kaspa-rest-server
+/// accepts up to 1000; we stay at 500 — verified live, comfortable margin).
+pub const MAX_SEARCH_BATCH: usize = 500;
+
+/// JSON body for the batch search request. Pure for testability.
+pub fn build_search_body(txids: &[Vec<u8>]) -> String {
+    let ids: Vec<String> = txids.iter().map(hex::encode).collect();
+    serde_json::json!({ "transactionIds": ids }).to_string()
 }
 
 /// Build the per-row UPDATE SQL for a given table. The table name is
@@ -226,14 +250,103 @@ async fn try_fetch_enrichment_once(
         // help if it's a transient flakiness. Treat as transient.
         Err(e) => return Err(FetchError::Transient(e)),
     };
-    let mut senders = Vec::with_capacity(parsed.inputs.len());
-    let mut sender_amounts = Vec::with_capacity(parsed.inputs.len());
-    for input in &parsed.inputs {
+    Ok(extract_enriched(&parsed))
+}
+
+/// Project an `ApiTransaction` into the writable `EnrichedTx`. Shared by
+/// the single-tx and batch fetch paths.
+fn extract_enriched(tx: &ApiTransaction) -> EnrichedTx {
+    let mut senders = Vec::with_capacity(tx.inputs.len());
+    let mut sender_amounts = Vec::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
         senders.push(input.previous_outpoint_address.clone().unwrap_or_default());
         sender_amounts.push(input.previous_outpoint_amount.unwrap_or(0));
     }
-    let fee_sompi = compute_fee_from_api_tx(&parsed);
-    Ok(EnrichedTx { senders, sender_amounts, fee_sompi })
+    let fee_sompi = compute_fee_from_api_tx(tx);
+    EnrichedTx { senders, sender_amounts, fee_sompi }
+}
+
+/// Fetch a whole batch of txs via `POST /transactions/search`. Returns a
+/// map keyed by the raw txid bytes — the response order is not guaranteed
+/// and txs unknown to the API are simply absent from the response, so the
+/// caller diffs the map against its request list to find misses.
+///
+/// Rate-limit safety: this is ONE request regardless of batch size; the
+/// caller runs batches strictly sequentially with an inter-batch delay.
+/// Retries use the same policy/classification as the single-tx path —
+/// 429/5xx back off exponentially, other 4xx are permanent.
+pub async fn fetch_enrichment_batch(
+    client: &Client,
+    search_url: &str,
+    txids: &[Vec<u8>],
+    policy: RetryPolicy,
+) -> Result<std::collections::HashMap<Vec<u8>, EnrichedTx>> {
+    let body = build_search_body(txids);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..policy.max_attempts {
+        match try_fetch_batch_once(client, search_url, &body).await {
+            Ok(list) => {
+                let mut out = std::collections::HashMap::with_capacity(list.len());
+                for tx in &list {
+                    let Some(id_hex) = &tx.transaction_id else {
+                        continue;
+                    };
+                    let Ok(id) = hex::decode(id_hex) else {
+                        continue;
+                    };
+                    out.insert(id, extract_enriched(tx));
+                }
+                return Ok(out);
+            }
+            Err(FetchError::Permanent(e)) => return Err(e),
+            Err(FetchError::Transient(e)) => {
+                last_err = Some(e);
+                if attempt + 1 < policy.max_attempts {
+                    let delay = policy.delay_for_attempt(attempt);
+                    debug!(
+                        attempt = attempt + 1,
+                        max_attempts = policy.max_attempts,
+                        sleep_ms = delay.as_millis() as u64,
+                        batch = txids.len(),
+                        "transient batch fetch error; backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("fetch_enrichment_batch: out of retries with no error")))
+}
+
+async fn try_fetch_batch_once(
+    client: &Client,
+    url: &str,
+    body: &str,
+) -> std::result::Result<Vec<ApiTransaction>, FetchError> {
+    let resp = match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Err(FetchError::Transient(anyhow::anyhow!(e))),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = format!("HTTP {status} for batch search");
+        return if is_retriable_status(status) {
+            Err(FetchError::Transient(anyhow::anyhow!(msg)))
+        } else {
+            Err(FetchError::Permanent(anyhow::anyhow!(msg)))
+        };
+    }
+    match resp.json().await.context("parse api.kaspa.org batch json") {
+        Ok(list) => Ok(list),
+        Err(e) => Err(FetchError::Transient(e)),
+    }
 }
 
 /// Outcome of a full enrichment run on one table.
@@ -248,92 +361,131 @@ pub struct EnrichmentStats {
 /// resolved sender data from `rest_base`, and UPDATE the row. Idempotent
 /// — re-runs after partial failures or new rows pick up only the still-NULL
 /// rows.
+/// Delay between successful batch requests. One batch = one HTTP request
+/// for up to [`MAX_SEARCH_BATCH`] rows; at 500ms spacing that's ~2 req/s —
+/// the same request rate the old per-tx path ran at concurrency=2, but
+/// moving 500× the rows per request. Politeness first: we could go
+/// faster (probed 10 back-to-back batches with zero 429s), but there's no
+/// need — this still finishes 4.5M rows in ~2-3 hours.
+const INTER_BATCH_DELAY: Duration = Duration::from_millis(500);
+
+/// Cool-down after a batch fails all its retries (e.g. sustained 429 or
+/// 5xx storm). Long pause instead of hammering the next batch into the
+/// same wall.
+const BATCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Walk all rows in `table` missing senders or fee, resolve them via the
+/// batch search endpoint, and UPDATE each row. Idempotent — re-runs pick
+/// up only still-NULL rows.
+///
+/// Keyset pagination on `(created_at, kaspa_txid)` descending — NOT a bare
+/// `WHERE ... IS NULL LIMIT n` re-poll. Rows the API doesn't return (or
+/// that legitimately have no computable fee) stay NULL, and a re-poll
+/// design would re-select them forever and never advance past the first
+/// stuck batch. The cursor guarantees forward progress; stragglers get
+/// re-attempted on the NEXT full run, not in this one.
 pub async fn enrich_table(
     pool: &db::Pool,
     client: &Client,
     rest_base: &str,
     table: &str,
-    concurrency: usize,
+    _concurrency: usize,
     batch_size: usize,
     max_rows: Option<usize>,
 ) -> Result<EnrichmentStats> {
-    info!(table = %table, "starting enrichment scan");
+    info!(table = %table, "starting enrichment scan (batch mode)");
     let mut stats = EnrichmentStats::default();
+    let search_url = build_search_url(rest_base);
+    let req_batch = batch_size.clamp(1, MAX_SEARCH_BATCH);
+    // (created_at, kaspa_txid) keyset cursor; None = start from newest.
+    let mut cursor: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = None;
 
     loop {
-        // Pull the next batch of un-enriched txids. Widened WHERE clause to
-        // include rows missing EITHER senders OR fee — so an already-senders-
-        // enriched row without a fee gets picked up on this next sweep.
-        // ORDER BY accepted_at DESC to give researchers a monotonic
-        // "everything from date X back is enriched" guarantee: partial
-        // completion is always usable for recent windows.
         let conn = pool.get().await?;
-        let rows = conn
-            .query(
-                &format!(
-                    "SELECT kaspa_txid FROM {table}
-                     WHERE l1_senders IS NULL OR l1_fee_sompi IS NULL
-                     ORDER BY created_at DESC
-                     LIMIT $1"
-                ),
-                &[&(batch_size as i64)],
-            )
-            .await?;
+        let rows = match &cursor {
+            None => {
+                conn.query(
+                    &format!(
+                        "SELECT kaspa_txid, created_at FROM {table}
+                         WHERE l1_senders IS NULL OR l1_fee_sompi IS NULL
+                         ORDER BY created_at DESC, kaspa_txid DESC
+                         LIMIT $1"
+                    ),
+                    &[&(req_batch as i64)],
+                )
+                .await?
+            }
+            Some((ts, id)) => {
+                conn.query(
+                    &format!(
+                        "SELECT kaspa_txid, created_at FROM {table}
+                         WHERE (l1_senders IS NULL OR l1_fee_sompi IS NULL)
+                           AND (created_at, kaspa_txid) < ($2, $3)
+                         ORDER BY created_at DESC, kaspa_txid DESC
+                         LIMIT $1"
+                    ),
+                    &[&(req_batch as i64), ts, &id.as_slice()],
+                )
+                .await?
+            }
+        };
         drop(conn);
 
-        let txids: Vec<Vec<u8>> = rows.iter().map(|r| r.get::<_, Vec<u8>>(0)).collect();
-        if txids.is_empty() {
+        if rows.is_empty() {
             info!(table = %table, "no more rows to enrich");
             break;
         }
+        let txids: Vec<Vec<u8>> = rows.iter().map(|r| r.get::<_, Vec<u8>>(0)).collect();
+        let last = rows.last().unwrap();
+        cursor = Some((last.get::<_, chrono::DateTime<chrono::Utc>>(1), last.get::<_, Vec<u8>>(0)));
 
-        // Concurrent fetches with a semaphore to limit pressure on the API.
-        let sem = Arc::new(Semaphore::new(concurrency.max(1)));
-        let mut tasks = Vec::with_capacity(txids.len());
-        for txid in &txids {
-            let permit = sem.clone().acquire_owned().await?;
-            let client = client.clone();
-            let url = build_tx_url(rest_base, txid);
-            let txid = txid.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = permit; // dropped at task end → releases semaphore slot
-                fetch_enrichment(&client, &url, &txid).await.map(|e| (txid, e))
-            }));
-        }
-
-        let mut updates: Vec<(Vec<u8>, EnrichedTx)> = Vec::new();
-        for t in tasks {
-            match t.await {
-                Ok(Ok((txid, enriched))) => {
-                    if enriched.senders.is_empty() {
-                        stats.no_inputs += 1;
+        // One POST for the whole batch, strictly sequential.
+        match fetch_enrichment_batch(client, &search_url, &txids, RetryPolicy::default_polite())
+            .await
+        {
+            Ok(resolved) => {
+                let misses = txids.len() - resolved.len();
+                stats.failed += misses;
+                let mut updates: Vec<(&Vec<u8>, &EnrichedTx)> = Vec::with_capacity(resolved.len());
+                for txid in &txids {
+                    if let Some(e) = resolved.get(txid) {
+                        if e.senders.is_empty() {
+                            stats.no_inputs += 1;
+                        }
+                        updates.push((txid, e));
                     }
-                    updates.push((txid, enriched));
                 }
-                Ok(Err(e)) => {
-                    debug!(err = %e, "fetch failed; will retry on next pass");
-                    stats.failed += 1;
-                }
-                Err(e) => {
-                    warn!(err = %e, "task join failed");
-                    stats.failed += 1;
-                }
-            }
-        }
 
-        if !updates.is_empty() {
-            let mut conn = pool.get().await?;
-            let tx = conn.transaction().await?;
-            let sql = build_update_sql(table);
-            for (txid, e) in &updates {
-                tx.execute(
-                    &sql,
-                    &[&txid.as_slice(), &e.senders, &e.sender_amounts, &e.fee_sompi],
-                )
-                .await?;
+                if !updates.is_empty() {
+                    let mut conn = pool.get().await?;
+                    let tx = conn.transaction().await?;
+                    let sql = build_update_sql(table);
+                    for (txid, e) in &updates {
+                        tx.execute(
+                            &sql,
+                            &[&txid.as_slice(), &e.senders, &e.sender_amounts, &e.fee_sompi],
+                        )
+                        .await?;
+                    }
+                    tx.commit().await?;
+                    stats.enriched += updates.len();
+                }
+                tokio::time::sleep(INTER_BATCH_DELAY).await;
             }
-            tx.commit().await?;
-            stats.enriched += updates.len();
+            Err(e) => {
+                // Whole batch failed after retries — likely rate limiting or
+                // an API outage. Cool down hard before the next batch; the
+                // cursor has already advanced so we don't re-hit the same
+                // rows this run.
+                warn!(
+                    err = %e,
+                    batch = txids.len(),
+                    cooldown_secs = BATCH_FAILURE_COOLDOWN.as_secs(),
+                    "batch fetch failed after retries; cooling down"
+                );
+                stats.failed += txids.len();
+                tokio::time::sleep(BATCH_FAILURE_COOLDOWN).await;
+            }
         }
 
         info!(
@@ -566,7 +718,7 @@ mod tests {
 
     #[test]
     fn compute_fee_normal_positive() {
-        let tx = ApiTransaction {
+        let tx = ApiTransaction { transaction_id: None,
             inputs: vec![ApiInput {
                 previous_outpoint_address: Some("k".into()),
                 previous_outpoint_amount: Some(1000),
@@ -578,7 +730,7 @@ mod tests {
 
     #[test]
     fn compute_fee_coinbase_returns_none() {
-        let tx = ApiTransaction {
+        let tx = ApiTransaction { transaction_id: None,
             inputs: vec![],
             outputs: vec![ApiOutput { amount: Some(50_000_000_000) }],
         };
@@ -588,7 +740,7 @@ mod tests {
     #[test]
     fn compute_fee_outputs_exceed_inputs_returns_none() {
         // Invalid on real chain — prefer None over inserting a wraparound.
-        let tx = ApiTransaction {
+        let tx = ApiTransaction { transaction_id: None,
             inputs: vec![ApiInput {
                 previous_outpoint_address: None,
                 previous_outpoint_amount: Some(100),
@@ -600,7 +752,7 @@ mod tests {
 
     #[test]
     fn compute_fee_zero_fee_is_valid() {
-        let tx = ApiTransaction {
+        let tx = ApiTransaction { transaction_id: None,
             inputs: vec![ApiInput {
                 previous_outpoint_address: None,
                 previous_outpoint_amount: Some(1000),
@@ -608,6 +760,164 @@ mod tests {
             outputs: vec![ApiOutput { amount: Some(1000) }],
         };
         assert_eq!(compute_fee_from_api_tx(&tx), Some(0));
+    }
+
+    // ---------- batch search (POST /transactions/search) ----------
+
+    #[test]
+    fn builds_search_url() {
+        assert_eq!(
+            build_search_url("https://api.kaspa.org"),
+            "https://api.kaspa.org/transactions/search?resolve_previous_outpoints=light"
+        );
+        assert_eq!(
+            build_search_url("https://api.kaspa.org/"),
+            "https://api.kaspa.org/transactions/search?resolve_previous_outpoints=light"
+        );
+    }
+
+    #[test]
+    fn builds_search_body_hex_encodes_txids() {
+        let body = build_search_body(&[vec![0x97, 0xb1], vec![0xaa, 0xbb]]);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["transactionIds"],
+            serde_json::json!(["97b1", "aabb"])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_keys_results_by_txid_regardless_of_order() {
+        // Response deliberately in REVERSE order of the request, with full
+        // 32-byte txids. Both must key correctly.
+        let body = br#"[
+            {
+                "transaction_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "inputs": [ {"previous_outpoint_address": "kaspa:b", "previous_outpoint_amount": 200} ],
+                "outputs": [ {"amount": 150} ]
+            },
+            {
+                "transaction_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "inputs": [ {"previous_outpoint_address": "kaspa:a", "previous_outpoint_amount": 1000} ],
+                "outputs": [ {"amount": 900} ]
+            }
+        ]"#;
+        let addr = spawn_canned_http_server(body, "200 OK").await;
+        let url = format!("http://{addr}/transactions/search");
+        let client = Client::builder().build().unwrap();
+        let tx_a = vec![0xaa; 32];
+        let tx_b = vec![0xbb; 32];
+        let map = fetch_enrichment_batch(
+            &client,
+            &url,
+            &[tx_a.clone(), tx_b.clone()],
+            RetryPolicy::default_polite(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&tx_a].senders, vec!["kaspa:a".to_string()]);
+        assert_eq!(map[&tx_a].fee_sompi, Some(100));
+        assert_eq!(map[&tx_b].senders, vec!["kaspa:b".to_string()]);
+        assert_eq!(map[&tx_b].fee_sompi, Some(50));
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_missing_txs_absent_from_map() {
+        // Requested 2, API knows only 1 — the other is simply absent, NOT
+        // an error. Caller counts it as a miss and moves on (cursor design
+        // guarantees we don't spin on it).
+        let body = br#"[
+            {
+                "transaction_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "inputs": [ {"previous_outpoint_amount": 10} ],
+                "outputs": [ {"amount": 8} ]
+            }
+        ]"#;
+        let addr = spawn_canned_http_server(body, "200 OK").await;
+        let url = format!("http://{addr}/transactions/search");
+        let client = Client::builder().build().unwrap();
+        let known = vec![0xaa; 32];
+        let unknown = vec![0xcc; 32];
+        let map = fetch_enrichment_batch(
+            &client,
+            &url,
+            &[known.clone(), unknown.clone()],
+            RetryPolicy::default_polite(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&known));
+        assert!(!map.contains_key(&unknown));
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_retries_transient_503_then_succeeds() {
+        let success: &[u8] = br#"[
+            {
+                "transaction_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "inputs": [ {"previous_outpoint_amount": 7} ],
+                "outputs": []
+            }
+        ]"#;
+        let addr = spawn_n_failures_then_success(2, success).await;
+        let url = format!("http://{addr}/transactions/search");
+        let client = Client::builder().build().unwrap();
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(10),
+        };
+        let id = vec![0xaa; 32];
+        let map = fetch_enrichment_batch(&client, &url, &[id.clone()], policy)
+            .await
+            .expect("recovers from 2 503s");
+        assert_eq!(map[&id].fee_sompi, Some(7));
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_permanent_400_fails_fast() {
+        let addr = spawn_canned_http_server(b"bad request", "400 Bad Request").await;
+        let url = format!("http://{addr}/transactions/search");
+        let client = Client::builder().build().unwrap();
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_secs(60), // observed if erroneously retried
+            max_backoff: Duration::from_secs(60),
+        };
+        let start = std::time::Instant::now();
+        let result =
+            fetch_enrichment_batch(&client, &url, &[vec![0xaa; 32]], policy).await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "400 must fail immediately without retry sleep"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_skips_entries_with_missing_or_garbage_txid() {
+        // Entries without transaction_id or with non-hex ids must be skipped
+        // silently, not poison the whole batch.
+        let body = br#"[
+            { "inputs": [ {"previous_outpoint_amount": 1} ], "outputs": [] },
+            { "transaction_id": "zzzz-not-hex", "inputs": [], "outputs": [] },
+            {
+                "transaction_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "inputs": [ {"previous_outpoint_amount": 5} ],
+                "outputs": [ {"amount": 2} ]
+            }
+        ]"#;
+        let addr = spawn_canned_http_server(body, "200 OK").await;
+        let url = format!("http://{addr}/transactions/search");
+        let client = Client::builder().build().unwrap();
+        let id = vec![0xaa; 32];
+        let map = fetch_enrichment_batch(&client, &url, &[id.clone()], RetryPolicy::default_polite())
+            .await
+            .unwrap();
+        assert_eq!(map.len(), 1, "only the well-formed entry survives");
+        assert_eq!(map[&id].fee_sompi, Some(3));
     }
 
     // ---------- retry policy / status classification ----------
@@ -679,7 +989,7 @@ mod tests {
         use tokio::io::AsyncWriteExt as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let (mut sock, _) = match listener.accept().await {
