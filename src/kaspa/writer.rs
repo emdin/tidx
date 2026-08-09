@@ -284,6 +284,11 @@ impl KaspaProvenanceWriter {
 
         let l2_rows = tx
             .query(
+                // Keyed on kaspa_txid throughout — an L2 tx may have
+                // MULTIPLE L1 carriers (verified on mainnet; see the
+                // multi-carrier note in db/kaspa_provenance.sql). Keying
+                // the DELETE on l2_tx_hash would evict sibling carriers
+                // that have not been promoted yet.
                 "WITH due AS (
                     SELECT l2_tx_hash, kaspa_txid
                     FROM kaspa_pending_l2_submissions
@@ -292,16 +297,16 @@ impl KaspaProvenanceWriter {
                  inserted AS (
                     INSERT INTO kaspa_l2_submissions (l2_tx_hash, kaspa_txid)
                     SELECT l2_tx_hash, kaspa_txid FROM due
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (kaspa_txid) DO NOTHING
                     RETURNING l2_tx_hash, kaspa_txid, created_at
                  ),
                  deleted AS (
                     DELETE FROM kaspa_pending_l2_submissions p
                     USING due d
-                    WHERE p.l2_tx_hash = d.l2_tx_hash
+                    WHERE p.kaspa_txid = d.kaspa_txid
                       AND EXISTS (
                         SELECT 1 FROM kaspa_l2_submissions f
-                        WHERE f.l2_tx_hash = p.l2_tx_hash
+                        WHERE f.kaspa_txid = p.kaspa_txid
                       )
                  )
                  SELECT l2_tx_hash, kaspa_txid, created_at FROM inserted",

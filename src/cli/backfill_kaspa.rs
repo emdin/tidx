@@ -310,9 +310,11 @@ async fn insert_batch(pool: &db::Pool, txs: &[IgraTx]) -> Result<(u64, u64)> {
     if !sub_l2_hashes.is_empty() {
         let n = tx
             .execute(
+                // Conflict target is kaspa_txid (the L1 carrier identity) —
+                // an L2 tx can legitimately have several carriers.
                 "INSERT INTO kaspa_l2_submissions (l2_tx_hash, kaspa_txid)
                  SELECT * FROM UNNEST($1::bytea[], $2::bytea[])
-                 ON CONFLICT (l2_tx_hash) DO NOTHING",
+                 ON CONFLICT (kaspa_txid) DO NOTHING",
                 &[&sub_l2_hashes, &sub_kaspa_txids],
             )
             .await
