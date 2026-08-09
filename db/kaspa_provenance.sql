@@ -163,3 +163,66 @@ CREATE INDEX IF NOT EXISTS idx_kaspa_entries_enrichment_pending
 CREATE INDEX IF NOT EXISTS idx_kaspa_l2_submissions_enrichment_pending
     ON kaspa_l2_submissions (kaspa_txid)
     WHERE l1_senders IS NULL;
+
+-- ---------------------------------------------------------------------
+-- Multi-carrier support (2026-08-09).
+--
+-- An L2 tx can be carried to Kaspa L1 by MORE THAN ONE accepted L1 tx.
+-- Verified on mainnet: L2 tx 0xb42a582d… was carried by BOTH
+-- 97b171d13ced4666… (sender kaspa:qqjtfplm…) and 97b15b8e0b6b8f9a…
+-- (sender kaspa:qpc2dpys…), accepted in different Kaspa blocks 1.27s
+-- apart, each paying 219,100 sompi. Kaspa does not dedupe them — both
+-- are real accepted L1 txs; the L2 sequencer includes the tx once.
+--
+-- The original PK on l2_tx_hash therefore silently discarded every
+-- carrier after the first (~7.8% of 97b1 traffic in a 2.5-day sample),
+-- along with its sender and its very real fee — so "L1 fees paid"
+-- undercounted.
+--
+-- kaspa_txid is the natural identity of an L1 carrier and is already
+-- UNIQUE, so promoting it to PK is a metadata-only change (Postgres
+-- reuses the existing unique index; no table rewrite). l2_tx_hash
+-- becomes a plain non-unique index.
+--
+-- CONSUMER-VISIBLE BREAKING CHANGE: joins on l2_tx_hash now fan out to
+-- N rows per L2 tx. Aggregate or use DISTINCT ON (l2_tx_hash) where a
+-- single row per L2 tx is required.
+DO $$
+BEGIN
+    -- Only act while the PK is still the (wrong) l2_tx_hash.
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+        WHERE c.conrelid = 'kaspa_l2_submissions'::regclass
+          AND c.contype = 'p' AND a.attname = 'l2_tx_hash'
+    ) THEN
+        ALTER TABLE kaspa_l2_submissions DROP CONSTRAINT kaspa_l2_submissions_pkey;
+        -- The pre-existing UNIQUE(kaspa_txid) owns its index, so it cannot be
+        -- promoted via USING INDEX; drop it and let ADD PRIMARY KEY rebuild.
+        ALTER TABLE kaspa_l2_submissions
+            DROP CONSTRAINT IF EXISTS kaspa_l2_submissions_kaspa_txid_key;
+        ALTER TABLE kaspa_l2_submissions ADD PRIMARY KEY (kaspa_txid);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_kaspa_l2_submissions_l2_tx_hash
+    ON kaspa_l2_submissions (l2_tx_hash);
+
+-- Same reasoning for the pending table (rows flow pending -> final).
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+        WHERE c.conrelid = 'kaspa_pending_l2_submissions'::regclass
+          AND c.contype = 'p' AND a.attname = 'l2_tx_hash'
+    ) THEN
+        ALTER TABLE kaspa_pending_l2_submissions DROP CONSTRAINT kaspa_pending_l2_submissions_pkey;
+        ALTER TABLE kaspa_pending_l2_submissions
+            DROP CONSTRAINT IF EXISTS kaspa_pending_l2_submissions_kaspa_txid_key;
+        ALTER TABLE kaspa_pending_l2_submissions ADD PRIMARY KEY (kaspa_txid);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_kaspa_pending_l2_submissions_l2_tx_hash
+    ON kaspa_pending_l2_submissions (l2_tx_hash);
