@@ -454,9 +454,18 @@ async fn handle_kaspa_coverage(
 
     // Serial plan: the parallel one needs more /dev/shm than the prod
     // container has (see 2026-08-04 shared-memory errors).
-    conn.batch_execute("SET max_parallel_workers_per_gather = 0")
-        .await
-        .map_err(|e| ApiError::QueryError(e.to_string()))?;
+    //
+    // statement_timeout: the pool leaves it unset (API default), but this
+    // JOIN over ~5M txs × kaspa_l2_submissions measured 26s on prod
+    // 2026-08-09 and grows with the chain — well past any default. Give it
+    // its own generous ceiling; the 15-minute cache means we pay this at
+    // most 4×/hour. Without this the endpoint returns {"ok":false,
+    // "error":"db error"} once the table crosses the timeout.
+    conn.batch_execute(
+        "SET max_parallel_workers_per_gather = 0; SET statement_timeout = 120000",
+    )
+    .await
+    .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     let floor = conn
         .query_one(
