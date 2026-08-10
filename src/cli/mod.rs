@@ -1,5 +1,6 @@
 pub mod backfill_denorm;
 pub mod backfill_kaspa;
+pub mod backfill_kaspa_rest;
 pub mod backfill_kaspa_tx_index;
 pub mod backfill_receipt_data;
 pub mod backfill_traces;
@@ -49,6 +50,11 @@ pub enum Commands {
     /// node's virtual chain. Idempotent. Use against local kaspad-archive or
     /// archival.kaspa.ws to recover provenance pre-dating the tidx deploy.
     BackfillKaspa(backfill_kaspa::Args),
+    /// Recover historical L1 carriers by enumerating accepted Kaspa txs
+    /// through a kaspa-rest-server (POST /transactions/search over a
+    /// bluescore range). Works past kaspad's pruning horizon, which the
+    /// chain-walk CLIs cannot. Idempotent.
+    BackfillKaspaRest(backfill_kaspa_rest::Args),
     /// Populate `kaspa_tx_index` (txid → block_hash) by walking a Kaspa
     /// wRPC node's virtual chain. Required primitive for local L1 fee
     /// enrichment — kaspad has no native tx-by-id lookup. Idempotent.
