@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         Commands::BackfillTraces(args) => cli::backfill_traces::run(args).await,
         Commands::BackfillKaspa(args) => cli::backfill_kaspa::run(args).await,
         Commands::BackfillKaspaTxIndex(args) => cli::backfill_kaspa_tx_index::run(args).await,
+        Commands::BackfillKaspaRest(args) => cli::backfill_kaspa_rest::run(args).await,
         Commands::EnrichL1Senders(args) => cli::enrich_l1_senders::run(args).await,
         Commands::EnrichL1Fees(args) => cli::enrich_l1_fees::run(args).await,
         Commands::ImportBlockscout(args) => cli::import_blockscout::run(args).await,
