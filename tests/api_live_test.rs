@@ -189,6 +189,70 @@ async fn test_query_post_rejects_non_select() {
     );
 }
 
+/// A `signature` in the POST JSON body must build the event CTE, so
+/// `FROM <EventName>` resolves. Previously signatures were read only from the
+/// URL, so a body signature was dropped and the query failed with
+/// "table <eventname> not allowed". Empty `logs` is fine — 0 rows, ok:true.
+#[tokio::test]
+#[serial(db)]
+async fn test_query_post_signature_in_body_is_honored() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/query")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"sql":"SELECT * FROM Transfer LIMIT 1","chainId":1,"signature":"Transfer(address,address,uint256)"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["ok"], true,
+        "body signature must build the Transfer CTE (was 'table transfer not allowed'): {json}"
+    );
+}
+
+/// Same, accepting an array of signatures in the body.
+#[tokio::test]
+#[serial(db)]
+async fn test_query_post_signature_array_in_body() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/query")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"sql":"SELECT * FROM Transfer LIMIT 1","chainId":1,"signature":["Transfer(address,address,uint256)"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true, "array-form body signature must also work: {json}");
+}
+
 #[tokio::test]
 #[serial(db)]
 async fn test_query_select_txs() {

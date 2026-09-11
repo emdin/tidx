@@ -566,6 +566,30 @@ pub struct QueryParams {
     /// Force a specific engine: "postgres" or "clickhouse"
     #[serde(default)]
     engine: Option<String>,
+    /// Event signature(s) for the `?signature=` CTE helper, when supplied in a
+    /// POST JSON body. Accepts a single string or an array. GET requests carry
+    /// these as repeated `?signature=` query params instead (see
+    /// `extract_signatures`); this field only backs the POST body path.
+    #[serde(default, deserialize_with = "string_or_vec")]
+    signature: Vec<String>,
+}
+
+/// Deserialize a field that may be a single string (`"Transfer(...)"`) or an
+/// array of strings (`["A(...)", "B(...)"]`) into a `Vec<String>`.
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 fn default_timeout() -> u64 {
@@ -612,7 +636,11 @@ async fn handle_query_post(
     uri: axum::http::Uri,
     Json(params): Json<QueryParams>,
 ) -> Response {
-    let signatures = extract_signatures(uri.query());
+    // Signatures may arrive in the JSON body (`signature`) and/or as `?signature=`
+    // URL params; merge both so a POST body signature is honored (previously it
+    // was silently dropped and `FROM <EventName>` failed as "table not allowed").
+    let mut signatures = extract_signatures(uri.query());
+    signatures.extend(params.signature.iter().cloned());
     dispatch_query(state, params, signatures).await
 }
 
@@ -668,8 +696,11 @@ async fn handle_query_once(
                 ))
             })?;
 
+        // ClickHouse has no built-in cap here, so enforce it on the SQL: append
+        // a LIMIT when absent and clamp an explicit LIMIT to HARD_LIMIT_CLICKHOUSE.
+        let ch_sql = crate::query::enforce_limit(&params.sql, options.limit, cap);
         clickhouse
-            .query(&params.sql, &sigs)
+            .query(&ch_sql, &sigs)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
