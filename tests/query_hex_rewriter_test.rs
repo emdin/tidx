@@ -119,6 +119,35 @@ async fn column_comparison_literal_still_converts_to_bytea() {
     );
 }
 
+/// Regression: the `?signature=` CTE path. The generator rewrites a pushdown
+/// filter into `"col" = '0x…'` and the CTE itself compares `selector = '\x…'`;
+/// both must still reach Postgres as bytea. Empty `logs` → 0 rows, ok:true;
+/// a missed conversion surfaces as "operator does not exist: bytea = text".
+#[tokio::test]
+#[serial(db)]
+async fn signature_cte_with_pushdown_filter_still_converts() {
+    let db = TestDb::empty().await;
+    let mut app = service(db.pool.clone()).await;
+
+    // Params must be NAMED for the CTE to expose `"to"` as a column (an
+    // unnamed `Transfer(address,address,uint256)` yields no `"to"`; verified
+    // against prod: `column "to" does not exist`).
+    let sig = "Transfer(address%20from,address%20to,uint256%20value)";
+    let uri = format!(
+        "/query?sql=SELECT%20count(*)%20AS%20n%20FROM%20Transfer%20WHERE%20%22to%22%3D%270xC281cb25715EA8e46c9B916F22aE7c0F55b014d7%27&chainId=1&signature={sig}"
+    );
+    let resp = app
+        .call(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    // Read the body BEFORE asserting status so a failure shows the error text.
+    let status = resp.status();
+    let json = body_json(resp).await;
+    assert_eq!(json["ok"], true, "signature + pushdown must still convert to bytea (HTTP {status}): {json}");
+    assert_eq!(status, StatusCode::OK);
+}
+
 /// Regression: IN-list of hex literals against a column still converts.
 #[tokio::test]
 #[serial(db)]

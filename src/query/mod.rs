@@ -16,99 +16,77 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
 
-/// How to rewrite a `'0x…'` hex literal that sits in a column-comparison.
-#[derive(Clone, Copy)]
-enum HexMode {
-    /// `'0x…'` → `'\x…'` so Postgres accepts it as a bytea literal.
-    PostgresBytea,
-    /// `'0x…'` → `'0x<lowercased>'` so it matches ClickHouse's lowercase
-    /// string columns (CH columns are strings, not bytea, and case-sensitive).
-    ClickhouseLower,
-}
-
-/// A `'0x…'` literal is only meaningful as an address/topic/hash when it has
-/// the 40+ hex chars of one; shorter `'0x'` fragments (e.g. inside `concat()`)
-/// are left alone. Returns the hex body if `s` qualifies.
+/// The hex body of `s` if it is an address/topic/hash literal: `0x` plus 40+
+/// hex chars. Shorter `'0x'` fragments (e.g. inside `concat()`) don't qualify.
 fn hex_body(s: &str) -> Option<&str> {
     let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-    if body.len() >= 40 && body.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(body)
-    } else {
-        None
+    (body.len() >= 40 && body.bytes().all(|b| b.is_ascii_hexdigit())).then_some(body)
+}
+
+/// A bare column reference, looking through parentheses: `addr`, `t.addr`, `(addr)`.
+fn is_column(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(inner) => is_column(inner),
+        _ => false,
     }
 }
 
-fn is_column(e: &Expr) -> bool {
-    matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-}
-
-fn is_comparison(op: &BinaryOperator) -> bool {
-    matches!(
-        op,
-        BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::Gt
-            | BinaryOperator::LtEq
-            | BinaryOperator::GtEq
-    )
-}
-
-/// If `e` is a qualifying `'0x…'` string literal, rewrite it in place per mode.
-fn rewrite_literal(e: &mut Expr, mode: HexMode) {
-    let Expr::Value(vws) = e else { return };
-    let Value::SingleQuotedString(s) = &vws.value else {
-        return;
-    };
-    let Some(body) = hex_body(s) else { return };
-    let replacement = match mode {
-        HexMode::PostgresBytea => format!("\\x{body}"),
-        HexMode::ClickhouseLower => format!("0x{}", body.to_ascii_lowercase()),
-    };
-    *e = Expr::Value(Value::SingleQuotedString(replacement).with_empty_span());
+/// Rewrite `e` in place if it is a qualifying `'0x…'` string literal.
+fn rewrite_literal(e: &mut Expr, transform: &dyn Fn(&str) -> String) {
+    let Expr::Value(v) = e else { return };
+    let Value::SingleQuotedString(s) = &v.value else { return };
+    if let Some(body) = hex_body(s) {
+        *e = Expr::Value(Value::SingleQuotedString(transform(body)).with_empty_span());
+    }
 }
 
 /// Rewrite `'0x…'` hex literals, but ONLY where they are a direct operand of a
-/// comparison (`=`, `<>`, `<`, `>`, `<=`, `>=`), an `IN (…)` list, or a
-/// `BETWEEN`, against a bare column reference.
+/// comparison (`= <> < > <= >=`), an `IN (…)` list, or a `BETWEEN`, against a
+/// bare column reference. `transform` receives the hex body and returns the
+/// replacement string contents.
 ///
 /// This is deliberately context-aware. The previous implementation was a raw
 /// regex over the SQL text, which also rewrote literals passed as *function
 /// arguments* — so `topic_addr('0x…')` became `topic_addr('\x…')` (→ "invalid
-/// hexadecimal digit") and `replace('0x…','0x','')` was mangled. A literal that
-/// is a function argument is never a direct comparison operand, so walking the
-/// AST and only touching comparison operands fixes both while preserving the
-/// original convenience (`WHERE addr = '0x…'`, `IN ('0x…', …)`).
+/// hexadecimal digit") and `replace('0x…','0x','')` was mangled. A function
+/// argument is never a direct comparison operand, so walking the AST and only
+/// touching comparison operands fixes both while preserving the convenience
+/// (`WHERE addr = '0x…'`, `IN ('0x…', …)`). Every literal the `?signature=`
+/// CTE generator emits is also of the `col = '…'` form, so those still convert.
 ///
 /// Callers always pass SQL that `validate_query` has already parsed as a single
-/// SELECT, so a parse failure here is not expected; if it happens we return the
-/// input unchanged rather than risk corrupting it.
-fn rewrite_hex_literals(sql: &str, mode: HexMode) -> String {
+/// SELECT, so a parse failure here is not expected; if it happens the input is
+/// returned unchanged rather than risk corrupting it.
+fn rewrite_hex_literals(sql: &str, transform: impl Fn(&str) -> String) -> String {
+    use BinaryOperator::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
+
     let mut statements = match Parser::parse_sql(&GenericDialect {}, sql) {
         Ok(s) if s.len() == 1 => s,
         _ => return sql.to_string(),
     };
 
+    // `col <op> lit` or `lit <op> col`: rewrite whichever side faces a column.
+    let rewrite_facing = |a: &mut Expr, b: &mut Expr| {
+        if is_column(a) {
+            rewrite_literal(b, &transform);
+        }
+    };
+
     let _: ControlFlow<()> = visit_expressions_mut(&mut statements, |e| {
         match e {
-            Expr::BinaryOp { left, op, right } if is_comparison(op) => {
-                if is_column(left) {
-                    rewrite_literal(right, mode);
-                }
-                if is_column(right) {
-                    rewrite_literal(left, mode);
-                }
+            Expr::BinaryOp { left, op, right }
+                if matches!(op, Eq | NotEq | Lt | Gt | LtEq | GtEq) =>
+            {
+                rewrite_facing(left, right);
+                rewrite_facing(right, left);
             }
             Expr::InList { expr, list, .. } if is_column(expr) => {
-                for item in list.iter_mut() {
-                    rewrite_literal(item, mode);
-                }
+                list.iter_mut().for_each(|item| rewrite_literal(item, &transform));
             }
-            Expr::Between {
-                expr, low, high, ..
-            } if is_column(expr) => {
-                rewrite_literal(low, mode);
-                rewrite_literal(high, mode);
+            Expr::Between { expr, low, high, .. } if is_column(expr) => {
+                rewrite_literal(low, &transform);
+                rewrite_literal(high, &transform);
             }
             _ => {}
         }
@@ -118,10 +96,10 @@ fn rewrite_hex_literals(sql: &str, mode: HexMode) -> String {
     statements[0].to_string()
 }
 
-/// Convert `'0x…'` hex literals to `'\x…'` for PostgreSQL bytea comparison.
+/// Convert `'0x…'` hex literals to `'\x…'` so Postgres reads them as bytea.
 /// See [`rewrite_hex_literals`] for why this is AST-scoped, not textual.
 pub fn convert_hex_literals_postgres(sql: &str) -> String {
-    rewrite_hex_literals(sql, HexMode::PostgresBytea)
+    rewrite_hex_literals(sql, |body| format!("\\x{body}"))
 }
 
 /// Lowercase the hex body of `'0x…'` literals for ClickHouse.
@@ -133,7 +111,7 @@ pub fn convert_hex_literals_postgres(sql: &str) -> String {
 /// by value). Here we keep the string type and 0x prefix and fold to lowercase,
 /// scoped to comparison operands so a function argument is not clobbered.
 pub fn normalize_hex_literals_clickhouse(sql: &str) -> String {
-    rewrite_hex_literals(sql, HexMode::ClickhouseLower)
+    rewrite_hex_literals(sql, |body| format!("0x{}", body.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -191,6 +169,18 @@ mod hex_literal_tests {
         // A bare projected literal is not a comparison operand.
         let out = pg(&format!("SELECT '{ADDR}' AS a"));
         assert!(!out.contains("\\x"), "projected literal should not convert; got: {out}");
+    }
+
+    #[test]
+    fn pg_converts_parenthesised_column_and_between() {
+        let out = pg(&format!("SELECT n FROM logs WHERE (address) = '{ADDR}' AND topic1 BETWEEN '{ADDR}' AND '{ADDR}'"));
+        assert_eq!(out.matches("'\\x").count(), 3, "(col) = lit and BETWEEN bounds all convert; got: {out}");
+    }
+
+    #[test]
+    fn pg_converts_not_equal_and_ordering_comparisons() {
+        let out = pg(&format!("SELECT n FROM logs WHERE address <> '{ADDR}' AND topic1 > '{ADDR}'"));
+        assert_eq!(out.matches("'\\x").count(), 2, "<> and > operands convert; got: {out}");
     }
 
     #[test]
