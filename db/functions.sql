@@ -64,3 +64,28 @@ BEGIN
   RETURN abi_uint(input)::TEXT;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+-- Word-indexed ABI decode. Event `data` is a sequence of 32-byte words; the
+-- 1-arg abi_uint/format_uint read the WHOLE buffer as one integer, which is
+-- correct only for single-word payloads (e.g. ERC-20 Transfer). For anything
+-- wider (a 64-byte AttesterRegistered, etc.) select the word explicitly.
+-- `word` is 0-based. Out-of-range words yield an empty substring -> 0.
+CREATE OR REPLACE FUNCTION abi_uint(input BYTEA, word INT) RETURNS NUMERIC AS $$
+  SELECT abi_uint(substring(input FROM word * 32 + 1 FOR 32));
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+-- Prefer format_uint over abi_uint when returning values through the JSON API:
+-- abi_uint yields NUMERIC, which the response serializer renders via a 96-bit
+-- decimal and NULLs for any value >= 2^96 (~7.9e28). format_uint returns TEXT
+-- and round-trips full uint256 (2^256-1, 78 digits) intact.
+CREATE OR REPLACE FUNCTION format_uint(input BYTEA, word INT) RETURNS TEXT AS $$
+  SELECT abi_uint(substring(input FROM word * 32 + 1 FOR 32))::TEXT;
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+-- Build the 32-byte, left-padded, lowercase topic form of an EVM address so
+-- callers can filter indexed address topics (topic1/2/3) without hand-padding.
+-- Accepts checksummed (mixed-case) input, with or without the 0x prefix.
+-- Invalid input raises (loud) rather than silently returning a zero-match value.
+CREATE OR REPLACE FUNCTION topic_addr(addr TEXT) RETURNS BYTEA AS $$
+  SELECT decode(lpad(lower(regexp_replace(addr, '^0[xX]', '')), 64, '0'), 'hex');
+$$ LANGUAGE sql IMMUTABLE STRICT;
