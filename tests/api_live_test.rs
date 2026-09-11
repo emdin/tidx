@@ -128,6 +128,69 @@ async fn test_query_select_blocks() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_post_json_body() {
+    // POST /query with a JSON body must be accepted and run through the same
+    // validator + engine path as GET. Long SQL overruns URL limits, so
+    // consumers need the body path. `SELECT 1` exercises the full
+    // Json-extractor -> dispatch -> validator -> Postgres chain without needing
+    // seeded data (seeding requires a Tempo node this harness may not have).
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/query")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"sql":"SELECT 1 AS one","chainId":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK, "POST /query should be accepted");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["columns"], serde_json::json!(["one"]));
+    assert_eq!(json["row_count"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_post_rejects_non_select() {
+    // The validator applies to POST exactly as to GET — no bypass.
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/query")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"sql":"DELETE FROM blocks","chainId":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "POST must not bypass the SELECT-only validator"
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_select_txs() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());

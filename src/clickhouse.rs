@@ -112,6 +112,12 @@ impl ClickHouseEngine {
             sql.to_string()
         };
 
+        // ClickHouse address/topic/hash columns are stored as lowercase
+        // 0x-prefixed strings and string comparison is case-sensitive, so a
+        // checksummed literal silently matches nothing. Fold hex literals to
+        // lowercase (the Postgres path gets this for free via bytea conversion).
+        let sql = crate::query::normalize_hex_literals_clickhouse(&sql);
+
         let start = std::time::Instant::now();
         let n = self.instances.len();
         let starting = self.active.load(Ordering::Relaxed);

@@ -548,7 +548,7 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
     }
 }
 
-const ALLOWED_FUNCTIONS: &[&str] = &[
+pub const ALLOWED_FUNCTIONS: &[&str] = &[
     // ABI decode helpers (custom PostgreSQL functions)
     "abi_uint",
     "abi_int",
@@ -558,6 +558,7 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "abi_string",
     "format_address",
     "format_uint",
+    "topic_addr",
     // Aggregates
     "count",
     "sum",

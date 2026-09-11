@@ -40,9 +40,37 @@ pub struct TableInfo {
 }
 
 #[derive(Serialize)]
+pub struct FunctionInfo {
+    pub name: &'static str,
+    pub signature: &'static str,
+    pub returns: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct Limits {
+    /// Max rows per page on the default (Postgres) engine.
+    pub max_rows_postgres: i64,
+    /// Max rows per page when `?engine=clickhouse` is set.
+    pub max_rows_clickhouse: i64,
+    /// Default statement timeout (ms) when `?timeout_ms=` is omitted.
+    pub default_timeout_ms: u64,
+    /// Ceiling `?timeout_ms=` is clamped to.
+    pub max_timeout_ms: u64,
+    /// Max SQL length in bytes (why POST exists for long queries).
+    pub max_query_bytes: usize,
+    /// Only a single SELECT statement is accepted.
+    pub select_only: bool,
+    /// Both GET (query string) and POST (JSON body) are accepted on /query.
+    pub methods: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
 pub struct TablesResponse {
     pub ok: bool,
     pub tables: Vec<TableInfo>,
+    pub functions: Vec<FunctionInfo>,
+    pub limits: Limits,
     pub tips: Vec<&'static str>,
 }
 
@@ -455,7 +483,84 @@ pub fn tips() -> Vec<&'static str> {
         "Internal calls (CALL, DELEGATECALL, CREATE, etc.) made by contracts inside a tx are indexed in `internal_txs` — captured from debug_traceTransaction's callTracer. Use it to find ERC-20 transfers performed by routers, internal value moves, or to reconstruct a tx's full call tree via (tx_hash, path_idx).",
         "internal_txs only stores nested frames (depth ≥ 1). The top-level call IS the tx itself and lives in `txs`/`receipts`. A self-contained payable function (e.g. a bridge `lockForExit` that just credits storage and emits an event) produces ZERO internal_txs rows — that's expected. To track all native-iKAS flows into an address regardless of depth, union over `txs.value` and `internal_txs.value`: `SELECT block_num, value FROM txs WHERE \"to\"=decode('<addr>','hex') AND value::numeric > 0 UNION ALL SELECT block_num, value FROM internal_txs WHERE \"to\"=decode('<addr>','hex') AND value::numeric > 0`.",
         "PG helpers in the /query allowlist: `format_address(bytea) → text` returns `'0x' || encode(...,'hex')` (use it on every address column to avoid the encode/decode dance), `format_uint(bytea) → text` decodes ABI uint payloads. For numeric arithmetic on uint256 string columns in PG, cast: `CAST(gas_used AS numeric) * CAST(effective_gas_price AS numeric)`. CH: prefer the `_u256` mirror columns and skip the cast entirely.",
+        "Filtering by an indexed ADDRESS topic (topic1/2/3): the topic is the 32-byte left-padded form, so use `WHERE topic2 = topic_addr('0xAbC…')` (accepts checksummed input). To read an address OUT of a topic use `abi_address(topic2)` (trailing 20 bytes) — `format_address(topic2)` returns the full 32-byte padded value and is the wrong tool for topics.",
+        "ClickHouse string literals are case-sensitive but address/topic/hash columns are stored lowercase — the API lowercases `'0x…'` literals for you, but if you build a literal dynamically, lowercase it yourself or you'll get a silent zero-row result. `abi_uint` returns null through the JSON layer for values ≥ 2^96; use `format_uint` (text) for large amounts, and `abi_uint(data, i)`/`format_uint(data, i)` to select the i-th 32-byte word of multi-word event data.",
     ]
+}
+
+/// SQL helper functions callable from `/query`, beyond standard SQL. Curated
+/// (with signatures) rather than derived from the validator's bare-name
+/// allowlist, because the useful thing to publish is how to call them. A test
+/// asserts every entry here is actually allowed by the validator.
+pub fn functions_metadata() -> Vec<FunctionInfo> {
+    vec![
+        FunctionInfo {
+            name: "abi_uint",
+            signature: "abi_uint(bytea) -> numeric | abi_uint(bytea, word_index) -> numeric",
+            returns: "numeric",
+            description: "Decode a big-endian ABI uint. The 1-arg form reads the WHOLE buffer as one integer (correct only for single-word data, e.g. ERC-20 Transfer); the 2-arg form reads the 0-based 32-byte word. NOTE: the JSON response renders numeric via a 96-bit decimal and returns null for values >= 2^96 — use format_uint for display of large values.",
+        },
+        FunctionInfo {
+            name: "format_uint",
+            signature: "format_uint(bytea) -> text | format_uint(bytea, word_index) -> text",
+            returns: "text",
+            description: "Same decode as abi_uint but returns text, so full uint256 (up to 2^256-1) round-trips through the API without the 2^96 null ceiling. Prefer this when returning amounts.",
+        },
+        FunctionInfo {
+            name: "abi_address",
+            signature: "abi_address(bytea) -> bytea",
+            returns: "bytea",
+            description: "Extract the trailing 20-byte address from a 32-byte ABI word or topic (topic1/2/3). Use this for indexed address topics — NOT format_address, which would return the full 32-byte padded value.",
+        },
+        FunctionInfo {
+            name: "format_address",
+            signature: "format_address(bytea) -> text",
+            returns: "text",
+            description: "Render a 20-byte address column as '0x'||hex. For a 32-byte topic, wrap with abi_address first: format_address(abi_address(topic1)).",
+        },
+        FunctionInfo {
+            name: "topic_addr",
+            signature: "topic_addr(text) -> bytea",
+            returns: "bytea",
+            description: "Turn an EVM address (checksummed or lowercase, 0x optional) into its 32-byte left-padded topic form for filtering indexed address topics: WHERE topic2 = topic_addr('0xAbC…'). Avoids hand-padding and the silent zero-row result it causes.",
+        },
+        FunctionInfo {
+            name: "abi_int",
+            signature: "abi_int(bytea) -> numeric",
+            returns: "numeric",
+            description: "Decode a two's-complement signed ABI int from a 32-byte word.",
+        },
+        FunctionInfo {
+            name: "abi_bool",
+            signature: "abi_bool(bytea) -> boolean",
+            returns: "boolean",
+            description: "Decode an ABI bool (last byte nonzero) from a 32-byte word.",
+        },
+        FunctionInfo {
+            name: "abi_bytes",
+            signature: "abi_bytes(bytea, offset_bytes DEFAULT 0) -> bytea",
+            returns: "bytea",
+            description: "Decode a dynamic bytes value (offset+length header) from ABI-encoded data.",
+        },
+        FunctionInfo {
+            name: "abi_string",
+            signature: "abi_string(bytea, offset_bytes DEFAULT 0) -> text",
+            returns: "text",
+            description: "Decode a dynamic UTF-8 string from ABI-encoded data.",
+        },
+    ]
+}
+
+fn limits() -> Limits {
+    Limits {
+        max_rows_postgres: crate::query::HARD_LIMIT_MAX,
+        max_rows_clickhouse: crate::query::HARD_LIMIT_CLICKHOUSE,
+        default_timeout_ms: 5000,
+        max_timeout_ms: 30000,
+        max_query_bytes: 65_536,
+        select_only: true,
+        methods: vec!["GET", "POST"],
+    }
 }
 
 pub async fn handle_tables(
@@ -464,6 +569,8 @@ pub async fn handle_tables(
     Ok(Json(TablesResponse {
         ok: true,
         tables: tables_metadata(),
+        functions: functions_metadata(),
+        limits: limits(),
         tips: tips(),
     }))
 }
@@ -656,6 +763,42 @@ mod tests {
             body.contains("CAST") && body.contains("numeric"),
             "tips must show the PG `CAST(... AS numeric)` idiom for uint256 string columns; got: {body}"
         );
+    }
+
+    /// Everything published in functions_metadata must actually be callable —
+    /// i.e. present in the /query validator's allowlist. Advertising a function
+    /// the validator rejects would be a worse first-contact error than omitting
+    /// it. (Mirror of tables_metadata_only_lists_allowed_tables.)
+    #[test]
+    fn advertised_functions_are_all_allowed_by_the_validator() {
+        for f in functions_metadata() {
+            assert!(
+                crate::query::ALLOWED_FUNCTIONS.contains(&f.name),
+                "function {:?} is advertised by /tables but not in the /query allowlist",
+                f.name
+            );
+            assert!(!f.signature.is_empty() && !f.returns.is_empty() && !f.description.is_empty());
+        }
+    }
+
+    /// The reported pain points (uint256 word access, address-topic filtering)
+    /// are answered by these specific helpers; make sure they stay published.
+    #[test]
+    fn functions_metadata_covers_the_reported_gaps() {
+        let names: Vec<&str> = functions_metadata().iter().map(|f| f.name).collect();
+        for required in ["topic_addr", "abi_uint", "format_uint", "abi_address"] {
+            assert!(names.contains(&required), "functions must publish {required}");
+        }
+    }
+
+    /// Limits must reflect the real validator/handler constants, not drift.
+    #[test]
+    fn limits_match_the_enforced_values() {
+        let l = limits();
+        assert_eq!(l.max_rows_postgres, crate::query::HARD_LIMIT_MAX);
+        assert_eq!(l.max_rows_clickhouse, crate::query::HARD_LIMIT_CLICKHOUSE);
+        assert!(l.select_only);
+        assert!(l.methods.contains(&"POST"), "POST is now supported on /query");
     }
 
     #[test]

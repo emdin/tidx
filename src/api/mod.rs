@@ -299,7 +299,7 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/status", get(handle_status))
         .route("/status/kaspa-coverage", get(handle_kaspa_coverage))
         .route("/tables", get(tables::handle_tables))
-        .route("/query", get(handle_query))
+        .route("/query", get(handle_query).post(handle_query_post))
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
             "/views/{name}",
@@ -598,7 +598,25 @@ async fn handle_query(
     Query(params): Query<QueryParams>,
 ) -> Response {
     let signatures = extract_signatures(uri.query());
+    dispatch_query(state, params, signatures).await
+}
 
+/// POST variant of `/query`. Long SQL (joins, big `IN (...)` lists) overruns
+/// URL-length limits and forces backslash/quote escaping in a GET string, so
+/// consumers need a body-based path. The JSON body carries the same fields as
+/// the query string; `?signature=` may still be supplied on the URL. The
+/// validator and engine dispatch are identical to GET — this is purely a
+/// transport alternative, not a second code path.
+async fn handle_query_post(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    Json(params): Json<QueryParams>,
+) -> Response {
+    let signatures = extract_signatures(uri.query());
+    dispatch_query(state, params, signatures).await
+}
+
+async fn dispatch_query(state: AppState, params: QueryParams, signatures: Vec<String>) -> Response {
     if params.live {
         if params.engine.as_deref() == Some("clickhouse") {
             return ApiError::BadRequest(
