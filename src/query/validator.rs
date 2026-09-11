@@ -54,11 +54,23 @@ pub fn engine_limit_cap(engine: Option<&str>) -> i64 {
     }
 }
 
+/// Validates that a SQL query is safe to execute, with the Postgres row cap
+/// (`HARD_LIMIT_MAX`) applied to the top-level `LIMIT`.
+pub fn validate_query(sql: &str) -> Result<()> {
+    validate_query_with_cap(sql, HARD_LIMIT_MAX)
+}
+
 /// Validates that a SQL query is safe to execute.
 ///
 /// Uses a reject-by-default approach: only explicitly allowed tables,
 /// functions, and expression types are permitted. Everything else is rejected.
-pub fn validate_query(sql: &str) -> Result<()> {
+///
+/// `cap` bounds the TOP-LEVEL `LIMIT` and is engine policy (Postgres 10 000,
+/// ClickHouse 50 000). Nested queries (CTEs, subqueries) are always held to
+/// `HARD_LIMIT_MAX` regardless of engine: that check is a resource guard
+/// against materialising huge intermediate sets, not the user-facing page cap,
+/// and 10 000 is the right ceiling for it on both engines.
+pub fn validate_query_with_cap(sql: &str, cap: i64) -> Result<()> {
     if sql.len() > MAX_QUERY_LENGTH {
         return Err(anyhow!(
             "Query too large ({} bytes, max {})",
@@ -84,7 +96,8 @@ pub fn validate_query(sql: &str) -> Result<()> {
     match stmt {
         Statement::Query(query) => {
             let cte_names = extract_cte_names(query);
-            validate_query_ast(query, &cte_names, 0)
+            validate_query_ast(query, &cte_names, 0)?;
+            validate_limit_clause(query, cap)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
@@ -152,35 +165,40 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         }
     }
 
-    // Validate LIMIT / OFFSET: only allow numeric literals
-    if let Some(limit_clause) = &query.limit_clause {
-        match limit_clause {
-            sqlparser::ast::LimitClause::LimitOffset {
-                limit,
-                offset,
-                limit_by,
-            } => {
-                if let Some(limit_expr) = limit {
-                    validate_limit_expr(limit_expr, "LIMIT")?;
-                }
-                if let Some(offset) = offset {
-                    validate_limit_expr(&offset.value, "OFFSET")?;
-                }
-                if !limit_by.is_empty() {
-                    return Err(anyhow!("LIMIT BY is not allowed"));
-                }
-            }
-            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                validate_limit_expr(offset, "OFFSET")?;
-                validate_limit_expr(limit, "LIMIT")?;
-            }
-        }
+    // Nested queries get the fixed resource-guard cap; the top level is
+    // checked by the caller with the engine's own cap.
+    if depth > 0 {
+        validate_limit_clause(query, HARD_LIMIT_MAX)?;
     }
 
     Ok(())
 }
 
-fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
+/// Validate LIMIT / OFFSET: numeric literals only, `LIMIT` at most `cap`.
+fn validate_limit_clause(query: &Query, cap: i64) -> Result<()> {
+    use sqlparser::ast::LimitClause;
+    match &query.limit_clause {
+        None => Ok(()),
+        Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+            if let Some(limit) = limit {
+                validate_limit_expr(limit, "LIMIT", cap)?;
+            }
+            if let Some(offset) = offset {
+                validate_limit_expr(&offset.value, "OFFSET", cap)?;
+            }
+            if !limit_by.is_empty() {
+                return Err(anyhow!("LIMIT BY is not allowed"));
+            }
+            Ok(())
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+            validate_limit_expr(offset, "OFFSET", cap)?;
+            validate_limit_expr(limit, "LIMIT", cap)
+        }
+    }
+}
+
+fn validate_limit_expr(expr: &Expr, context: &str, cap: i64) -> Result<()> {
     match expr {
         Expr::Value(v) => {
             let val = &v.value;
@@ -190,10 +208,8 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
                         if num < 0 {
                             return Err(anyhow!("{context} must not be negative"));
                         }
-                        if num > HARD_LIMIT_MAX {
-                            return Err(anyhow!(
-                                "{context} value {num} exceeds maximum ({HARD_LIMIT_MAX})"
-                            ));
+                        if num > cap {
+                            return Err(anyhow!("{context} value {num} exceeds maximum ({cap})"));
                         }
                         Ok(())
                     } else {
@@ -559,6 +575,13 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "format_address",
     "format_uint",
     "topic_addr",
+    // ClickHouse decode helpers emitted by the `?signature=` CTE generator
+    // (`to_cte_sql_clickhouse*`). Pure byte-reinterpretation, read-only;
+    // needed so the CH public path can run this same validator on the
+    // wrapped SQL. Lowercase: the validator lowercases names before lookup.
+    "unhex",
+    "reinterpretasuint256",
+    "reinterpretasint256",
     // Aggregates
     "count",
     "sum",

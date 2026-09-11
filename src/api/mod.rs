@@ -566,6 +566,30 @@ pub struct QueryParams {
     /// Force a specific engine: "postgres" or "clickhouse"
     #[serde(default)]
     engine: Option<String>,
+    /// Event signature(s) for the `?signature=` CTE helper, when supplied in a
+    /// POST JSON body. Accepts a single string or an array. GET requests carry
+    /// these as repeated `?signature=` query params instead (see
+    /// `extract_signatures`); this field only backs the POST body path.
+    #[serde(default, deserialize_with = "string_or_vec")]
+    signature: Vec<String>,
+}
+
+/// Deserialize a field that may be a single string (`"Transfer(...)"`) or an
+/// array of strings (`["A(...)", "B(...)"]`) into a `Vec<String>`.
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 fn default_timeout() -> u64 {
@@ -612,7 +636,11 @@ async fn handle_query_post(
     uri: axum::http::Uri,
     Json(params): Json<QueryParams>,
 ) -> Response {
-    let signatures = extract_signatures(uri.query());
+    // Signatures may arrive in the JSON body (`signature`) and/or as `?signature=`
+    // URL params; merge both so a POST body signature is honored (previously it
+    // was silently dropped and `FROM <EventName>` failed as "table not allowed").
+    let mut signatures = extract_signatures(uri.query());
+    signatures.extend_from_slice(&params.signature);
     dispatch_query(state, params, signatures).await
 }
 
@@ -668,8 +696,10 @@ async fn handle_query_once(
                 ))
             })?;
 
+        // Validated + capped public entry point (never the raw `query`, which
+        // is the unvalidated DDL path used by views.rs).
         clickhouse
-            .query(&params.sql, &sigs)
+            .query_public(&params.sql, &sigs, options.limit)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,

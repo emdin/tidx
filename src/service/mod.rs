@@ -196,8 +196,8 @@ pub async fn execute_query_postgres(
     // Validate query (after CTE wrapping so signature-derived table names are valid)
     validate_query(&sql)?;
 
-    // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
-    let sql = append_limit_if_missing(&sql, options.limit);
+    // Append a LIMIT when absent and clamp any explicit LIMIT to the cap.
+    let sql = crate::query::enforce_limit(&sql, options.limit, HARD_LIMIT_MAX);
 
     // Convert '0x...' hex literals to '\x...' bytea literals for PostgreSQL
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
@@ -274,20 +274,6 @@ pub async fn execute_query_postgres(
     })
 }
 
-fn append_limit_if_missing(sql: &str, limit: i64) -> String {
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    let dialect = GenericDialect {};
-    if let Ok(stmts) = Parser::parse_sql(&dialect, sql) {
-        if let Some(sqlparser::ast::Statement::Query(query)) = stmts.first() {
-            if query.limit_clause.is_none() {
-                return format!("{sql} LIMIT {limit}");
-            }
-        }
-    }
-    sql.to_string()
-}
 
 pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
     let col = &row.columns()[idx];
