@@ -640,7 +640,7 @@ async fn handle_query_post(
     // URL params; merge both so a POST body signature is honored (previously it
     // was silently dropped and `FROM <EventName>` failed as "table not allowed").
     let mut signatures = extract_signatures(uri.query());
-    signatures.extend(params.signature.iter().cloned());
+    signatures.extend_from_slice(&params.signature);
     dispatch_query(state, params, signatures).await
 }
 
@@ -696,11 +696,10 @@ async fn handle_query_once(
                 ))
             })?;
 
-        // ClickHouse has no built-in cap here, so enforce it on the SQL: append
-        // a LIMIT when absent and clamp an explicit LIMIT to HARD_LIMIT_CLICKHOUSE.
-        let ch_sql = crate::query::enforce_limit(&params.sql, options.limit, cap);
+        // Validated + capped public entry point (never the raw `query`, which
+        // is the unvalidated DDL path used by views.rs).
         clickhouse
-            .query(&ch_sql, &sigs)
+            .query_public(&params.sql, &sigs, options.limit)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,

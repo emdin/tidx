@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
-use crate::query::{extract_raw_column_predicates, EventSignature};
+use crate::query::{
+    enforce_limit, extract_raw_column_predicates, normalize_hex_literals_clickhouse,
+    validate_query_with_cap, EventSignature, HARD_LIMIT_CLICKHOUSE,
+};
 
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
@@ -84,39 +87,70 @@ impl ClickHouseEngine {
         &self.database
     }
 
-    /// Execute a query and return results as JSON values.
-    /// On connection failure the engine automatically retries with the next
-    /// instance (failover). Only connection-level errors trigger failover;
-    /// ClickHouse query errors (syntax, missing table, etc.) are returned
-    /// immediately.
+    /// Prefix `sql` with the event CTEs derived from `signatures`, so that
+    /// `FROM <EventName>` resolves. Pure; no I/O.
+    fn wrap_signatures(sql: &str, signatures: &[&str]) -> Result<String> {
+        if signatures.is_empty() {
+            return Ok(sql.to_string());
+        }
+        let sigs: Vec<EventSignature> = signatures
+            .iter()
+            .map(|s| EventSignature::parse(s))
+            .collect::<Result<_>>()?;
+
+        let sql = sigs.iter().fold(sql.to_string(), |sql, sig| {
+            sig.rewrite_filters_for_pushdown(&sig.normalize_table_references(&sql))
+        });
+        let pushdown = extract_raw_column_predicates(&sql);
+        let ctes: Vec<String> = sigs
+            .iter()
+            .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
+            .collect();
+        Ok(format!("WITH {} {sql}", ctes.join(", ")))
+    }
+
+    /// Everything the PUBLIC `/query` path must do to untrusted SQL before it
+    /// touches ClickHouse, as a pure function so it is unit-testable without a
+    /// live server: CTE-wrap, run the same allowlist validator Postgres uses,
+    /// and enforce the row cap. Mirrors `service::execute_query_postgres`.
+    ///
+    /// This exists because the ClickHouse path previously ran NO validation —
+    /// `engine=clickhouse` could read `system.tables`, and the server runs as
+    /// `default` with `readonly=0`. Trusted internal callers that need DDL
+    /// (`views.rs`) use `query` directly and are not subject to this.
+    pub fn prepare_public_sql(sql: &str, signatures: &[&str], limit: i64) -> Result<String> {
+        let sql = Self::wrap_signatures(sql, signatures)?;
+        validate_query_with_cap(&sql, HARD_LIMIT_CLICKHOUSE)?;
+        Ok(enforce_limit(&sql, limit, HARD_LIMIT_CLICKHOUSE))
+    }
+
+    /// Public `/query` entry point: validated + capped, then executed.
+    pub async fn query_public(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        limit: i64,
+    ) -> Result<QueryResult> {
+        let sql = Self::prepare_public_sql(sql, signatures, limit)?;
+        self.run(&sql).await
+    }
+
+    /// Trusted entry point (no validation, no cap) for internal callers such as
+    /// `views.rs`, which issue DDL. NOT for user-supplied SQL — use
+    /// `query_public`.
     pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
-        let sql = if !signatures.is_empty() {
-            let sigs: Vec<EventSignature> = signatures
-                .iter()
-                .map(|s| EventSignature::parse(s))
-                .collect::<Result<_>>()?;
+        let sql = Self::wrap_signatures(sql, signatures)?;
+        self.run(&sql).await
+    }
 
-            let mut sql = sql.to_string();
-            for sig in &sigs {
-                sql = sig.normalize_table_references(&sql);
-                sql = sig.rewrite_filters_for_pushdown(&sql);
-            }
-
-            let pushdown = extract_raw_column_predicates(&sql);
-            let ctes: Vec<String> = sigs
-                .iter()
-                .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
-                .collect();
-            format!("WITH {} {sql}", ctes.join(", "))
-        } else {
-            sql.to_string()
-        };
-
-        // ClickHouse address/topic/hash columns are stored as lowercase
-        // 0x-prefixed strings and string comparison is case-sensitive, so a
-        // checksummed literal silently matches nothing. Fold hex literals to
-        // lowercase (the Postgres path gets this for free via bytea conversion).
-        let sql = crate::query::normalize_hex_literals_clickhouse(&sql);
+    /// Execute already-prepared SQL, failing over across instances on
+    /// connection errors. ClickHouse query errors (syntax, missing table) are
+    /// returned immediately. Hex-literal case folding lives here because it is
+    /// an execution concern for every CH statement: columns are lowercase
+    /// 0x-strings compared case-sensitively, so a checksummed literal would
+    /// silently match nothing. It is a no-op on DDL.
+    async fn run(&self, sql: &str) -> Result<QueryResult> {
+        let sql = normalize_hex_literals_clickhouse(sql);
 
         let start = std::time::Instant::now();
         let n = self.instances.len();
@@ -343,5 +377,86 @@ mod tests {
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         assert_eq!(engine.database(), "tidx_4217");
+    }
+
+    // ---- prepare_public_sql: the public /query policy pipeline, no I/O ----
+    //
+    // The ClickHouse path previously ran NO validator: `engine=clickhouse`
+    // could read `system.tables` (verified on prod 2026-09-11) while the same
+    // query was rejected on Postgres. These pin the closed gap and the cap.
+
+    use crate::query::HARD_LIMIT_CLICKHOUSE;
+    const SIG: &str = "Transfer(address,address,uint256)";
+
+    #[test]
+    fn public_sql_rejects_non_allowlisted_table() {
+        let err = ClickHouseEngine::prepare_public_sql(
+            "SELECT name FROM system.tables",
+            &[],
+            100,
+        )
+        .expect_err("system.tables must be rejected on the CH public path");
+        assert!(err.to_string().contains("not allowed"), "got: {err}");
+    }
+
+    #[test]
+    fn public_sql_rejects_non_select() {
+        assert!(ClickHouseEngine::prepare_public_sql("DROP TABLE logs", &[], 100).is_err());
+        assert!(ClickHouseEngine::prepare_public_sql("SELECT 1; DROP TABLE logs", &[], 100).is_err());
+    }
+
+    #[test]
+    fn public_sql_appends_caller_page_size_when_no_limit() {
+        let sql = ClickHouseEngine::prepare_public_sql("SELECT num FROM blocks", &[], 250).unwrap();
+        assert_eq!(sql, "SELECT num FROM blocks LIMIT 250");
+    }
+
+    /// Over the CH cap is rejected LOUDLY by the validator (not silently
+    /// clamped — a quiet truncation is the class of bug the dev flagged), and
+    /// the message names the ClickHouse cap, not Postgres's.
+    #[test]
+    fn public_sql_rejects_limit_over_ch_cap_loudly() {
+        let err = ClickHouseEngine::prepare_public_sql(
+            "SELECT num FROM blocks LIMIT 999999",
+            &[],
+            HARD_LIMIT_CLICKHOUSE,
+        )
+        .expect_err("over-cap LIMIT must be rejected");
+        assert!(
+            err.to_string().contains(&format!("exceeds maximum ({HARD_LIMIT_CLICKHOUSE})")),
+            "must cite the CH cap; got: {err}"
+        );
+    }
+
+    /// The regression guard for making the validator engine-aware: a LIMIT
+    /// between Postgres's 10 000 and ClickHouse's 50 000 must be ACCEPTED on
+    /// CH and left intact. Before, the CH path would have applied the PG cap.
+    #[test]
+    fn public_sql_accepts_limit_between_pg_and_ch_caps() {
+        let sql = ClickHouseEngine::prepare_public_sql("SELECT num FROM blocks LIMIT 20000", &[], 100)
+            .expect("20000 is within the CH cap and must validate");
+        assert_eq!(sql, "SELECT num FROM blocks LIMIT 20000");
+    }
+
+    /// The generated CH CTE uses unhex/reinterpretAsUInt256/reinterpretAsInt256;
+    /// they must be allowlisted or `?signature=` dies on ClickHouse the moment
+    /// the validator is applied. This is the test that catches a missing one.
+    #[test]
+    fn public_sql_accepts_signature_cte_and_caps_outer_query() {
+        let sql = ClickHouseEngine::prepare_public_sql("SELECT * FROM Transfer", &[SIG], 100)
+            .expect("the CH signature CTE must pass the allowlist validator");
+        assert!(sql.starts_with("WITH "), "CTE wrapped; got: {sql}");
+        assert!(sql.ends_with("LIMIT 100"), "outer query capped; got: {sql}");
+    }
+
+    #[test]
+    fn public_sql_signature_with_pushdown_filter_validates() {
+        let sql = ClickHouseEngine::prepare_public_sql(
+            "SELECT count(*) FROM Transfer WHERE \"to\" = '0xC281cb25715EA8e46c9B916F22aE7c0F55b014d7'",
+            &[SIG],
+            100,
+        )
+        .expect("pushdown-rewritten signature query must validate");
+        assert!(sql.contains("LIMIT 100"), "got: {sql}");
     }
 }

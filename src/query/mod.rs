@@ -8,7 +8,8 @@ pub use parser::{
 };
 pub use router::QueryEngine;
 pub use validator::{
-    engine_limit_cap, validate_query, ALLOWED_FUNCTIONS, HARD_LIMIT_CLICKHOUSE, HARD_LIMIT_MAX,
+    engine_limit_cap, validate_query, validate_query_with_cap, ALLOWED_FUNCTIONS,
+    HARD_LIMIT_CLICKHOUSE, HARD_LIMIT_MAX,
 };
 
 use sqlparser::ast::{BinaryOperator, Expr, Value, visit_expressions_mut};
@@ -20,11 +21,14 @@ use std::ops::ControlFlow;
 ///
 /// - No top-level LIMIT → append `LIMIT append_if_missing` (the caller's
 ///   requested/default page size, already ≤ `cap`).
-/// - `LIMIT ALL` / no numeric limit → set to `cap`.
-/// - Explicit numeric `LIMIT n` with `n > cap` → clamp to `cap`. Previously an
-///   explicit LIMIT bypassed the published cap (ClickHouse had no enforcement
-///   at all, so `LIMIT 50001` returned 50001 rows against a 50000 cap).
-/// - `LIMIT n` with `n ≤ cap` → left as-is (OFFSET / `BY` preserved).
+/// - A LIMIT we can prove is a literal `≤ cap` → left as-is (OFFSET / `BY`
+///   preserved).
+/// - Anything else — a literal `> cap`, `LIMIT ALL`, offset-only, or a
+///   non-literal expression like `LIMIT 50000+1` — → set to `cap`. Only a
+///   literal we can read is trusted; an expression could evaluate past the cap,
+///   so it is clamped rather than passed through. Previously an explicit LIMIT
+///   bypassed the published cap entirely (and ClickHouse had no enforcement at
+///   all: `LIMIT 50001` returned 50001 rows against a 50000 cap).
 ///
 /// Callers pass SQL that `validate_query` has already parsed; an unexpected
 /// parse failure returns the input unchanged rather than risk corrupting it.
@@ -34,10 +38,16 @@ pub fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
     use sqlparser::parser::Parser;
 
     let num = |v: i64| Expr::Value(Value::Number(v.to_string(), false).with_empty_span());
-    let over_cap = |e: &Expr| -> bool {
-        matches!(e, Expr::Value(vws) if matches!(&vws.value,
-            Value::Number(n, _) if n.parse::<i64>().map(|v| v > cap).unwrap_or(false)))
-    };
+    /// The row count if `e` is a plain integer literal; `None` for anything else.
+    fn literal(e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Value(v) => match &v.value {
+                Value::Number(n, _) => n.parse().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 
     let mut stmts = match Parser::parse_sql(&GenericDialect {}, sql) {
         Ok(s) if s.len() == 1 => s,
@@ -53,13 +63,13 @@ pub fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
                     limit_by: Vec::new(),
                 });
             }
-            Some(LimitClause::LimitOffset { limit, .. }) => match limit {
-                Some(e) if over_cap(e) => *limit = Some(num(cap)),
-                None => *limit = Some(num(cap)), // LIMIT ALL / offset-only
-                _ => {}
-            },
+            Some(LimitClause::LimitOffset { limit, .. }) => {
+                if limit.as_ref().and_then(literal).is_none_or(|n| n > cap) {
+                    *limit = Some(num(cap));
+                }
+            }
             Some(LimitClause::OffsetCommaLimit { limit, .. }) => {
-                if over_cap(limit) {
+                if literal(limit).is_none_or(|n| n > cap) {
                     *limit = num(cap);
                 }
             }
@@ -214,6 +224,13 @@ mod enforce_limit_tests {
     fn preserves_under_cap_limit_with_offset() {
         let out = el("SELECT n FROM blocks LIMIT 5 OFFSET 10");
         assert!(out.contains("LIMIT 5") && out.contains("OFFSET 10"), "got: {out}");
+    }
+
+    #[test]
+    fn non_literal_limit_expression_is_clamped_to_cap() {
+        // `LIMIT 999+1` is not a readable literal; passing it through would let
+        // an expression evaluate past the cap. Untrusted -> cap.
+        assert_eq!(el("SELECT n FROM blocks LIMIT 999+1"), "SELECT n FROM blocks LIMIT 1000");
     }
 
     #[test]
