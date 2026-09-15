@@ -19,8 +19,9 @@ use super::decoder::{
 use super::fetcher::{ReceiptFetchMode, RpcClient};
 use super::sink::SinkSet;
 use super::writer::{
-    detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
-    load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, gaps_above_watermark,
+    get_block_hash, has_gaps, load_sync_state, save_sync_state, update_sync_rate,
+    update_synced_num, update_tip_num,
 };
 
 /// RPC concurrency limits
@@ -1069,12 +1070,13 @@ async fn tick_gapfill_parallel(
         return Ok(());
     }
 
-    // Fast path: use COUNT-based check (btree index scan) to see if there
-    // are any gaps at all. Only fall back to the expensive LAG() window
-    // function when gaps actually exist and we need their exact ranges.
-    // With 0.5s block time, tip_num races ahead of synced_num constantly,
-    // so we check the range [1, tip_num] cheaply via COUNT vs expected.
-    if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
+    // Fast path: COUNT vs expected over [watermark, tip] — O(gap), since the
+    // table is verified contiguous below synced_num. This used to count from
+    // block 1: O(table), 2.1 s warm at 16.9M rows, and growing with the chain.
+    // Only fall back to the LAG() window when gaps actually exist and we need
+    // their exact ranges. (synced_num is 0 only on a fresh table, where block 1
+    // is the right floor.)
+    if state.tip_num > 0 && !has_gaps(pool, state.synced_num.max(1), state.tip_num).await? {
         metrics::set_gap_blocks(chain_id, "postgres", 0);
         metrics::set_gap_count(chain_id, "postgres", 0);
         metrics::set_synced(chain_id, realtime_lag == 0);
@@ -1085,8 +1087,8 @@ async fn tick_gapfill_parallel(
         return Ok(());
     }
 
-    // Gaps exist — run the expensive window function to find exact ranges
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    // Gaps exist — find their exact ranges, bounded to above the watermark.
+    let gaps = gaps_above_watermark(pool, state.synced_num, state.tip_num).await?;
 
     if gaps.is_empty() {
         // No gaps - fully synced from genesis to tip
@@ -1369,8 +1371,8 @@ async fn tick_gapfill_parallel_no_throttle(
     let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
-    // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    // Gaps above the watermark, sorted by end DESC (most recent first)
+    let gaps = gaps_above_watermark(pool, state.synced_num, state.tip_num).await?;
 
     if gaps.is_empty() {
         if state.synced_num < state.tip_num {
@@ -1545,12 +1547,6 @@ async fn tick_gapfill_parallel_no_throttle(
     Ok(())
 }
 
-/// Check if fully synced (no gaps from genesis to tip)
-#[allow(dead_code)]
-async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
-    let gaps = detect_all_gaps(pool, tip_num).await?;
-    Ok(gaps.is_empty())
-}
 
 /// Mark backfill as complete in `sync_state`. The gap-fill loop only ever wrote
 /// "lowest block touched in last round" to `backfill_num`, so this needs to

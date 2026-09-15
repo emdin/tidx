@@ -1202,7 +1202,7 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
     let row = conn
         .query_one(
             "SELECT COUNT(*) FROM blocks WHERE num >= $1 AND num <= $2",
-            &[&(from as i64), &(to as i64)],
+            &[&(from.min(i64::MAX as u64) as i64), &(to.min(i64::MAX as u64) as i64)],
         )
         .await?;
     let count: i64 = row.get(0);
@@ -1210,10 +1210,15 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
     Ok(count != expected)
 }
 
-/// Detect gaps in the block sequence (between existing blocks only)
+/// Detect gaps between existing blocks in `[from, below]`.
 /// Returns a list of (start, end) ranges that are missing.
-/// `below` bounds the scan to `num <= below`, avoiding a full-table scan.
-pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
+///
+/// `from` should be a block that is PRESENT (the sync watermark): the window
+/// starts at it, so a gap immediately above it is detected. The old signature
+/// had no lower bound, which made every call an O(table) LAG scan — 6.7 s at
+/// 16.9M rows, and the thing that wedged the gap-fill loop (see
+/// `gaps_above_watermark`).
+pub async fn detect_gaps(pool: &Pool, from: u64, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
 
     let rows = conn
@@ -1222,13 +1227,15 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
             WITH numbered AS (
                 SELECT num, LAG(num) OVER (ORDER BY num) as prev_num
                 FROM blocks
-                WHERE num <= $1
+                WHERE num >= $1 AND num <= $2
             )
             SELECT prev_num + 1 as gap_start, num - 1 as gap_end
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[&(below as i64)],
+            // Clamp before the i64 cast: `u64::MAX` (callers' "no bound") used
+            // to wrap to -1 and silently match nothing.
+            &[&(from.min(i64::MAX as u64) as i64), &(below.min(i64::MAX as u64) as i64)],
         )
         .await?;
 
@@ -1272,7 +1279,10 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
         .await?
         .get(0);
 
-    let mut gaps = detect_gaps(pool, tip_num).await?;
+    // From 0, not 1: the full audit must see block 0 when it exists, so the
+    // LAG window catches a gap directly above genesis. (Bounding is the
+    // incremental path's job — see gaps_above_watermark.)
+    let mut gaps = detect_gaps(pool, 0, tip_num).await?;
 
     // Add gap from block 1 to first block (if we have any blocks and min > 1)
     // Block 0 is typically empty/genesis, so we start from block 1
@@ -1292,6 +1302,30 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
     gaps.sort_by(|a, b| b.1.cmp(&a.1));
 
     Ok(gaps)
+}
+
+/// Gaps in `[synced_num, tip_num]` — the only range that can hold any.
+///
+/// `synced_num` is, by definition, the highest block below which the table has
+/// been verified contiguous, so re-scanning `[1, synced_num]` on every tick is
+/// O(table) work that can never find anything. At 16.9M rows that full LAG
+/// window took 6.7 s and lost to a leaked 5 s `statement_timeout` on every
+/// attempt: the gap-fill loop failed, never advanced the watermark, and
+/// re-ran the same doomed scan (2026-09-14, 69 failures in 8 min while
+/// `gap_blocks` grew at chain rate). Bounded, the scan is O(gap).
+///
+/// A fresh table (watermark 0) has no verified floor and needs the
+/// genesis-aware full scan instead.
+pub async fn gaps_above_watermark(
+    pool: &Pool,
+    synced_num: u64,
+    tip_num: u64,
+) -> Result<Vec<(u64, u64)>> {
+    if synced_num == 0 {
+        detect_all_gaps(pool, tip_num).await
+    } else {
+        detect_gaps(pool, synced_num, tip_num).await
+    }
 }
 
 /// Displace all rows at or after `from_block` — archive them into `orphaned_*`,

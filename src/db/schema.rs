@@ -26,7 +26,10 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
 
     for session in sessions {
         let pid: i32 = session.get(0);
-        let user: String = session.get(1);
+        // NULL for background sessions (autovacuum / parallel workers) attached
+        // to this database; reading it as `String` panicked at boot whenever
+        // one happened to be active.
+        let user: Option<String> = session.get(1);
 
         match conn
             .execute("SELECT pg_terminate_backend($1)", &[&pid])
@@ -35,7 +38,7 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
             Ok(_) => terminated += 1,
             Err(error) => {
                 skipped += 1;
-                warn!(pid, user = %user, error = %error, "Could not terminate existing database session before migrations");
+                warn!(pid, user = user.as_deref().unwrap_or("<background>"), error = %error, "Could not terminate existing database session before migrations");
             }
         }
     }
