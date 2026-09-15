@@ -447,10 +447,17 @@ async fn handle_kaspa_coverage(
         .iter()
         .next()
         .ok_or_else(|| ApiError::QueryError("no chains configured".into()))?;
-    let conn = pool
+    let mut conn = pool
         .get()
         .await
         .map_err(|e| ApiError::QueryError(format!("pool: {e}")))?;
+    // Transaction so the settings below are SET LOCAL: a session-level SET
+    // stayed on the pooled connection and leaked to its next borrower (the
+    // pool is shared with the sync engine).
+    let tx = conn
+        .transaction()
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     // Serial plan: the parallel one needs more /dev/shm than the prod
     // container has (see 2026-08-04 shared-memory errors).
@@ -461,13 +468,13 @@ async fn handle_kaspa_coverage(
     // its own generous ceiling; the 15-minute cache means we pay this at
     // most 4×/hour. Without this the endpoint returns {"ok":false,
     // "error":"db error"} once the table crosses the timeout.
-    conn.batch_execute(
-        "SET max_parallel_workers_per_gather = 0; SET statement_timeout = 120000",
+    tx.batch_execute(
+        "SET LOCAL max_parallel_workers_per_gather = 0; SET LOCAL statement_timeout = 120000",
     )
     .await
     .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
-    let floor = conn
+    let floor = tx
         .query_one(
             "SELECT min(b.num) AS first_linked_block,
                     min(b.timestamp) AS first_linked_at
@@ -479,7 +486,7 @@ async fn handle_kaspa_coverage(
         .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
-    let months = conn
+    let months = tx
         .query(
             "SELECT date_trunc('month', b.timestamp)::date::text AS month,
                     count(*) AS l2_txs,
@@ -491,6 +498,9 @@ async fn handle_kaspa_coverage(
              GROUP BY 1 ORDER BY 1",
             &[],
         )
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?;
+    tx.commit()
         .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 

@@ -73,9 +73,14 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
         )
         .await?;
 
-    // Detect actual gaps in the blocks table (bounded by max tip_num)
+    // Gaps above the sync watermark only. This used to run the unbounded LAG
+    // window (6.7 s at 16.9M rows) on EVERY /status poll, then
+    // `unwrap_or_default()` turned its timeout into `gaps: []` — so /status
+    // reported "no gaps" precisely while the gap-fill loop was wedged. Bounded
+    // it is O(gap); and a scan failure is now an error, not a clean answer.
     let max_tip: u64 = rows.iter().map(|r| r.get::<_, i64>(3) as u64).max().unwrap_or(0);
-    let gaps = crate::sync::writer::detect_gaps(pool, max_tip).await.unwrap_or_default();
+    let min_synced: u64 = rows.iter().map(|r| r.get::<_, i64>(2) as u64).min().unwrap_or(0);
+    let gaps = crate::sync::writer::gaps_above_watermark(pool, min_synced, max_tip).await?;
     let gaps_i64: Vec<(i64, i64)> = gaps.iter().map(|(s, e)| (*s as i64, *e as i64)).collect();
 
     Ok(rows
@@ -203,19 +208,23 @@ pub async fn execute_query_postgres(
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
     let sql = crate::query::convert_hex_literals_postgres(&sql);
 
-    let conn = pool.get().await?;
+    let mut conn = pool.get().await?;
 
-    // Set statement timeout for this session
-    conn.execute(
-        &format!("SET statement_timeout = {}", options.timeout_ms),
-        &[],
-    )
-    .await?;
+    // SET LOCAL inside a transaction, so the timeout dies with it. The old
+    // session-level SET persisted on the pooled connection and leaked to
+    // whoever got that connection next — the pool is shared with the sync
+    // engine, whose gap scans then died to a /query caller's 5 s default (or a
+    // deliberate `?timeout_ms=100`), wedging gap-fill from an unauthenticated
+    // endpoint. If this future is dropped mid-query (client-side timeout
+    // below), the Transaction's Drop rolls back and the setting with it.
+    let tx = conn.transaction().await?;
+    tx.batch_execute(&format!("SET LOCAL statement_timeout = {}", options.timeout_ms))
+        .await?;
 
     let start = Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(options.timeout_ms + 100),
-        conn.query(&sql, &[]),
+        tx.query(&sql, &[]),
     )
     .await;
 
@@ -233,7 +242,7 @@ pub async fn execute_query_postgres(
     // Get columns from result (even if empty, prepared statement has column info)
     let columns: Vec<String> = if rows.is_empty() {
         // For empty results, prepare statement to get column metadata
-        conn.prepare(&sql)
+        tx.prepare(&sql)
             .await
             .ok()
             .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
@@ -241,6 +250,7 @@ pub async fn execute_query_postgres(
     } else {
         rows[0].columns().iter().map(|c| c.name().to_string()).collect()
     };
+    tx.commit().await?;
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
