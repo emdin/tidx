@@ -1,8 +1,8 @@
 {
   "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 24.6,
-  "attempted_at": "2026-09-28T19:41:24Z",
+  "wall_ms": 26.8,
+  "attempted_at": "2026-09-28T20:16:59Z",
   "response": {
     "columns": [
       "num",
@@ -18,7 +18,7 @@
     ],
     "row_count": 1,
     "engine": "postgres",
-    "query_time_ms": 0.401238,
+    "query_time_ms": 0.50946,
     "ok": true
   }
 }

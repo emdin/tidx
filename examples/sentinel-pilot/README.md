@@ -21,7 +21,8 @@ sql/q3o_erc20_orphaned.sql    } keyed on what was originally alerted
 sql/q0a_cutoff_hash.sql       pin the complete-indexed cutoff
 sql/q0b_pin_check.sql         reorg detection on resume and after each scan; also fetches TS_LO
 sql/q0c_orphaned_range.sql    which blocks a reorg invalidated, with reorg_id
-sql/q0d_internal_coverage.sql INTERIM trace-coverage signal for a window (see "Internal coverage")
+sql/q0d_internal_coverage.sql INTERIM trace-coverage heuristic (until trace_outcomes is deployed)
+sql/q0e_trace_coverage.sql    trace coverage from tidx's per-tx trace record (this PR's Rust change)
 fixtures/run.py               substitute → validate → save input → POST /query → save outcome
 fixtures/classify.py          reference expansion classifier: block-pinned eth_getCode + config (step 4)
 fixtures/acceptance.py        repeatable acceptance run (prod fixtures + classifier decisions + DB fixtures)
@@ -188,9 +189,33 @@ Do not "re-point" q1–q3 at the orphaned tables ad hoc: their joins to
 canonical `txs`/`receipts`/`blocks` would drop rows or attach the
 replacement block hash. That is what the `*o` twins exist for.
 
-### Internal coverage — unresolved until tidx records trace outcomes
-`q0d` exists because tidx today has **no per-transaction trace outcome**
-(verified in source 2026-09-28):
+### Internal coverage — resolved by the trace-outcome record (this PR)
+This PR adds the tidx-side fix in the same branch (`src/sync/trace.rs`,
+`db/trace_outcomes.sql`, `src/sync/engine.rs`, `src/cli/backfill_traces.rs`,
+tests in `tests/trace_outcomes_test.rs`):
+
+* **`trace_outcomes`** — one row per traced tx: `ok` (frames written),
+  `empty` (traced, no nested call), `failed` (every attempt errored, `error`
+  kept), with cumulative `attempts`. A tx with no row was never traced.
+* **Retry** — each trace gets 3 attempts with backoff on the realtime and
+  gap-fill paths; a failure is recorded, never skipped.
+* **Gap-fill traces** — `sync_range_standalone` now traces gap-filled blocks
+  when tracing is enabled (it never did before).
+* **Repair loop** — a background task re-traces `failed` (up to 12 cumulative
+  attempts) and never-traced txs within the last 100k blocks below
+  `synced_num`, 200 per pass.
+* **`tidx backfill-traces`** — default selection is now failed + never-traced
+  (not "no internal_txs rows", which conflated `empty` with untraced);
+  `--mark-existing` stamps `ok` on already-traced history without RPC;
+  `--all` re-traces everything. Reorgs drop outcomes for orphaned blocks.
+* **`/query`** exposes `trace_outcomes`; `q0e_trace_coverage.sql` partitions a
+  window into `ok / empty / failed / untraced` and returns `resolved` only when
+  `failed = 0 AND untraced = 0`. The acceptance run executes F0e once the
+  table is live on the target tidx and prints SKIP until then.
+
+Until that deploy, `q0d` is the only signal. It exists because tidx before
+this change had **no per-transaction trace outcome** (verified in source
+2026-09-28):
 
 * the realtime tracer logs `Failed to trace tx; skipping` and moves on — no
   retry, no marker (`src/sync/trace.rs`);
@@ -210,14 +235,16 @@ tell those apart. Measured: F1b window (200 blocks, 126 txs) → 123 with
 frames, 3 possibly untraced, 106 ms; a 200k window → 85 603 / 1 191, 27 s
 (run it per poll window, not per replay chunk).
 
-**Bot rule:** report `internal_coverage: unresolved` for any window with
-`possibly_untraced > 0` **and persist it in `unresolved_internal_ranges`**
-(above) so the range is replayed after repair rather than skipped; run `tidx
-backfill-traces --from --to` on it and re-run q2 to resolve. The proper fix —
-a trace-outcome record per tx (`ok` / `empty` / `failed` + retry), written by
-both the realtime and the gap-fill paths — is a tidx change, not part of this
-pilot. Issues are disabled on `emdin/tidx`; the follow-up will be opened as
-its own PR and linked here.
+**Bot rule:** report `internal_coverage: unresolved` for any window where
+`q0e.resolved` is false (or, pre-deploy, `q0d.possibly_untraced > 0`) **and
+persist it in `unresolved_internal_ranges`** (above) so the range is replayed
+after repair rather than skipped; run `tidx backfill-traces --from --to` on it
+and re-run q2 to resolve. **Upgrade order:** run `tidx backfill-traces
+--mark-existing --from 0 --to <synced_num>` (chunked per `--batch-size`, no
+RPC for already-traced txs) *before* starting the new engine image; otherwise
+the repair loop re-traces the last 100k blocks (~42k txs on prod) over RPC.
+Failed txs are retried no sooner than 10 min after their last attempt, so an
+RPC outage costs one pass, not the attempt budget.
 
 ## Correctness rules and where each is enforced
 
@@ -279,9 +306,9 @@ after the review edits).
 
 ## Coverage gaps (recorded, not hidden)
 
-* **Internal-trace coverage is unresolved** per window until tidx records
-  trace outcomes (above). q0d bounds it; it does not close it; the
-  persisted backlog keeps such windows replayable.
+* **Internal-trace coverage** is measurable per window once `trace_outcomes`
+  is deployed (q0e); before that q0d only bounds it. Either way the persisted
+  backlog keeps unresolved windows replayable.
 * **Exits (payload 0x3) are not parsed by tidx.** L2→L1 exits have no L1-side
   provenance row. On the L2 side an exit **is** fully visible as a native tx
   to the canonical exit contract (F7) — alert on that.

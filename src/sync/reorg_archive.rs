@@ -183,6 +183,10 @@ pub async fn apply_reorg_mutation<'a>(
         let stmt = stmts.get(src).expect("stmt was inserted just above");
         tx.execute(&stmt.delete_sql, &[&cut]).await?;
     }
+    // trace_outcomes is not archived: it describes the tracing of a tx in a
+    // block that no longer exists; the replacement block is traced afresh.
+    tx.execute("DELETE FROM trace_outcomes WHERE block_num >= $1", &[&cut])
+        .await?;
 
     // 7. counts + count_check_ok. blocks_removed should equal depth when the
     //    canonical head is contiguous. Anomaly is logged AND recorded queryable

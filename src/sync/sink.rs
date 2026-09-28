@@ -6,6 +6,7 @@ use crate::metrics;
 use crate::types::{BlockRow, InternalTxRow, L2WithdrawalRow, LogRow, ReceiptRow, TxRow};
 
 use super::ch_sink::ClickHouseSink;
+use super::trace::TraceBatch;
 use super::writer;
 
 /// Number of blocks worth of data to fetch per query during backfill.
@@ -94,6 +95,12 @@ impl SinkSet {
     /// Phase 4: callTracer-derived nested calls. Written through a separate
     /// path from `write_all` because tracing is opt-in and traces are fetched
     /// per-tx after the block has already been persisted.
+    /// Frames to PG (+CH) and one outcome row per traced tx to PG.
+    pub async fn write_traces(&self, batch: &TraceBatch) -> Result<()> {
+        self.write_internal_txs(&batch.rows).await?;
+        writer::write_trace_outcomes(&self.pool, &batch.outcomes).await
+    }
+
     pub async fn write_internal_txs(&self, internal_txs: &[InternalTxRow]) -> Result<()> {
         if let Some(ch) = &self.ch {
             tokio::try_join!(

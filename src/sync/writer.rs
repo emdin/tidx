@@ -6,6 +6,7 @@ use tokio_postgres::types::Type;
 
 use crate::db::Pool;
 use crate::metrics;
+use crate::sync::trace::TraceOutcome;
 use crate::types::{BlockRow, InternalTxRow, L2WithdrawalRow, LogRow, ReceiptRow, SyncState, TxRow};
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
@@ -482,6 +483,132 @@ pub async fn write_l2_withdrawals(pool: &Pool, withdrawals: &[L2WithdrawalRow]) 
 
 /// Batch insert internal_txs (callTracer-derived nested calls) using staging
 /// table + ON CONFLICT DO NOTHING. Mirror of write_logs/write_receipts.
+/// Upsert one `trace_outcomes` row per traced tx. A later pass replaces the
+/// status/frames/error and ADDS its attempts to the running total, so
+/// `attempts` is the cumulative RPC cost of getting a tx traced.
+pub async fn write_trace_outcomes(pool: &Pool, outcomes: &[TraceOutcome]) -> Result<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let hashes: Vec<&[u8]> = outcomes.iter().map(|o| o.tx_hash.as_slice()).collect();
+    let blocks: Vec<i64> = outcomes.iter().map(|o| o.block_num).collect();
+    let statuses: Vec<&str> = outcomes.iter().map(|o| o.status.as_str()).collect();
+    let frames: Vec<i32> = outcomes.iter().map(|o| o.frames).collect();
+    let attempts: Vec<i32> = outcomes.iter().map(|o| o.attempts).collect();
+    let errors: Vec<Option<&str>> = outcomes.iter().map(|o| o.error.as_deref()).collect();
+
+    let conn = pool.get().await?;
+    conn.execute(
+        "INSERT INTO trace_outcomes (tx_hash, block_num, outcome, frames, attempts, error)
+         SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::text[], $4::int4[], $5::int4[], $6::text[])
+         ON CONFLICT (tx_hash) DO UPDATE
+           SET block_num = EXCLUDED.block_num,
+               outcome   = EXCLUDED.outcome,
+               frames    = EXCLUDED.frames,
+               attempts  = trace_outcomes.attempts + EXCLUDED.attempts,
+               error     = EXCLUDED.error,
+               traced_at = now()",
+        &[&hashes, &blocks, &statuses, &frames, &attempts, &errors],
+    )
+    .await?;
+    metrics::record_sink_write_rows("postgres", "trace_outcomes", outcomes.len() as u64);
+    Ok(())
+}
+
+const TX_ROW_COLUMNS: &str = "t.block_num, t.block_timestamp, t.idx, t.hash, t.type, t.\"from\", t.\"to\",
+    t.value, t.input, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas,
+    t.gas_used, t.nonce_key, t.nonce, t.fee_token, t.fee_payer, t.calls,
+    t.call_count, t.valid_before, t.valid_after, t.signature_type, t.selector";
+
+fn tx_row_from(r: &tokio_postgres::Row) -> TxRow {
+    TxRow {
+        block_num: r.get(0),
+        block_timestamp: r.get(1),
+        idx: r.get(2),
+        hash: r.get(3),
+        tx_type: r.get(4),
+        from: r.get(5),
+        to: r.get(6),
+        value: r.get(7),
+        input: r.get(8),
+        gas_limit: r.get(9),
+        max_fee_per_gas: r.get(10),
+        max_priority_fee_per_gas: r.get(11),
+        gas_used: r.get(12),
+        nonce_key: r.get(13),
+        nonce: r.get(14),
+        fee_token: r.get(15),
+        fee_payer: r.get(16),
+        calls: r.get(17),
+        call_count: r.get(18),
+        valid_before: r.get(19),
+        valid_after: r.get(20),
+        signature_type: r.get(21),
+        selector: r.get(22),
+    }
+}
+
+/// Txs in `[from, to]` that still need a trace: never traced (no outcome row)
+/// or `failed` with fewer than `max_attempts` cumulative attempts AND last
+/// tried more than `retry_after_secs` ago. The age gate is what stops an RPC
+/// outage from burning a tx's whole attempt budget in seconds and stranding
+/// it. Oldest first, at most `limit`.
+pub async fn load_txs_for_trace_repair(
+    pool: &Pool,
+    from: i64,
+    to: i64,
+    max_attempts: i32,
+    retry_after_secs: i64,
+    limit: i64,
+) -> Result<Vec<TxRow>> {
+    let conn = pool.get().await?;
+    let sql = format!(
+        "SELECT {TX_ROW_COLUMNS}
+           FROM txs t
+           LEFT JOIN trace_outcomes o ON o.tx_hash = t.hash
+          WHERE t.block_num BETWEEN $1 AND $2
+            AND (o.tx_hash IS NULL
+                 OR (o.outcome = 'failed' AND o.attempts < $3
+                     AND o.traced_at < now() - ($4::int8 * interval '1 second')))
+          ORDER BY t.block_num, t.idx
+          LIMIT $5"
+    );
+    let rows = conn
+        .query(&sql, &[&from, &to, &max_attempts, &retry_after_secs, &limit])
+        .await?;
+    Ok(rows.iter().map(tx_row_from).collect())
+}
+
+/// Every tx in `[from, to]` (for `backfill-traces --all`).
+pub async fn load_txs_in_range(pool: &Pool, from: i64, to: i64) -> Result<Vec<TxRow>> {
+    let conn = pool.get().await?;
+    let sql = format!(
+        "SELECT {TX_ROW_COLUMNS} FROM txs t WHERE t.block_num BETWEEN $1 AND $2 ORDER BY t.block_num, t.idx"
+    );
+    let rows = conn.query(&sql, &[&from, &to]).await?;
+    Ok(rows.iter().map(tx_row_from).collect())
+}
+
+/// Backfill `ok` outcomes for txs that already have `internal_txs` rows but no
+/// outcome (traced before `trace_outcomes` existed). Frames present ⇒ the
+/// trace succeeded, so no RPC is needed; existing outcomes are left alone.
+/// One aggregate over `idx_internal_txs_block_num`; call it per block chunk,
+/// not over full history in one statement. Returns rows inserted.
+pub async fn mark_existing_traces(pool: &Pool, from: i64, to: i64) -> Result<u64> {
+    let conn = pool.get().await?;
+    Ok(conn
+        .execute(
+            "INSERT INTO trace_outcomes (tx_hash, block_num, outcome, frames, attempts)
+             SELECT i.tx_hash, min(i.block_num), 'ok', count(*)::int4, 0
+               FROM internal_txs i
+              WHERE i.block_num BETWEEN $1 AND $2
+              GROUP BY i.tx_hash
+             ON CONFLICT (tx_hash) DO NOTHING",
+            &[&from, &to],
+        )
+        .await?)
+}
+
 pub async fn write_internal_txs(pool: &Pool, internal_txs: &[InternalTxRow]) -> Result<()> {
     if internal_txs.is_empty() {
         return Ok(());

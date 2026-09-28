@@ -107,6 +107,17 @@ def main():
     for name, ok in [("F8  page1+page2 == single 10-row query", p1+p2==s10), ("F8  no overlap between pages", not set(p1)&set(p2)),
                      ("F9  restart re-run identical to page1", rr==p1)]:
         ok_all &= ok; print(f"{'PASS' if ok else 'FAIL'}  {name}")
+    # F0e needs tidx's trace_outcomes table (this PR's Rust change); skipped until it is deployed.
+    import urllib.request
+    tables = json.load(urllib.request.urlopen(f"{base}/tables", timeout=15))
+    names = [t["name"] for t in (tables.get("tables") if isinstance(tables, dict) else tables)]
+    if "trace_outcomes" in names:
+        outcome, rows = run("q0e_trace_coverage.sql", "F0e_trace_coverage_F1b_window.params.json", base)
+        r = rows[0] if rows else {}
+        ok = rows is not None and len(rows) == 1 and int(r["successful_txs"]) == sum(int(r[k]) for k in ("ok", "empty", "failed", "untraced"))
+        ok_all &= ok; print(f"{'PASS' if ok else 'FAIL'}  F0e trace_outcomes partitions the window exactly        {r if rows else outcome}")
+    else:
+        print("SKIP  F0e trace coverage from trace_outcomes: table not deployed on this tidx yet (q0d heuristic applies)")
     sys.path.insert(0, HERE); import classify
     cfg = json.load(open(os.path.join(HERE, "..", "config.example.json"))); get_code = classify.rpc_get_code(cfg["rpc_url"])
     for params, prefix, want, why in CLASSIFY:

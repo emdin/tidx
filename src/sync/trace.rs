@@ -157,57 +157,118 @@ fn flatten_recursive(
     Ok(())
 }
 
-/// Fetch `debug_traceTransaction` for every tx in `txs` (concurrently, capped
-/// by the RpcClient's semaphore) and flatten each result into a list of
-/// `InternalTxRow`s. The returned vec is the concatenation of per-tx results
-/// in the same order as `txs`.
-///
-/// A single tx that fails to trace (e.g. rate-limited, or the RPC dropped the
-/// archive state for that block) does NOT abort the whole batch — it's logged
-/// and skipped. The caller can re-run the trace backfill CLI to fill gaps.
-pub async fn fetch_and_flatten_traces(
-    rpc: &RpcClient,
-    txs: &[TxRow],
-) -> Result<Vec<InternalTxRow>> {
-    if txs.is_empty() {
-        return Ok(Vec::new());
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceStatus {
+    /// Traced; ≥1 nested frame written to `internal_txs`.
+    Ok,
+    /// Traced; the tx made no nested call, so `internal_txs` has nothing for it.
+    Empty,
+    /// Every attempt errored. Retried later by the repair loop / backfill CLI.
+    Failed,
+}
 
-    // Fire all per-tx trace calls; the RpcClient semaphore caps concurrency so
-    // we don't have to worry about overwhelming the upstream.
+impl TraceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraceStatus::Ok => "ok",
+            TraceStatus::Empty => "empty",
+            TraceStatus::Failed => "failed",
+        }
+    }
+}
+
+/// One row of `trace_outcomes`: the answer to "was this tx traced?", which the
+/// presence or absence of `internal_txs` rows cannot give.
+#[derive(Debug, Clone)]
+pub struct TraceOutcome {
+    pub tx_hash: Vec<u8>,
+    pub block_num: i64,
+    pub status: TraceStatus,
+    pub frames: i32,
+    /// RPC attempts made in THIS pass; the writer accumulates across passes.
+    pub attempts: i32,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct TraceBatch {
+    pub rows: Vec<InternalTxRow>,
+    pub outcomes: Vec<TraceOutcome>,
+}
+
+/// Attempts per tx on the realtime/gap-fill paths. Transient RPC failures
+/// (rate limit, connection reset) usually clear within the two backoffs
+/// (200 ms, 400 ms); anything longer is left to the repair loop.
+pub const DEFAULT_TRACE_ATTEMPTS: u32 = 3;
+
+/// Fetch `debug_traceTransaction` for every tx in `txs` (concurrently, capped
+/// by the RpcClient's semaphore), flatten each result, and record an outcome
+/// for EVERY tx — including the ones with zero nested frames and the ones
+/// that failed every attempt. Nothing is silently skipped.
+pub async fn trace_txs(rpc: &RpcClient, txs: &[TxRow], max_attempts: u32) -> TraceBatch {
+    let max_attempts = max_attempts.max(1);
     let futs = txs.iter().map(|tx| async move {
         let hash_hex = format!("0x{}", hex::encode(&tx.hash));
-        let frame = rpc.trace_transaction(&hash_hex).await?;
-        let tx_hash_arr: [u8; 32] = tx
-            .hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("tx hash is not 32 bytes for {hash_hex}"))?;
-        flatten_call_frame(
-            tx.block_num,
-            tx.block_timestamp,
-            tx.idx,
-            &tx_hash_arr,
-            &frame,
+        let mut last_err = None;
+        for attempt in 1..=max_attempts {
+            match trace_one(rpc, tx, &hash_hex).await {
+                Ok(rows) => {
+                    let frames = rows.len() as i32;
+                    let status = if frames > 0 { TraceStatus::Ok } else { TraceStatus::Empty };
+                    let outcome = TraceOutcome {
+                        tx_hash: tx.hash.clone(),
+                        block_num: tx.block_num,
+                        status,
+                        frames,
+                        attempts: attempt as i32,
+                        error: None,
+                    };
+                    return (rows, outcome);
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
+                    }
+                }
+            }
+        }
+        tracing::warn!(
+            tx_idx = tx.idx,
+            block_num = tx.block_num,
+            attempts = max_attempts,
+            error = last_err.as_deref().unwrap_or(""),
+            "Failed to trace tx; recorded as failed for repair"
+        );
+        (
+            Vec::new(),
+            TraceOutcome {
+                tx_hash: tx.hash.clone(),
+                block_num: tx.block_num,
+                status: TraceStatus::Failed,
+                frames: 0,
+                attempts: max_attempts as i32,
+                error: last_err,
+            },
         )
     });
 
-    let results = future::join_all(futs).await;
-    let mut out = Vec::new();
-    for (i, r) in results.into_iter().enumerate() {
-        match r {
-            Ok(rows) => out.extend(rows),
-            Err(e) => {
-                tracing::warn!(
-                    tx_idx = txs[i].idx,
-                    block_num = txs[i].block_num,
-                    error = %e,
-                    "Failed to trace tx; skipping"
-                );
-            }
-        }
+    let mut batch = TraceBatch::default();
+    for (rows, outcome) in future::join_all(futs).await {
+        batch.rows.extend(rows);
+        batch.outcomes.push(outcome);
     }
-    Ok(out)
+    batch
+}
+
+async fn trace_one(rpc: &RpcClient, tx: &TxRow, hash_hex: &str) -> Result<Vec<InternalTxRow>> {
+    let frame = rpc.trace_transaction(hash_hex).await?;
+    let tx_hash_arr: [u8; 32] = tx
+        .hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("tx hash is not 32 bytes for {hash_hex}"))?;
+    flatten_call_frame(tx.block_num, tx.block_timestamp, tx.idx, &tx_hash_arr, &frame)
 }
 
 /// Decode a `0x`-prefixed 20-byte hex string into `Vec<u8>` length 20. Bad
