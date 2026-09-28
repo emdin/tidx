@@ -23,11 +23,13 @@ sql/q0b_pin_check.sql         reorg detection on resume and after each scan; als
 sql/q0c_orphaned_range.sql    which blocks a reorg invalidated, with reorg_id
 sql/q0d_internal_coverage.sql INTERIM trace-coverage signal for a window (see "Internal coverage")
 fixtures/run.py               substitute → validate → save input → POST /query → save outcome
-fixtures/acceptance.py        repeatable acceptance run (prod fixtures + local-chain fixtures)
+fixtures/classify.py          reference expansion classifier: block-pinned eth_getCode + config (step 4)
+fixtures/acceptance.py        repeatable acceptance run (prod fixtures + classifier decisions + DB fixtures)
 fixtures/*.params.json        exact inputs;  *.input.json  what was sent;  *.output.json  what came back
-fixtures/local/setup.sql      idempotent local-chain fixtures (F1c, F4/F4c, F10b) for a tidx test DB
+fixtures/local/setup.sql      synthetic DATABASE QUERY FIXTURES (F1c, F4/F4c, F10b/F10c) — disposable test DB only
 fixtures/local/run_local.py   runs the SAME sql files through psql against that DB
-config.example.json           watchlist / token decimals / contract classification
+config.example.json           watchlist / token decimals / contract classification / rpc_url / state schema
+state.example.json            shape of the persisted bot state (two checkpoints + unresolved-trace backlog)
 benchmark.md                  measured cost per query × watchlist size × window
 ```
 
@@ -37,13 +39,20 @@ benchmark.md                  measured cost per query × watchlist size × windo
 # production fixtures only (network access to tidx.igralabs.com)
 python3 fixtures/acceptance.py --skip-local
 
-# production + local-chain fixtures; <db> is a libpq URL for psql, or
-# docker:<container>:<user>:<dbname> for a tidx test database (migrations applied)
+# production + database fixtures; <db> is a libpq URL for psql, or
+# docker:<container>:<user>:<dbname> for a DISPOSABLE tidx test database
+# (migrations applied, marked once with `CREATE TABLE sentinel_disposable_db ();`)
 python3 fixtures/acceptance.py --local-db docker:tidx-test-pg:tidx:tidx
+
+# classifier rules alone, offline (stubbed code lookup)
+python3 fixtures/classify.py --selftest
 ```
 
 Exit code 0 only if every assertion holds. Each line prints PASS/FAIL with the
-evidence. Last run 2026-09-28: 23 production checks + 7 local checks, ALL PASS.
+evidence. Last run 2026-09-28: 24 production query checks + 8 classifier
+decisions (live block-pinned `eth_getCode`) + 10 database-fixture checks,
+ALL PASS. The production checks establish query behaviour; they do **not**
+establish complete trace coverage (see "Internal coverage").
 
 ## How the bot uses it
 
@@ -60,27 +69,40 @@ evidence. Last run 2026-09-28: 23 production checks + 7 local checks, ALL PASS.
    paginated to completion (below), then `q0d` for the window (record its
    `possibly_untraced`; if > 0 the window's internal coverage is
    **unresolved**, see below).
-4. **Watchlist expansion — classify before adding.** A row may add an address
-   to the *off-chain* watchlist only if **all** of these hold:
-   * `direction = 'out'` — the watched address is the sender (`from_address`).
-     Inbound rows never expand the watchlist (they would add the payer).
+4. **Watchlist expansion — classify before adding.** The reference
+   implementation is `fixtures/classify.py` (`decide(row, …)`); the rules:
+   * `direction = 'out'` — the watched address is the sender. Inbound rows
+     are reported, never expand (they would add the payer).
    * positive value — enforced in SQL (`value > 0` for q1/q2,
-     `abi_uint(data) > 0` for q3), so any returned row qualifies.
+     `abi_uint(data) > 0` for q3); the classifier re-checks it.
    * eligible watch-start position — the row's `(block_num, tx_index,
      log_index | trace_path)` is at or after the position from which the
-     sending address is watched (`watch_from_block` for a seed; the first
-     observed inbound row for an added recipient). Rows before it are history
-     and only reported.
-   * the **direct recipient** (`to_address`) classifies as *unknown EOA-like*:
-     not in `config.contracts` (exit, Hyperlane router, known pool/DEX), not
-     the zero address, and not a contract observed as `called_contract` /
-     token address anywhere in the run. The **top-level callee**
-     (`called_contract`, `selector`) is classified too: exit / router / pool
-     / unknown-contract. Any of those on either side → the row is a **review
-     flag**, not an expansion. Unknown contracts and services stay in human
-     review; only reviewed decisions add them to `config.contracts`.
-   A designation is never propagated through a pool, router or exchange to
-   its other users; the bot adds at most the direct counterparty.
+     **sender** is watched (`watch_from_block` for a seed; the first observed
+     inbound row for an added recipient). Earlier rows are history: reported.
+   * **explicit address classification**, same function for the direct
+     recipient (`to_address`) and the top-level callee (`called_contract`),
+     first match wins: `zero_address` → `exit` → `hyperlane_router` (the nine
+     routers) → `known_pool` → `token` (config or the row's own
+     `token_address`) → otherwise **`eth_getCode(addr, row.block_num)`**
+     against `config.rpc_url`: non-empty → `contract`, empty → `eoa`, lookup
+     failure → `unknown`. Appearing in `called_contract` does *not* make an
+     address a contract (q1 puts the recipient wallet there for a plain
+     payment), and absence from config or from the run does *not* make it an
+     EOA — only the block-pinned code lookup decides those two, and
+     `unknown` is retained for review, never treated as EOA.
+   * **expand** only if the recipient is `eoa` **and** the callee is one of
+     the two allowed cases: `callee == recipient` (plain native payment to a
+     wallet, F12) or `callee == token_address` (ordinary ERC-20
+     `transfer()` — the token contract is the callee while the recipient may
+     be a wallet, F1b A→B). Every other callee (exit, router, pool, any other
+     contract, unknown) → **review**.
+   Unknown contracts and services stay in human review; only reviewed
+   decisions add them to `config.contracts`. A designation is never
+   propagated through a pool, router or exchange to its other users; the bot
+   adds at most the direct counterparty. Evidence that the code lookup is
+   load-bearing: F1b's recipient C (`0x923ba6be…cf92`) *looks* like a wallet
+   in the query row but has 8 KB of code at that block and 1 217 calls into
+   it — the classifier returns `review`, not `expand`.
 5. **Recipient rescan.** For every address added in step 4, run q1–q3 with
    watchlist = that address from its first observed inbound position
    through **the end of the current window**. This catches movements later
@@ -88,12 +110,29 @@ evidence. Last run 2026-09-28: 23 production checks + 7 local checks, ALL PASS.
    original scan could not see. Rescans overlap earlier scans by
    construction — deduplicate on the key below. Recurse for recipients found
    by rescans, same rule.
-6. **Window checkpoint.** After every page of q1–q3 for the window *and* every
+6. **Window checkpoints.** After every page of q1–q3 for the window *and* every
    rescan it triggered are complete, re-run `q0b` on the window's last block:
-   hash unchanged → advance the checkpoint to that window end and persist
-   `(checkpoint, hash)`; changed → treat as a reorg (below) before advancing.
+   hash unchanged → advance the checkpoints (below) to that window end and
+   persist `(block, hash)`; changed → treat as a reorg before advancing.
    The **overall cutoff** is reached only after all windows and all recipient
    rescans finish; never advance to the pinned cutoff early.
+
+### Checkpoints and the unresolved-trace backlog (persisted state, required)
+`state.example.json` is the shape. Two checkpoints advance **independently**:
+
+* `scan_checkpoint` — q1 + q3 (native top-level + ERC-20). Advances per
+  window as in step 6.
+* `internal_checkpoint` — q2. May advance through a window **only** when
+  `q0d` reported `possibly_untraced = 0` for it, **or** the window has been
+  appended to `unresolved_internal_ranges` `{block_lo, block_hi,
+  possibly_untraced, recorded_at, resolved_at: null}`.
+
+Advancing `scan_checkpoint` therefore never discards an internal range: the
+backlog entry survives restarts and is replayed — q2 over exactly that range,
+same watchlist, then the step-4/5 rules — after a trace repair (`tidx
+backfill-traces --from --to` today; the trace-outcome record once it lands),
+and only then gets `resolved_at`. `pending_rescans` is persisted for the same
+reason: a restart between a discovery and its rescan must not lose it.
 
 ### Pagination (deterministic, keyset)
 Order is `(block_num, tx_index, log_index)` for q3, `(…, trace_path)` for q2,
@@ -125,8 +164,9 @@ alert; rescans and restarts re-emit the same rows (F9) and must be idempotent.
 ### Reorg handling
 tidx archives every reorg atomically (`reorgs` + `orphaned_blocks/txs/
 receipts/logs/internal_txs`, all keyed by `reorg_id`; PR #13). Igra has
-recorded **0 reorgs** to date (F10), so this path is exercised only on the
-local-chain fixture F10b.
+recorded **0 reorgs** to date (F10). The orphan queries are therefore
+exercised only on synthetic `reorgs`/`orphaned_*` rows (F10b/F10c) — that
+tests the SQL over the archive schema, **not** tidx's reorg handling itself.
 
 * **Detect.** `q0b` on the stored checkpoint block before each poll, and on
   the window's last block after each scan (step 6). Hash differs → reorg.
@@ -134,7 +174,9 @@ local-chain fixture F10b.
   the orphaned blocks with their `reorg_id`; `reorgs.fork_point` is the
   replay start.
 * **Correct from the retained original observations.** Run `q1o`/`q2o`/`q3o`
-  with `REORG_ID` = that id and the same watchlist. They join
+  with `REORG_ID` = that id and the same watchlist, **paginated with the same
+  keyset cursors as q1–q3** (a reorg can orphan more than a page of movements
+  in one block — F10c). They join
   `orphaned_txs ⋈ orphaned_receipts ⋈ orphaned_blocks` (and `orphaned_logs`
   / `orphaned_internal_txs`) **within the same `reorg_id`** — never the
   canonical tables, which by then hold the replacement block (or nothing).
@@ -169,11 +211,13 @@ frames, 3 possibly untraced, 106 ms; a 200k window → 85 603 / 1 191, 27 s
 (run it per poll window, not per replay chunk).
 
 **Bot rule:** report `internal_coverage: unresolved` for any window with
-`possibly_untraced > 0`; optionally run `tidx backfill-traces --from --to`
-on that range and re-run q2. The proper fix — a trace-outcome record per
-tx (`ok` / `empty` / `failed` + retry), written by both the realtime and the
-gap-fill paths — is a tidx change and is proposed as a separate PR; it is
-not part of this pilot.
+`possibly_untraced > 0` **and persist it in `unresolved_internal_ranges`**
+(above) so the range is replayed after repair rather than skipped; run `tidx
+backfill-traces --from --to` on it and re-run q2 to resolve. The proper fix —
+a trace-outcome record per tx (`ok` / `empty` / `failed` + retry), written by
+both the realtime and the gap-fill paths — is a tidx change, not part of this
+pilot. Issues are disabled on `emdin/tidx`; the follow-up will be opened as
+its own PR and linked here.
 
 ## Correctness rules and where each is enforced
 
@@ -195,7 +239,7 @@ not part of this pilot.
 | # | Case | Fixture | Result |
 |---|---|---|---|
 | F1 | seed → recipient → next recipient **between two polls** (router-mediated) | seed `0x7826f542…cbe45`. Poll 1 `[17959300,17959360]`: WiKAS **277.36** → `0x13f197c7…0bd5` in `0xf210f33312bcd4b1fb65ed850022ebe5548820f13ab07befd88f4390f4358c2b` (blk 17959343). Recipient rescan `[17959343,17959360]` → only that inbound. Poll 2 `[17959361,17960200]` with both watched: `0x13f1…` → `0xc281cb25…14d7` **398.59** in `0xa8fdae0b11134066987a35f0562c43bc854cc0bb1854a5a9be975a0e361120d5` (17959374) and **186.83** in `0x553cc102008302d5c9cf833002608959daebb6b4432260684c0712b1f2a0505c` (17960101) | ✅ forwarding caught in poll 2; every leg has `called_contract = 0xa5b0946d…`, `selector 0x38ed1739` → **review flag** (router), so under step 4 these do *not* expand the watchlist |
-| F1b | **ordinary-wallet forwarding inside the initial scanned range** | direct `transfer()` legs, A = `0xc87dfceb…`, B = `0x725836b4…`, C = `0x923ba6be…`, window `[17114600,17114800]`. Seed A: A→B **9 990** WiKAS in `0xca275fc2b46504f5b96b5734840363c5362bb30119b2e3fd68f848324f5d048a` (17114606). Rescan B over the SAME window: B→C **100** in `0x244884b027d68af104e215a5690f9869624b141cf1502b901d09a93490da53fe` (17114613) and B→A 9 700 in `0x0c2894dd8ef84cc04e94238d3a9c6be44fc13e94ce5d222f95a4b801f99d168d` (17114741) | ✅ both legs `direction = out`, `called_contract` = the token itself, `selector 0xa9059cbb`; B is an unlisted, EOA-like recipient → eligible |
+| F1b | **ordinary-wallet forwarding inside the initial scanned range** | direct `transfer()` legs, A = `0xc87dfcebdb5de6ba38975bdb1418174b88b51e00`, B = `0x725836b4d485ab446c1698d3b622dae0084b1c98`, C = `0x923ba6be4bbe5d89975e259a0d3e09842045cf92`, window `[17114600,17114800]`. Seed A: A→B **9 990** WiKAS in `0xca275fc2b46504f5b96b5734840363c5362bb30119b2e3fd68f848324f5d048a` (17114606). Rescan B over the SAME window: B→C **100** in `0x244884b027d68af104e215a5690f9869624b141cf1502b901d09a93490da53fe` (17114613) and B→C 9 700 in `0x0c2894dd8ef84cc04e94238d3a9c6be44fc13e94ce5d222f95a4b801f99d168d` (17114741) | ✅ both legs `direction = out`, `called_contract` = the token itself, `selector 0xa9059cbb`. Classifier: A→B **expand** (B has no code at 17114606); B→C **review** — C has code (a contract with 1 217 inbound calls), which nothing in the row reveals |
 | F1c | forwarding **in the same block** | **local-chain** block 999002: tx#0 A→B 500 T, tx#1 B→C 200 T | ✅ poll with A returns tx#0 (`out`); rescan with B over the same one-block window returns tx#1 (`out`). *Igra has no real same-block instance among direct wallet transfers* |
 | F2 | small positive transfer | `0xaeb835081aa881a5cc86dc761cbf300fe7eae0cf7d36031d0d08fef84d335af6` (17315165), **105 raw** WiKAS from `0xe3ec9732…25b8` | ✅ returned |
 | F3 | failed transaction | `0x7b8ed91308ef638f2fbc53ed338d4a47b09734047b4e6b699c67ddbb28c3c48b` (17886245), 2 885 iKAS, `status = 0` | ✅ q1 returns **0 rows** |
@@ -208,7 +252,10 @@ not part of this pilot.
 | F8 | full-page continuation | `0xc281cb25…14d7`, 2M blocks, page 5 | ✅ `page1+page2 == single 10-row query`; no overlap; cursor `(15978373, 4, 5)` |
 | F9 | identical re-run | identical re-run of page 1 | ✅ identical rows. **Restart persistence and alert dedup are bot-lifecycle behaviour — explicitly deferred to the bot deliverable**, not demonstrated here |
 | F10 | cutoff pin / reorg detection | `/status` cutoff pinned via q0a; q0b on block 17959343 matches `0x7c6e65d3…b764`; q0c over the F1 range → 0; `reorgs` = 0 | ✅ mechanism exercised; no live reorg exists on Igra |
-| F10b | **actual reorg correction** | **local-chain**: reorg 999 orphaned block 999003 (hash `0xdead…9003`) holding tx `feed…04` A→B 5 wei native + 900 T; canonical replacement block has no txs | ✅ q1o and q3o (REORG_ID 999, watched A) each return the movement **with the orphaned hash**; canonical q3 over the same range returns 0 rows |
+| F10b | reorg correction from the archive | **database fixture** (synthetic `reorgs`/`orphaned_*` rows — not an executed reorg): reorg 999 orphaned block 999003 (hash `0xdead…9003`) holding txs `feed…04` (A→B 5 wei + 900 T) and `feed…05` (7 wei, five transfers 901–905 T, three internal frames); canonical replacement block is empty | ✅ q1o (2 rows), q2o (3), q3o (6) with REORG_ID 999, watched A, every row **with the orphaned hash**; canonical q3 over the same range returns 0 rows |
+| F10c | **more than a page of orphaned rows in one block** | same fixture, page sizes 1 / 2 / 4 | ✅ q1o 2 pages, q2o 2 pages, q3o 2 pages; each `page1+…+pageN == single query`, no overlap |
+| F12 | plain native payment wallet→wallet | `0x076f281b28f45104e855594aa4a0a8822c6a6f68cfd36dbf8f6441326b2809f3` (17950630): `0x2f296ed8…` → `0xa0416cde…` **100 iKAS**, `gas_used 21000` | ✅ q1 1 row `out`; `called_contract == to_address` (a wallet, no code at that block) → classifier **expand** |
+| C | expansion decisions | `fixtures/classify.py` over F1b, F12, F1, F6, F7, F11 with live block-pinned `eth_getCode` | ✅ expand ×2 (F1b A→B, F12); review ×6 (contract recipient, router callee, pool, exit, zero address, Hyperlane router); offline `--selftest` covers lookup failure → review and watch-start positions |
 | F11 | representative **Hyperlane** movement | `0x244c4fdc9822fb620bc2e47ad81d8a6b5d931d665628a6403778e3643d7f3350` (17293324): `0xaaf9e5f4…` calls token router `0xa5b8bf90…35e7` (`selector 0x81b4e8b4`), which burns **176 479 296 raw** (Transfer → `0x0`) and emits `Dispatch`; the tx also sends **4.797 iKAS** native to the router | ✅ q3 1 row `out` to the zero address, q1 1 row `out` to the router → both classify as bridge-out via router → review, not expansion |
 | F0d | coverage is reported, not assumed | `q0d` over the F1b window and over a 200k window | ✅ counts partition `successful_txs` exactly; 3 (resp. 1 191) `possibly_untraced` → those windows are `unresolved` |
 
@@ -216,10 +263,15 @@ Cross-table completeness: every fixture tx is present and consistent in
 `txs`, `receipts`, `logs`, `internal_txs` (e.g. F1 legs: receipt 1, 4 logs,
 16 frames; F7: receipt 1, 6 logs, 11 frames; F3: receipt 0, 0 logs).
 
-Local-chain fixtures run the **same SQL files** through psql; the only
+Database fixtures (`fixtures/local/`) are synthetic rows inserted straight
+into tidx's tables. They run the **same SQL files** through psql; the only
 rendering difference is that `'0x…'` literals become `'\x…'::bytea` directly
-(what `/query`'s hex rewriter does server-side). Outputs are saved next to the
-runner as `*.local.output.csv`.
+(what `/query`'s hex rewriter does server-side). They exercise the queries
+over the schema; they do not run the indexer. `setup.sql` deletes by block
+range / reorg id, so it is restricted to a **disposable test database**: it
+refuses to run unless the operator has marked the database with
+`CREATE TABLE sentinel_disposable_db ();` and it holds no large chain.
+Outputs are saved next to the runner as `*.local.output.csv`.
 
 ## Benchmark
 See `benchmark.md` (generated from `fixtures/B_*.output.json`; re-measured
@@ -228,21 +280,20 @@ after the review edits).
 ## Coverage gaps (recorded, not hidden)
 
 * **Internal-trace coverage is unresolved** per window until tidx records
-  trace outcomes (above). q0d bounds it; it does not close it.
+  trace outcomes (above). q0d bounds it; it does not close it; the
+  persisted backlog keeps such windows replayable.
 * **Exits (payload 0x3) are not parsed by tidx.** L2→L1 exits have no L1-side
   provenance row. On the L2 side an exit **is** fully visible as a native tx
   to the canonical exit contract (F7) — alert on that.
 * **`l2_withdrawals` holds L1→L2 *entries* (deposits)**, not exits. Do not
   read it as exits.
-* **Hyperlane routers: the nine fork-fixture addresses are still missing.**
-  `IgraLabs/igra-sentinel` is private and the tidx host's GitHub token gets
-  HTTP 404 on it (2026-09-28), so they could not be fetched and were **not
-  guessed**. `config.example.json` has the empty slot plus evidence-based
-  on-chain candidates with their observed roles — the Mailbox (sole
-  `Dispatch` emitter) is a different role from a token router (the contract
-  users call, which burns and dispatches; F11). Please paste the nine
-  addresses from `test/IgraFork.t.sol` @ `a3029464` into
-  `contracts.hyperlane_routers.from_fork_fixture`.
+* **Hyperlane routers** — the nine Igra source routers (iKAS, USDC, USDT,
+  WETH, cbBTC, wstETH, SOL, USDS, sUSDS) are in
+  `contracts.hyperlane_routers.from_fork_fixture`, supplied by the reviewer
+  from `igra-sentinel/test/IgraFork.t.sol` @ `a3029464` (reviewed
+  configuration, not a live governance check). F11's router `0xa5b8bf90…`
+  is the USDC route. The Mailbox `0x3a867fcf…` is a different role and is
+  listed separately.
 * **NFT Transfer events** are excluded (`topic3 IS NULL`).
 * **`block_timestamp` is synthetic** (DAA-derived, ~10 min behind wall clock
   today). Exact bounds are `block_num`; `blocks.real_timestamp` is L1 time.

@@ -32,5 +32,8 @@ WHERE l.reorg_id = {{REORG_ID}}
   AND l.topic3 IS NULL
   AND abi_uint(l.data) > 0
   AND (l.topic1 IN ({{WATCHED_TOPICS}}) OR l.topic2 IN ({{WATCHED_TOPICS}}))
+  AND (l.block_num > {{CUR_BLOCK}}
+       OR (l.block_num = {{CUR_BLOCK}} AND l.tx_idx > {{CUR_TX}})
+       OR (l.block_num = {{CUR_BLOCK}} AND l.tx_idx = {{CUR_TX}} AND l.log_idx > {{CUR_LOG}}))
 ORDER BY l.block_num, l.tx_idx, l.log_idx
 LIMIT {{PAGE_PLUS_1}}

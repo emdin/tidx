@@ -68,11 +68,28 @@ def main():
     ok &= check("F1c rescan B, SAME window: B→C (tx#1, later in same block) out", outs == [("03", "200")], f"got {outs}")
     # F10b reorg: orphaned observations with their ORIGINAL block hash
     r = rows(db, "F10b_reorg_q1o", "q1o_native_orphaned.sql", [A], REORG_ID=999, BLOCK_LO=999003, BLOCK_HI=999003)
-    ok &= check("F10b q1o returns the orphaned native movement w/ orphaned hash", len(r) == 1 and r[0]["tx_hash"].endswith("04") and r[0]["block_hash"].startswith("\\xdead"), f"got {len(r)} rows, hash {r[0]['block_hash'][:8] if r else '-'}")
+    ok &= check("F10b q1o returns the orphaned native movements w/ orphaned hash", len(r) == 2 and r[0]["tx_hash"].endswith("04") and all(d["block_hash"].startswith("\\xdead") for d in r), f"got {len(r)} rows, hash {r[0]['block_hash'][:8] if r else '-'}")
     r = rows(db, "F10b_reorg_q3o", "q3o_erc20_orphaned.sql", [A], REORG_ID=999, BLOCK_LO=999003, BLOCK_HI=999003)
-    ok &= check("F10b q3o returns the orphaned token movement (900) w/ orphaned hash", len(r) == 1 and r[0]["amount_raw"] == "900" and r[0]["block_hash"].startswith("\\xdead"), f"got {len(r)} rows")
+    ok &= check("F10b q3o returns the orphaned token movements (900..905) w/ orphaned hash", sorted(d["amount_raw"] for d in r) == [str(n) for n in range(900, 906)] and all(d["block_hash"].startswith("\\xdead") for d in r), f"got {len(r)} rows")
     r = rows(db, "F10b_canonical_after_reorg", "q3_erc20.sql", [A], BLOCK_LO=999003, BLOCK_HI=999003)
     ok &= check("F10b canonical q3 over the same range now finds nothing", len(r) == 0, f"got {len(r)} rows")
+    # F10c: more than a page of orphaned rows inside ONE block — keyset pagination of q1o/q2o/q3o
+    for q, key, size, want in [("q1o_native_orphaned.sql", ("CUR_BLOCK", "CUR_TX"), 1, 2),
+                               ("q2o_internal_orphaned.sql", ("CUR_BLOCK", "CUR_TX", "CUR_PATH"), 2, 3),
+                               ("q3o_erc20_orphaned.sql", ("CUR_BLOCK", "CUR_TX", "CUR_LOG"), 4, 6)]:
+        col = {"CUR_BLOCK": "block_num", "CUR_TX": "tx_index", "CUR_PATH": "trace_path", "CUR_LOG": "log_index"}
+        full = rows(db, f"F10c_{q[:3]}_single", q, [A], REORG_ID=999, BLOCK_LO=999003, BLOCK_HI=999003, PAGE_PLUS_1=101)
+        pages, cur, n = [], {k: -1 for k in key}, 0
+        while True:
+            pg = rows(db, f"F10c_{q[:3]}_page{n+1}", q, [A], REORG_ID=999, BLOCK_LO=999003, BLOCK_HI=999003, PAGE_PLUS_1=size + 1, **cur)
+            pages.append(pg[:size]); n += 1
+            if len(pg) <= size: break
+            cur = {k: pg[size - 1][col[k]] for k in key}
+        keys = lambda rs: [tuple(d[col[k]] for k in key) for d in rs]
+        flat = [d for p in pages for d in p]
+        ok &= check(f"F10c {q[:3]} paginates {want} rows in one block over {n} pages == single query, no overlap",
+                    len(full) == want and keys(flat) == keys(full) and len(set(keys(flat))) == len(flat) and all(d["block_hash"].startswith("\\xdead") for d in flat),
+                    f"got {len(full)} rows, {n} pages, keys {keys(flat)}")
     print("\nLOCAL ALL PASS" if ok else "\nLOCAL FAILURES"); sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":

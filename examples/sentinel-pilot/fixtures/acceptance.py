@@ -70,6 +70,21 @@ PROD = [
    lambda r: (has(r,"0x244c4fdc","out") and r[0]["called_contract"]=="0xa5b8bf902b2844da17d4506cc827f7f1681735e7", f"{len(r)} rows")),
  ("F0d internal-coverage signal reports (not assumes) coverage", "q0d_internal_coverage.sql", "F0d_coverage_F1b_window.params.json",
    lambda r: (len(r)==1 and int(r[0]["successful_txs"])==int(r[0]["plain_transfers_certainly_covered"])+int(r[0]["traced_with_frames"])+int(r[0]["possibly_untraced"]), f"{r[0] if r else '-'}")),
+ ("F12 native payment wallet→wallet (gas 21000)", "q1_native.sql", "F12_native_to_wallet.params.json",
+   lambda r: (has(r,"0x076f281b","out") and r[0]["called_contract"]==r[0]["to_address"], f"{len(r)} rows")),
+]
+
+# Expansion decisions (README step 4) — classify.py with a BLOCK-PINNED eth_getCode via config.rpc_url.
+# (fixture params, tx prefix, expected decision, why)
+CLASSIFY = [
+ ("F1b_wallet_forward_in_window_seedA.params.json",  "0xca275fc2", "expand", "A→B ordinary transfer(), B has no code at that block"),
+ ("F1b_wallet_forward_in_window_rescanB.params.json","0x244884b0", "review", "B→C: C HAS code at that block (a contract), not an EOA"),
+ ("F12_native_to_wallet.params.json",                "0x076f281b", "expand", "native payment, recipient has no code"),
+ ("F1_poll1_seedA.params.json",                      "0xf210f333", "review", "callee 0xa5b0946d… is a contract (router)"),
+ ("F6_swap_user_in.params.json",                     "0x448cb992", "review", "recipient is a known pool"),
+ ("F7_exit_native.params.json",                      "0x47071e4d", "review", "recipient is the canonical exit"),
+ ("F11_hyperlane_bridge_out_erc20.params.json",      "0x244c4fdc", "review", "burn to the zero address"),
+ ("F11_hyperlane_bridge_out_native.params.json",     "0x244c4fdc", "review", "recipient is a Hyperlane router (USDC)"),
 ]
 
 def keyset(rows): return [(d["block_num"], d["tx_index"], d["log_index"]) for d in rows]
@@ -92,6 +107,14 @@ def main():
     for name, ok in [("F8  page1+page2 == single 10-row query", p1+p2==s10), ("F8  no overlap between pages", not set(p1)&set(p2)),
                      ("F9  restart re-run identical to page1", rr==p1)]:
         ok_all &= ok; print(f"{'PASS' if ok else 'FAIL'}  {name}")
+    sys.path.insert(0, HERE); import classify
+    cfg = json.load(open(os.path.join(HERE, "..", "config.example.json"))); get_code = classify.rpc_get_code(cfg["rpc_url"])
+    for params, prefix, want, why in CLASSIFY:
+        p = json.load(open(os.path.join(HERE, params))); wf = {a.lower(): (p["BLOCK_LO"], -1, -1) for a in p["WATCHED"]}
+        outs = [d for d in results[params] if d["tx_hash"].startswith(prefix) and d["direction"] == "out"]
+        got = [classify.decide(d, cfg, get_code, wf) for d in outs]
+        ok = bool(got) and all(g[0] == want for g in got)
+        ok_all &= ok; print(f"{'PASS' if ok else 'FAIL'}  C   {prefix} → {want:7s} {why:52s} got {[g[0] for g in got]}")
     if not skip_local:
         if not local:
             print("SKIP  local-chain fixtures: pass --local-db <url> (see local/setup.sql) or --skip-local");

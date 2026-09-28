@@ -1,8 +1,8 @@
 {
   "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 27.0,
-  "attempted_at": "2026-09-28T19:18:35Z",
+  "wall_ms": 29.8,
+  "attempted_at": "2026-09-28T19:41:24Z",
   "response": {
     "columns": [
       "chain_id",
@@ -30,7 +30,7 @@
     "rows": [],
     "row_count": 0,
     "engine": "postgres",
-    "query_time_ms": 2.3373869999999997,
+    "query_time_ms": 2.470258,
     "ok": true
   }
 }

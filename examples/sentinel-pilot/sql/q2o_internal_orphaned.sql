@@ -44,5 +44,8 @@ WHERE i.reorg_id = {{REORG_ID}}
   AND (i."from" IN ({{WATCHED}}) OR i."to" IN ({{WATCHED}}))
   AND NOT EXISTS (SELECT 1 FROM reverted rv
                   WHERE rv.tx_hash = i.tx_hash AND i.path_idx > rv.start_p AND i.path_idx < rv.end_p)
+  AND (i.block_num > {{CUR_BLOCK}}
+       OR (i.block_num = {{CUR_BLOCK}} AND i.tx_idx > {{CUR_TX}})
+       OR (i.block_num = {{CUR_BLOCK}} AND i.tx_idx = {{CUR_TX}} AND i.path_idx > {{CUR_PATH}}))
 ORDER BY i.block_num, i.tx_idx, i.path_idx
 LIMIT {{PAGE_PLUS_1}}

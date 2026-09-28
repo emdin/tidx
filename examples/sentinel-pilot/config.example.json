@@ -1,60 +1,88 @@
 {
   "chain_id": 38833,
   "tidx_base": "https://tidx.igralabs.com",
+  "rpc_url": "https://rpc.igralabs.com:8545",
+  "_rpc_note": "Igra JSON-RPC, used ONLY for block-pinned eth_getCode in the recipient classifier (fixtures/classify.py). Verified 2026-09-28 to answer eth_getCode at historical block numbers.",
   "_note": "Seed wallets and incident start positions are CONFIGURATION, not query logic. Every address must be 0x + 40 hex; run.py rejects anything else before it reaches SQL.",
-
   "incidents": [
     {
       "id": "krc20-2026-06",
-      "seed_wallets": ["0x<reviewed seed from the June incident>"],
+      "seed_wallets": [
+        "0x<reviewed seed from the June incident>"
+      ],
       "watch_from_block": 0
     },
     {
       "id": "krc20-2026-09",
-      "seed_wallets": ["0x<reviewed seed from the September incident>"],
+      "seed_wallets": [
+        "0x<reviewed seed from the September incident>"
+      ],
       "watch_from_block": 0
     }
   ],
-
   "tokens": {
     "_note": "tidx has no token registry on Igra (token_metadata is empty of ERC-20s), so decimals live here. WiKAS values read via eth_call decimals()/symbol() on 2026-09-28.",
-    "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242": { "symbol": "WiKAS", "decimals": 18 }
+    "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242": {
+      "symbol": "WiKAS",
+      "decimals": 18
+    }
   },
-
   "contracts": {
-    "_note": "Used only to CLASSIFY called_contract in query output for human review. Never to propagate a designation.",
+    "_note": "Used to CLASSIFY to_address and called_contract (fixtures/classify.py) for human review. Never to propagate a designation. Presence in called_contract does not make an address a contract; absence from this config does not make it an EOA — a block-pinned eth_getCode decides those two, and a failed lookup stays 'unknown' (review).",
     "canonical_exit": "0x4bb88c213d3ed9dc4bae694f1bc1bf745903b2d0",
-
     "hyperlane_routers": {
-      "_todo": "PASTE THE NINE ROUTER ADDRESSES FROM IgraLabs/igra-sentinel test/IgraFork.t.sol (commit a3029464). That repo is PRIVATE and the tidx host's GitHub token has no access (HTTP 404 on 2026-09-28), so they could not be fetched and were NOT guessed.",
-      "from_fork_fixture": [],
-      "_observed_on_chain_candidates": {
-        "_note": "Evidence only, not a claim they are the nine. Roles differ: the MAILBOX emits Dispatch; a TOKEN ROUTER is the contract users call (selector 0x81b4e8b4) which burns the token (Transfer to 0x0) and dispatches. Classify a token-router call as 'bridge-out (Hyperlane)'.",
-        "0x3a867fcffec2b790970eebdc9023e75b0a172aa7": "MAILBOX-like: sole emitter of Dispatch(address,uint32,bytes32,bytes) on Igra — 2,216 dispatches, blocks 1,086,916 → 17,949,927",
-        "0xa5b8bf902b2844da17d4506cc827f7f1681735e7": "TOKEN ROUTER-like: ERC-20 whose transferRemote-style call (sel 0x81b4e8b4) burns to 0x0 and emits Dispatch — fixture F11 (tx 0x244c4fdc…3350)",
-        "0x284226f651eb5cbd696365bc27d333028fcc5d54": "emits in every canonical-exit tx (topic0 b87e607f…) — role unknown",
-        "0x75719c858e0c73e07128f95b2c466d142490e933": "emits in every canonical-exit tx (topic0 253a3a04…) — role unknown"
+      "_source": "IgraLabs/igra-sentinel @ a30294641ec5d4d78480bee82953325daac6ebf3, test/IgraFork.t.sol routes.push(...), supplied by the reviewer in PR #30 on 2026-09-28 (reviewed configuration; not a live governance-state check).",
+      "from_fork_fixture": [
+        "0xeac17188d29665f57e31a0d9808a9173b9d9d632",
+        "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
+        "0x46346f49b4fe8c640c5fcdbed2d6741056feb959",
+        "0x69790024d44504f05973e127197e6df17e283859",
+        "0xf2b48b6e560af8834622203a8eeff6960d6172de",
+        "0xc3f8b34587eb403fc30a161d6a35cb724a3b273e",
+        "0xb9ec76392f7d48f6b266431951cb7c645bd711e2",
+        "0x5a19b7b45c3df3d436f1010fb5b95755800f22f3",
+        "0xf75ecd5ec89965ea29861d6e2d65b1215ccc82fd"
+      ],
+      "routes": {
+        "iKAS": "0xeac17188d29665f57e31a0d9808a9173b9d9d632",
+        "USDC": "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
+        "USDT": "0x46346f49b4fe8c640c5fcdbed2d6741056feb959",
+        "WETH": "0x69790024d44504f05973e127197e6df17e283859",
+        "cbBTC": "0xf2b48b6e560af8834622203a8eeff6960d6172de",
+        "wstETH": "0xc3f8b34587eb403fc30a161d6a35cb724a3b273e",
+        "SOL": "0xb9ec76392f7d48f6b266431951cb7c645bd711e2",
+        "USDS": "0x5a19b7b45c3df3d436f1010fb5b95755800f22f3",
+        "sUSDS": "0xf75ecd5ec89965ea29861d6e2d65b1215ccc82fd"
+      },
+      "_roles": "A token ROUTER is what users call (F11: USDC router 0xa5b8…35e7, selector 0x81b4e8b4; burns the synthetic token — Transfer to 0x0 — and dispatches). The MAILBOX 0x3a867fcffec2b790970eebdc9023e75b0a172aa7 is a different role: sole emitter of Dispatch(address,uint32,bytes32,bytes) on Igra (2,216 dispatches, blocks 1,086,916 → 17,949,927). It is not a router and is listed under mailbox, not here.",
+      "mailbox": "0x3a867fcffec2b790970eebdc9023e75b0a172aa7",
+      "_observed_in_every_canonical_exit_tx": {
+        "0x284226f651eb5cbd696365bc27d333028fcc5d54": "topic0 b87e607f… — role unknown",
+        "0x75719c858e0c73e07128f95b2c466d142490e933": "topic0 253a3a04… — role unknown"
       },
       "_stats": "last 3M blocks: 363 Dispatch txs — 112 via the canonical exit contract (native), 239 carrying an ERC-20 Transfer (token routers)"
     },
-
     "known_dex_or_pool": {
       "_note": "Swap/pool targets flagged for review; other users of these are NOT added to the watchlist.",
       "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd": "unverified; DEX-like — routes WiKAS between users (selector 4d13dd92)"
     }
   },
-
   "polling": {
     "page_size": 500,
     "timeout_ms": 30000,
     "max_window_blocks": 200000,
     "_note": "Never scan past synced_num from /status. Complete every page before advancing the checkpoint. A response with ok:false is a failure, not an empty page."
   },
-
   "coverage_gaps": {
     "exits_0x3": "tidx does not yet parse Igra payload type 0x3 (Exit). L2→L1 exits therefore have no L1-side provenance row. On the L2 side an exit IS visible as a native-value tx to canonical_exit (q1) — that is the observation to alert on.",
     "l2_withdrawals": "Despite its name this table holds L1→L2 ENTRIES (deposits). It must not be read as exits.",
     "erc721": "NFT Transfer events are excluded by q3 (topic3 IS NULL); not in scope for value tracking.",
     "block_timestamp": "Igra block.timestamp is synthetic (DAA-derived) and currently ~10 min behind wall clock. Use it only as an index-friendly prefilter; exact bounds are block_num. blocks.real_timestamp is the L1 wall-clock time."
+  },
+  "state": {
+    "_note": "Persisted bot state the pilot REQUIRES (see README 'Checkpoints and the unresolved-trace backlog'); shape in state.example.json. Two independent checkpoints: scan_checkpoint (q1+q3) and internal_checkpoint (q2). internal_checkpoint may advance through a window only when q0d reports possibly_untraced = 0 for it OR the window has been appended to unresolved_internal_ranges. Entries leave the backlog only after a trace repair (tidx backfill-traces or the trace-outcome PR) and a q2 re-run over exactly that range.",
+    "scan_checkpoint": "(block, hash)",
+    "internal_checkpoint": "(block, hash)",
+    "unresolved_internal_ranges": "[{block_lo, block_hi, possibly_untraced, recorded_at, resolved_at|null}]"
   }
 }

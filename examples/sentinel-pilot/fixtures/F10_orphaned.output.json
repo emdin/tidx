@@ -1,8 +1,8 @@
 {
   "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 37.3,
-  "attempted_at": "2026-09-28T19:18:36Z",
+  "wall_ms": 28.9,
+  "attempted_at": "2026-09-28T19:41:25Z",
   "response": {
     "columns": [
       "reorg_id",
@@ -13,7 +13,7 @@
     "rows": [],
     "row_count": 0,
     "engine": "postgres",
-    "query_time_ms": 3.130517,
+    "query_time_ms": 2.001398,
     "ok": true
   }
 }

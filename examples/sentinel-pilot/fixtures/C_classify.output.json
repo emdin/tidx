@@ -1,0 +1,122 @@
+[
+ {
+  "fixture": "F1b_wallet_forward_in_window_seedA.output.json",
+  "tx_hash": "0xca275fc2b46504f5b96b5734840363c5362bb30119b2e3fd68f848324f5d048a",
+  "block_num": 17114606,
+  "direction": "out",
+  "to_address": "0x725836b4d485ab446c1698d3b622dae0084b1c98",
+  "called_contract": "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
+  "decision": "expand",
+  "reason": "ordinary ERC-20 transfer (callee == token contract), recipient eoa by code lookup"
+ },
+ {
+  "fixture": "F1b_wallet_forward_in_window_rescanB.output.json",
+  "tx_hash": "0xca275fc2b46504f5b96b5734840363c5362bb30119b2e3fd68f848324f5d048a",
+  "block_num": 17114606,
+  "direction": "in",
+  "to_address": "0x725836b4d485ab446c1698d3b622dae0084b1c98",
+  "called_contract": "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
+  "decision": "report",
+  "reason": "inbound row; the payer is never added"
+ },
+ {
+  "fixture": "F1b_wallet_forward_in_window_rescanB.output.json",
+  "tx_hash": "0x244884b027d68af104e215a5690f9869624b141cf1502b901d09a93490da53fe",
+  "block_num": 17114613,
+  "direction": "out",
+  "to_address": "0x923ba6be4bbe5d89975e259a0d3e09842045cf92",
+  "called_contract": "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
+  "decision": "review",
+  "reason": "recipient 0x923ba6be4bbe5d89975e259a0d3e09842045cf92 is contract"
+ },
+ {
+  "fixture": "F1b_wallet_forward_in_window_rescanB.output.json",
+  "tx_hash": "0x0c2894dd8ef84cc04e94238d3a9c6be44fc13e94ce5d222f95a4b801f99d168d",
+  "block_num": 17114741,
+  "direction": "out",
+  "to_address": "0x923ba6be4bbe5d89975e259a0d3e09842045cf92",
+  "called_contract": "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
+  "decision": "review",
+  "reason": "recipient 0x923ba6be4bbe5d89975e259a0d3e09842045cf92 is contract"
+ },
+ {
+  "fixture": "F12_native_to_wallet.output.json",
+  "tx_hash": "0x076f281b28f45104e855594aa4a0a8822c6a6f68cfd36dbf8f6441326b2809f3",
+  "block_num": 17950630,
+  "direction": "out",
+  "to_address": "0xa0416cdeb986a8bfcd7356c249cce5042bb0133c",
+  "called_contract": "0xa0416cdeb986a8bfcd7356c249cce5042bb0133c",
+  "decision": "expand",
+  "reason": "native payment to a wallet (callee == recipient, eoa by code lookup)"
+ },
+ {
+  "fixture": "F1_poll1_seedA.output.json",
+  "tx_hash": "0xf210f33312bcd4b1fb65ed850022ebe5548820f13ab07befd88f4390f4358c2b",
+  "block_num": 17959343,
+  "direction": "in",
+  "to_address": "0x7826f5421c324590b1c21d22231c48ad059cbe45",
+  "called_contract": "0xa5b0946d31ad2d251e0fe2dfea8808bfd475e607",
+  "decision": "report",
+  "reason": "inbound row; the payer is never added"
+ },
+ {
+  "fixture": "F1_poll1_seedA.output.json",
+  "tx_hash": "0xf210f33312bcd4b1fb65ed850022ebe5548820f13ab07befd88f4390f4358c2b",
+  "block_num": 17959343,
+  "direction": "out",
+  "to_address": "0x13f197c71474a60cc8b1973ff8f8d4eab3430bd5",
+  "called_contract": "0xa5b0946d31ad2d251e0fe2dfea8808bfd475e607",
+  "decision": "review",
+  "reason": "callee 0xa5b0946d31ad2d251e0fe2dfea8808bfd475e607 is contract"
+ },
+ {
+  "fixture": "F6_swap_user_in.output.json",
+  "tx_hash": "0x448cb992c152006e117640a23c7cf6692f6e8addc6108dc6eb899e60a8060b4c",
+  "block_num": 17962263,
+  "direction": "in",
+  "to_address": "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+  "called_contract": "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+  "decision": "report",
+  "reason": "inbound row; the payer is never added"
+ },
+ {
+  "fixture": "F6_swap_user_in.output.json",
+  "tx_hash": "0x448cb992c152006e117640a23c7cf6692f6e8addc6108dc6eb899e60a8060b4c",
+  "block_num": 17962263,
+  "direction": "out",
+  "to_address": "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+  "called_contract": "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+  "decision": "review",
+  "reason": "recipient 0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd is known_pool"
+ },
+ {
+  "fixture": "F7_exit_native.output.json",
+  "tx_hash": "0x47071e4d10ad9a2a17f49accff69e23c765a8e400a573bd073504f2765904c75",
+  "block_num": 17949927,
+  "direction": "out",
+  "to_address": "0x4bb88c213d3ed9dc4bae694f1bc1bf745903b2d0",
+  "called_contract": "0x4bb88c213d3ed9dc4bae694f1bc1bf745903b2d0",
+  "decision": "review",
+  "reason": "recipient 0x4bb88c213d3ed9dc4bae694f1bc1bf745903b2d0 is exit"
+ },
+ {
+  "fixture": "F11_hyperlane_bridge_out_erc20.output.json",
+  "tx_hash": "0x244c4fdc9822fb620bc2e47ad81d8a6b5d931d665628a6403778e3643d7f3350",
+  "block_num": 17293324,
+  "direction": "out",
+  "to_address": "0x0000000000000000000000000000000000000000",
+  "called_contract": "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
+  "decision": "review",
+  "reason": "recipient 0x0000000000000000000000000000000000000000 is zero_address"
+ },
+ {
+  "fixture": "F11_hyperlane_bridge_out_native.output.json",
+  "tx_hash": "0x244c4fdc9822fb620bc2e47ad81d8a6b5d931d665628a6403778e3643d7f3350",
+  "block_num": 17293324,
+  "direction": "out",
+  "to_address": "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
+  "called_contract": "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
+  "decision": "review",
+  "reason": "recipient 0xa5b8bf902b2844da17d4506cc827f7f1681735e7 is hyperlane_router"
+ }
+]

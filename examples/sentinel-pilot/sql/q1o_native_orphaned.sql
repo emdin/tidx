@@ -9,6 +9,8 @@
 -- matches a row here; then rescan the canonical range above fork_point.
 --
 -- {{REORG_ID}} from `SELECT id, fork_point, prev_tip, depth, occurred_at FROM reorgs`.
+-- Paginated exactly like q1: keyset (block_num, tx_index), cursor {{CUR_BLOCK}},{{CUR_TX}};
+-- first page -1,-1. A reorg can orphan more than a page of movements in ONE block.
 SELECT
   38833                         AS chain_id,
   t.reorg_id,
@@ -35,5 +37,7 @@ WHERE t.reorg_id = {{REORG_ID}}
   AND r.status = 1
   AND t.value::numeric > 0
   AND (t."from" IN ({{WATCHED}}) OR t."to" IN ({{WATCHED}}))
+  AND (t.block_num > {{CUR_BLOCK}}
+       OR (t.block_num = {{CUR_BLOCK}} AND t.idx > {{CUR_TX}}))
 ORDER BY t.block_num, t.idx
 LIMIT {{PAGE_PLUS_1}}

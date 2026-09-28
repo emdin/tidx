@@ -1,7 +1,7 @@
 {
   "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 26.7,
+  "wall_ms": 25.3,
   "attempted_at": "2026-09-28T19:41:25Z",
   "response": {
     "columns": [
@@ -23,34 +23,36 @@
       "amount_raw",
       "decimals",
       "called_contract",
-      "selector"
+      "selector",
+      "status"
     ],
     "rows": [
       [
         38833,
-        17293324,
-        "0x52bde1485df66d244c79375448f52c8909c1f21fea5f7e514b1170a2b9a58077",
-        "2026-09-20T09:32:41+00:00",
-        "0x244c4fdc9822fb620bc2e47ad81d8a6b5d931d665628a6403778e3643d7f3350",
+        17950630,
+        "0xfef08c4360fec52b6b52f13bce49a60fc7233058bc2397a420d2b6052c6f317b",
+        "2026-09-28T13:40:05+00:00",
+        "0x076f281b28f45104e855594aa4a0a8822c6a6f68cfd36dbf8f6441326b2809f3",
         0,
-        "erc20",
-        0,
+        "native",
         null,
-        "0xaaf9e5f43705d837154be5bfce47bcade61221d0",
-        "0x0000000000000000000000000000000000000000",
-        "0xaaf9e5f43705d837154be5bfce47bcade61221d0",
+        null,
+        "0x2f296ed8e58a53c9642581e04da794bdd20431e6",
+        "0xa0416cdeb986a8bfcd7356c249cce5042bb0133c",
+        "0x2f296ed8e58a53c9642581e04da794bdd20431e6",
         "out",
-        "erc20",
-        "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
-        "176479296",
+        "native",
         null,
-        "0xa5b8bf902b2844da17d4506cc827f7f1681735e7",
-        "0x81b4e8b4"
+        "100000000000000000000",
+        18,
+        "0xa0416cdeb986a8bfcd7356c249cce5042bb0133c",
+        null,
+        1
       ]
     ],
     "row_count": 1,
     "engine": "postgres",
-    "query_time_ms": 1.430455,
+    "query_time_ms": 1.0078349999999998,
     "ok": true
   }
 }

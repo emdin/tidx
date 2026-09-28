@@ -1,8 +1,8 @@
 {
   "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 23.9,
-  "attempted_at": "2026-09-28T19:18:36Z",
+  "wall_ms": 25.5,
+  "attempted_at": "2026-09-28T19:41:24Z",
   "response": {
     "columns": [
       "cutoff",
@@ -18,7 +18,7 @@
     ],
     "row_count": 1,
     "engine": "postgres",
-    "query_time_ms": 0.42415200000000003,
+    "query_time_ms": 0.644415,
     "ok": true
   }
 }

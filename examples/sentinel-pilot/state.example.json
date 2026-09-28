@@ -1,0 +1,13 @@
+{
+  "_note": "Shape of the persisted bot state the pilot requires. scan_checkpoint (q1+q3) and internal_checkpoint (q2) advance independently; the backlog holds every window whose q0d possibly_untraced was > 0 and must be replayed with q2 after a trace repair before it is marked resolved. Numbers below are from the 2026-09-28 acceptance run (F0d).",
+  "chain_id": 38833,
+  "pinned_cutoff": { "block": 17964796, "hash": "0xa774b37de9…" },
+  "scan_checkpoint": { "block": 17114800, "hash": "0x…" },
+  "internal_checkpoint": { "block": 17114800, "hash": "0x…" },
+  "unresolved_internal_ranges": [
+    { "block_lo": 17114600, "block_hi": 17114800, "possibly_untraced": 3, "recorded_at": "2026-09-28T19:05:00Z", "resolved_at": null }
+  ],
+  "pending_rescans": [
+    { "address": "0x725836b4d485ab446c1698d3b622dae0084b1c98", "from": [17114606, 0, 0], "to_block": 17114800, "reason": "added by F1b A→B" }
+  ]
+}
