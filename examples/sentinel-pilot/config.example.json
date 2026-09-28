@@ -1,0 +1,58 @@
+{
+  "chain_id": 38833,
+  "tidx_base": "https://tidx.igralabs.com",
+  "_note": "Seed wallets and incident start positions are CONFIGURATION, not query logic. Every address must be 0x + 40 hex; run.py rejects anything else before it reaches SQL.",
+
+  "incidents": [
+    {
+      "id": "krc20-2026-06",
+      "seed_wallets": ["0x<reviewed seed from the June incident>"],
+      "watch_from_block": 0
+    },
+    {
+      "id": "krc20-2026-09",
+      "seed_wallets": ["0x<reviewed seed from the September incident>"],
+      "watch_from_block": 0
+    }
+  ],
+
+  "tokens": {
+    "_note": "tidx has no token registry on Igra (token_metadata is empty of ERC-20s), so decimals live here. WiKAS values read via eth_call decimals()/symbol() on 2026-09-28.",
+    "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242": { "symbol": "WiKAS", "decimals": 18 }
+  },
+
+  "contracts": {
+    "_note": "Used only to CLASSIFY called_contract in query output for human review. Never to propagate a designation.",
+    "canonical_exit": "0x4bb88c213d3ed9dc4bae694f1bc1bf745903b2d0",
+
+    "hyperlane_routers": {
+      "_todo": "PASTE THE NINE ADDRESSES FROM THE FORK FIXTURE HERE. They are not on the tidx host and were not guessed.",
+      "from_fork_fixture": [],
+      "_observed_on_chain_candidates": {
+        "_note": "Evidence only, not a claim they are the nine. 0x3a867fcf… is the sole emitter of Hyperlane Dispatch (topic0 769f711d…) on Igra: 2,216 dispatches, blocks 1,086,916 → 17,949,927. The other two emit in every canonical-exit transaction.",
+        "0x3a867fcffec2b790970eebdc9023e75b0a172aa7": "emits Dispatch(address,uint32,bytes32,bytes) — mailbox-like",
+        "0x284226f651eb5cbd696365bc27d333028fcc5d54": "emits in exit txs (topic0 b87e607f…)",
+        "0x75719c858e0c73e07128f95b2c466d142490e933": "emits in exit txs (topic0 253a3a04…)"
+      }
+    },
+
+    "known_dex_or_pool": {
+      "_note": "Swap/pool targets flagged for review; other users of these are NOT added to the watchlist.",
+      "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd": "unverified; DEX-like — routes WiKAS between users (selector 4d13dd92)"
+    }
+  },
+
+  "polling": {
+    "page_size": 500,
+    "timeout_ms": 30000,
+    "max_window_blocks": 200000,
+    "_note": "Never scan past synced_num from /status. Complete every page before advancing the checkpoint. A response with ok:false is a failure, not an empty page."
+  },
+
+  "coverage_gaps": {
+    "exits_0x3": "tidx does not yet parse Igra payload type 0x3 (Exit). L2→L1 exits therefore have no L1-side provenance row. On the L2 side an exit IS visible as a native-value tx to canonical_exit (q1) — that is the observation to alert on.",
+    "l2_withdrawals": "Despite its name this table holds L1→L2 ENTRIES (deposits). It must not be read as exits.",
+    "erc721": "NFT Transfer events are excluded by q3 (topic3 IS NULL); not in scope for value tracking.",
+    "block_timestamp": "Igra block.timestamp is synthetic (DAA-derived) and currently ~10 min behind wall clock. Use it only as an index-friendly prefilter; exact bounds are block_num. blocks.real_timestamp is the L1 wall-clock time."
+  }
+}

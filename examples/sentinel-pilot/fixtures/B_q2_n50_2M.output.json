@@ -1,0 +1,33 @@
+{
+  "http_status": 200,
+  "wall_ms": 2167.4,
+  "response": {
+    "columns": [
+      "chain_id",
+      "block_num",
+      "block_hash",
+      "block_timestamp",
+      "tx_hash",
+      "tx_index",
+      "event_kind",
+      "log_index",
+      "trace_path",
+      "from_address",
+      "to_address",
+      "matched_watch_address",
+      "asset_kind",
+      "token_address",
+      "amount_raw",
+      "decimals",
+      "called_contract",
+      "selector",
+      "call_type",
+      "depth"
+    ],
+    "row_count": 5091,
+    "engine": "postgres",
+    "query_time_ms": 2086.861719,
+    "ok": true,
+    "rows": "<5091 rows omitted from the repo copy; full dump reproducible via run.py>"
+  }
+}

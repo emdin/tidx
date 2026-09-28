@@ -1,0 +1,22 @@
+{
+  "http_status": 200,
+  "wall_ms": 24.3,
+  "response": {
+    "columns": [
+      "num",
+      "hash",
+      "timestamp"
+    ],
+    "rows": [
+      [
+        17959343,
+        "0x7c6e65d33e9d8da3aa90c624b0607c79ff3b68bf04a42d42e5cb9fe72440b764",
+        "2026-09-28T16:18:51+00:00"
+      ]
+    ],
+    "row_count": 1,
+    "engine": "postgres",
+    "query_time_ms": 0.691356,
+    "ok": true
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "http_status": 200,
+  "wall_ms": 31.0,
+  "response": {
+    "columns": [
+      "chain_id",
+      "block_num",
+      "block_hash",
+      "block_timestamp",
+      "tx_hash",
+      "tx_index",
+      "event_kind",
+      "log_index",
+      "trace_path",
+      "from_address",
+      "to_address",
+      "matched_watch_address",
+      "asset_kind",
+      "token_address",
+      "amount_raw",
+      "decimals",
+      "called_contract",
+      "selector"
+    ],
+    "rows": [
+      [
+        38833,
+        17962263,
+        "0x38e237fda5d6434f01269d183faa6f8ec6fadbfb6e08dd12638dfeb03442db18",
+        "2026-09-28T17:12:21+00:00",
+        "0x448cb992c152006e117640a23c7cf6692f6e8addc6108dc6eb899e60a8060b4c",
+        8,
+        "erc20",
+        7,
+        null,
+        "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+        "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+        "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+        "erc20",
+        "0x9bb6eaab0d92f670df93ca2fabe466cf5475d093",
+        "5731666728647175698754991",
+        null,
+        "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+        "0x4d13dd92"
+      ],
+      [
+        38833,
+        17962263,
+        "0x38e237fda5d6434f01269d183faa6f8ec6fadbfb6e08dd12638dfeb03442db18",
+        "2026-09-28T17:12:21+00:00",
+        "0x448cb992c152006e117640a23c7cf6692f6e8addc6108dc6eb899e60a8060b4c",
+        8,
+        "erc20",
+        8,
+        null,
+        "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+        "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+        "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+        "erc20",
+        "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
+        "264552210857823725527",
+        null,
+        "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
+        "0x4d13dd92"
+      ]
+    ],
+    "row_count": 2,
+    "engine": "postgres",
+    "query_time_ms": 4.148093,
+    "ok": true
+  }
+}

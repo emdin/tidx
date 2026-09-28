@@ -1,0 +1,72 @@
+{
+  "http_status": 200,
+  "wall_ms": 27.7,
+  "response": {
+    "columns": [
+      "chain_id",
+      "block_num",
+      "block_hash",
+      "block_timestamp",
+      "tx_hash",
+      "tx_index",
+      "event_kind",
+      "log_index",
+      "trace_path",
+      "from_address",
+      "to_address",
+      "matched_watch_address",
+      "asset_kind",
+      "token_address",
+      "amount_raw",
+      "decimals",
+      "called_contract",
+      "selector"
+    ],
+    "rows": [
+      [
+        38833,
+        17315165,
+        "0x6c48b244c8a39cdd3b78dae3788ec858322cd95919a04eea0e7fd99a2d359a5d",
+        "2026-09-20T15:51:01+00:00",
+        "0xaeb835081aa881a5cc86dc761cbf300fe7eae0cf7d36031d0d08fef84d335af6",
+        2,
+        "erc20",
+        7,
+        null,
+        "0xb34af39cb611d2745efd59ac95f232ac35667bc7",
+        "0xe3ec97320ab56f7d4401ba3a5e99ae1a118c25b8",
+        "0xe3ec97320ab56f7d4401ba3a5e99ae1a118c25b8",
+        "erc20",
+        "0x093d77d397f8accbaee0820345e9e700b1233cd1",
+        "1000",
+        null,
+        "0xa5b0946d31ad2d251e0fe2dfea8808bfd475e607",
+        "0xa00e728c"
+      ],
+      [
+        38833,
+        17315165,
+        "0x6c48b244c8a39cdd3b78dae3788ec858322cd95919a04eea0e7fd99a2d359a5d",
+        "2026-09-20T15:51:01+00:00",
+        "0xaeb835081aa881a5cc86dc761cbf300fe7eae0cf7d36031d0d08fef84d335af6",
+        2,
+        "erc20",
+        8,
+        null,
+        "0xe3ec97320ab56f7d4401ba3a5e99ae1a118c25b8",
+        "0xa5b0946d31ad2d251e0fe2dfea8808bfd475e607",
+        "0xe3ec97320ab56f7d4401ba3a5e99ae1a118c25b8",
+        "erc20",
+        "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
+        "105",
+        null,
+        "0xa5b0946d31ad2d251e0fe2dfea8808bfd475e607",
+        "0xa00e728c"
+      ]
+    ],
+    "row_count": 2,
+    "engine": "postgres",
+    "query_time_ms": 1.469382,
+    "ok": true
+  }
+}

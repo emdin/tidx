@@ -1,0 +1,36 @@
+{
+  "chain_id": 38833,
+  "head_num": 17964827,
+  "synced_num": 17964796,
+  "tip_num": 17964797,
+  "lag": 30,
+  "head_delay_blocks": 30,
+  "gap_blocks": 1,
+  "backfill_num": 0,
+  "backfill_remaining": 0,
+  "sync_rate": 1.2811420884998566,
+  "eta_secs": 0.0,
+  "updated_at": "2026-09-28T18:08:11.932231Z",
+  "postgres": {
+    "blocks": 17964797,
+    "txs": 17964797,
+    "logs": 17964797,
+    "receipts": 17964797,
+    "rate": 0.945920841845939,
+    "blocks_count": 27364415,
+    "txs_count": 7022623,
+    "logs_count": 26173735,
+    "receipts_count": 7112572
+  },
+  "clickhouse": {
+    "blocks": 17964797,
+    "txs": 17964797,
+    "logs": 17964797,
+    "receipts": 17964797,
+    "rate": 0.9446739332608354,
+    "blocks_count": 27365935,
+    "txs_count": 7112304,
+    "logs_count": 26175485,
+    "receipts_count": 7112304
+  }
+}
