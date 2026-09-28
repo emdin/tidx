@@ -1,6 +1,8 @@
 {
+  "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 31.0,
+  "wall_ms": 26.3,
+  "attempted_at": "2026-09-28T19:18:35Z",
   "response": {
     "columns": [
       "chain_id",
@@ -15,6 +17,7 @@
       "from_address",
       "to_address",
       "matched_watch_address",
+      "direction",
       "asset_kind",
       "token_address",
       "amount_raw",
@@ -36,6 +39,7 @@
         "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
         "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
         "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+        "in",
         "erc20",
         "0x9bb6eaab0d92f670df93ca2fabe466cf5475d093",
         "5731666728647175698754991",
@@ -56,6 +60,7 @@
         "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
         "0xbe3c61c2f57f78cdbaf35f0c03c3c8a680cce7bd",
         "0x30b3e9d62064900d8629aa7b541e905b3f2e7caa",
+        "out",
         "erc20",
         "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
         "264552210857823725527",
@@ -66,7 +71,7 @@
     ],
     "row_count": 2,
     "engine": "postgres",
-    "query_time_ms": 4.148093,
+    "query_time_ms": 1.153717,
     "ok": true
   }
 }

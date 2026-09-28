@@ -26,11 +26,26 @@ run, "warm" = immediate re-run. Page cap 10 000 (`PAGE_PLUS_1 = 10000`); a
 | q2 internal | 50 | 2M   | 5 091 | 2 026 | 2 087 |
 | q3 erc20    | 50 | 2M   | **10 000 (cap)** | 833 | 812 |
 
-q2 figures are for the **final** query (`candidate_txs` restriction). Before
-that change q2 cost 640–940 ms cold for one address with zero rows (its
-reverted-frame CTE walked the whole window); now 104–112 ms. For large result
-sets at 2M the change is roughly neutral (10 addrs: 7 942 → 2 118 cold,
-1 409 → 1 978 warm).
+q2 figures are for the `candidate_txs`-restricted query. Before that change q2
+cost 640–940 ms cold for one address with zero rows (its reverted-frame CTE
+walked the whole window); now 104–112 ms. For large result sets at 2M the
+change is roughly neutral (10 addrs: 7 942 → 2 118 cold, 1 409 → 1 978 warm).
+
+**Post-review re-measure (2026-09-28, warm)** after the review edits — `direction`
+column on q1–q3, `amount > 0` on q3, `CREATE2` on q2 — same order of magnitude:
+
+| query | addrs | window | rows | warm ms |
+|---|---|---|---|---|
+| q2 | 1  | 200k | 0     | 100   |
+| q2 | 50 | 200k | 533   | 168   |
+| q3 | 50 | 200k | 5 537 | 262   |
+| q2 | 50 | 2M   | 5 091 | 2 322 |
+| q3 | 50 | 2M   | cap   | 1 288 |
+
+`q0d_internal_coverage.sql` (the interim trace-coverage signal) is **not** a
+replay tool: 106 ms on a 200-block poll window, **27 s** on a 200k window
+(it anti-joins every successful tx against `internal_txs`). Run it per poll
+window, not per replay chunk.
 
 ## What this means for the bot
 

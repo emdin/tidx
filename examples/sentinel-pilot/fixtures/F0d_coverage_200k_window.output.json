@@ -1,0 +1,26 @@
+{
+  "outcome": "ok",
+  "http_status": 200,
+  "wall_ms": 27220.0,
+  "attempted_at": "2026-09-28T19:11:44Z",
+  "response": {
+    "columns": [
+      "successful_txs",
+      "plain_transfers_certainly_covered",
+      "traced_with_frames",
+      "possibly_untraced"
+    ],
+    "rows": [
+      [
+        86839,
+        45,
+        85603,
+        1191
+      ]
+    ],
+    "row_count": 1,
+    "engine": "postgres",
+    "query_time_ms": 27190.831059,
+    "ok": true
+  }
+}

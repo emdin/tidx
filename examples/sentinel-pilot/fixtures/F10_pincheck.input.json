@@ -1,5 +1,5 @@
 {
-  "sql_file": "../sql/q0b_pin_check.sql",
+  "sql_file": "/root/tidx-wt/examples/sentinel-pilot/fixtures/../sql/q0b_pin_check.sql",
   "params": {
     "PINNED_BLOCK": 17959343
   },
@@ -9,5 +9,6 @@
     "chainId": 38833,
     "timeout_ms": 30000,
     "engine": "postgres"
-  }
+  },
+  "attempted_at": "2026-09-28T19:18:36Z"
 }

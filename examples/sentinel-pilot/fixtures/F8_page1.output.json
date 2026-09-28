@@ -1,6 +1,8 @@
 {
+  "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 66.5,
+  "wall_ms": 84.9,
+  "attempted_at": "2026-09-28T19:18:35Z",
   "response": {
     "columns": [
       "chain_id",
@@ -15,6 +17,7 @@
       "from_address",
       "to_address",
       "matched_watch_address",
+      "direction",
       "asset_kind",
       "token_address",
       "amount_raw",
@@ -36,6 +39,7 @@
         "0x326020a92b0c475ee00fe0235fc238ab1bbacda1",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
+        "in",
         "erc20",
         "0x46346f49b4fe8c640c5fcdbed2d6741056feb959",
         "12169900",
@@ -56,6 +60,7 @@
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
         "0x326020a92b0c475ee00fe0235fc238ab1bbacda1",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
+        "out",
         "erc20",
         "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
         "411223811329354715575",
@@ -76,6 +81,7 @@
         "0x9b3c872a5078a33ceef59df1ee7aa1387fd0f4cb",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
+        "in",
         "erc20",
         "0x46346f49b4fe8c640c5fcdbed2d6741056feb959",
         "10370000",
@@ -96,6 +102,7 @@
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
         "0xa18a9d28a5ef040d8dbccd61a2ca7fc8d5306d95",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
+        "out",
         "erc20",
         "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
         "346203778245548883548",
@@ -116,6 +123,7 @@
         "0x394971d25dab16112742cf2f6e7f73cf85726112",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
+        "in",
         "erc20",
         "0x46346f49b4fe8c640c5fcdbed2d6741056feb959",
         "99920988",
@@ -136,6 +144,7 @@
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
         "0x2dfdc939c60da7906e7117a3d6dc6bd6bcd881c9",
         "0xc281cb25715ea8e46c9b916f22ae7c0f55b014d7",
+        "out",
         "erc20",
         "0x17ec7e1768c813e2a3a9b0f94a35605ca520c242",
         "3148077318380838313481",
@@ -146,7 +155,7 @@
     ],
     "row_count": 6,
     "engine": "postgres",
-    "query_time_ms": 40.721159,
+    "query_time_ms": 60.46508,
     "ok": true
   }
 }

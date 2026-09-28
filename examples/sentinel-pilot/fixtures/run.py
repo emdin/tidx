@@ -11,12 +11,16 @@
     WATCHED        -> list of 0x + 40 hex   -> quoted, comma-joined
     WATCHED_TOPICS -> same list, left-padded to 32 bytes, lowercased
   Numeric placeholders must be integers; TS_LO must look like a timestamp.
-* Writes <out>.input.json (exact SQL sent + params) and <out>.output.json
-  (exact response + HTTP status). <out> defaults to the params file name with
-  ".params.json" stripped.
-* Any non-ok outcome — validator rejection (HTTP 4xx with a JSON error body),
-  timeout, row cap, transport failure — exits 1 and is recorded verbatim, so a
-  failed query is never mistaken for an empty result.
+
+Evidence preservation (the point of this script):
+* <out>.input.json is written BEFORE the request is attempted, so an attempt
+  that never gets a response still leaves its exact input on disk.
+* <out>.output.json records every outcome: HTTP status + JSON body; an HTTP
+  error with a JSON body (tidx validator rejections are 4xx); a non-JSON
+  body; a network/timeout failure with no response at all. `outcome` is one of
+  ok | api_error | http_error | malformed_response | transport_error.
+* Exit code 0 only for outcome=ok. A timeout, row cap, validator rejection,
+  transport failure or malformed body is never an empty result.
 """
 import json, re, sys, time, urllib.error, urllib.request
 
@@ -58,18 +62,25 @@ def render(sql, p):
     return re.sub(r"\{\{([A-Z_0-9]+)\}\}", repl, sql)
 
 def post(base, q):
+    """Returns (outcome, http_status_or_None, body_or_None, raw_text_or_None)."""
     req = urllib.request.Request(f"{base}/query", data=json.dumps(q).encode(),
                                  headers={"content-type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
-            return r.status, json.load(r)
+            status, raw = r.status, r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="replace")
-        try:
-            body = json.loads(raw)
-        except ValueError:
-            body = {"ok": False, "error": f"HTTP {e.code}: {raw[:300]}"}
-        return e.code, body
+        status, raw = e.code, e.read().decode(errors="replace")
+    except Exception as e:                      # URLError, socket timeout, ...
+        return "transport_error", None, {"ok": False, "error": f"{type(e).__name__}: {e}"}, None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return "malformed_response", status, {"ok": False, "error": f"non-JSON body (HTTP {status})"}, raw[:2000]
+    if not isinstance(body, dict) or "ok" not in body:
+        return "malformed_response", status, {"ok": False, "error": "JSON without an ok field", "body": body}, None
+    if body.get("ok"):
+        return "ok", status, body, None
+    return ("api_error" if status < 400 else "http_error"), status, body, None
 
 def main():
     args = sys.argv[1:]
@@ -83,17 +94,24 @@ def main():
     params = json.load(open(params_file))
     rendered = render(sql, params)
     q = {"sql": rendered, "chainId": 38833, "timeout_ms": int(opt["timeout-ms"]), "engine": opt["engine"]}
+
+    # Input first: an attempt that never returns still leaves its exact evidence.
+    attempted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    json.dump({"sql_file": sql_file, "params": params, "rendered_sql": rendered, "request": q,
+               "attempted_at": attempted_at}, open(f"{out}.input.json", "w"), indent=2)
+
     t0 = time.time()
-    status, body = post(opt["base"], q)
+    outcome, status, body, raw = post(opt["base"], q)
     wall = round((time.time() - t0) * 1000, 1)
-    json.dump({"sql_file": sql_file, "params": params, "rendered_sql": rendered, "request": q},
-              open(f"{out}.input.json", "w"), indent=2)
-    json.dump({"http_status": status, "wall_ms": wall, "response": body},
-              open(f"{out}.output.json", "w"), indent=2)
-    ok = bool(body.get("ok"))
-    print(f"{out}: http={status} ok={ok} rows={body.get('row_count')} "
-          f"server_ms={round(body.get('query_time_ms') or 0, 1)} wall_ms={wall}"
-          + ("" if ok else f" ERROR={body.get('error')}"))
+    rec = {"outcome": outcome, "http_status": status, "wall_ms": wall, "attempted_at": attempted_at, "response": body}
+    if raw is not None:
+        rec["raw_body_prefix"] = raw
+    json.dump(rec, open(f"{out}.output.json", "w"), indent=2)
+
+    ok = outcome == "ok"
+    print(f"{out}: outcome={outcome} http={status} rows={body.get('row_count') if body else None} "
+          f"server_ms={round((body or {}).get('query_time_ms') or 0, 1)} wall_ms={wall}"
+          + ("" if ok else f" ERROR={(body or {}).get('error')}"))
     sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":

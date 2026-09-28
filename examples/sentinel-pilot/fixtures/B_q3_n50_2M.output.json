@@ -1,6 +1,8 @@
 {
+  "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 921.0,
+  "wall_ms": 1421.0,
+  "attempted_at": "2026-09-28T19:15:13Z",
   "response": {
     "columns": [
       "chain_id",
@@ -15,6 +17,7 @@
       "from_address",
       "to_address",
       "matched_watch_address",
+      "direction",
       "asset_kind",
       "token_address",
       "amount_raw",
@@ -24,8 +27,8 @@
     ],
     "row_count": 10000,
     "engine": "postgres",
-    "query_time_ms": 811.903275,
+    "query_time_ms": 1288.1882799999998,
     "ok": true,
-    "rows": "<10000 rows omitted from the repo copy; full dump reproducible via run.py>"
+    "rows": "<10000 rows omitted from the repo copy; reproducible via run.py>"
   }
 }

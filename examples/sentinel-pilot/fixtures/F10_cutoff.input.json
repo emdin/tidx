@@ -1,5 +1,5 @@
 {
-  "sql_file": "../sql/q0a_cutoff_hash.sql",
+  "sql_file": "/root/tidx-wt/examples/sentinel-pilot/fixtures/../sql/q0a_cutoff_hash.sql",
   "params": {
     "CUTOFF": 17964796
   },
@@ -9,5 +9,6 @@
     "chainId": 38833,
     "timeout_ms": 30000,
     "engine": "postgres"
-  }
+  },
+  "attempted_at": "2026-09-28T19:18:36Z"
 }

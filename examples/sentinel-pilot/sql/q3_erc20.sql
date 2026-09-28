@@ -25,6 +25,8 @@ SELECT
   abi_address(l.topic2)         AS to_address,
   CASE WHEN l.topic1 IN ({{WATCHED_TOPICS}}) THEN abi_address(l.topic1) ELSE abi_address(l.topic2) END
                                 AS matched_watch_address,
+  CASE WHEN l.topic1 IN ({{WATCHED_TOPICS}}) THEN 'out' ELSE 'in' END
+                                AS direction,           -- only 'out' rows may expand the watchlist
   'erc20'                       AS asset_kind,
   l.address                     AS token_address,
   format_uint(l.data)           AS amount_raw,        -- text; survives uint256 (abi_uint nulls >= 2^96)
@@ -38,6 +40,10 @@ WHERE l.block_num BETWEEN {{BLOCK_LO}} AND {{BLOCK_HI}}
   AND l.block_timestamp >= '{{TS_LO}}'
   AND l.topic0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
   AND l.topic3 IS NULL
+  AND abi_uint(l.data) > 0      -- zero-value Transfer events are not movements. Safe at
+                                -- full uint256 precision: the comparison runs server-side
+                                -- on NUMERIC; only RETURNED abi_uint values hit the JSON
+                                -- layer's 2^96 ceiling, which is why amount_raw uses format_uint.
   AND (l.topic1 IN ({{WATCHED_TOPICS}}) OR l.topic2 IN ({{WATCHED_TOPICS}}))
   AND (l.block_num > {{CUR_BLOCK}}
        OR (l.block_num = {{CUR_BLOCK}} AND l.tx_idx > {{CUR_TX}})

@@ -2,9 +2,10 @@
 --
 -- Correctness rules applied here (each verified against Igra data 2026-09-28):
 --   * receipt status = 1 — a reverted TRANSACTION contributes nothing.
---   * call_type IN (CALL, CREATE, SELFDESTRUCT) — DELEGATECALL frames carry the
---     parent's value context and are NOT transfers (25 such frames with value>0
---     per 300k blocks observed); STATICCALL never carries value.
+--   * call_type IN (CALL, CREATE, CREATE2, SELFDESTRUCT) — DELEGATECALL frames
+--     carry the parent's value context and are NOT transfers (25 such frames
+--     with value>0 per 300k blocks observed); STATICCALL never carries value.
+--     CREATE2 is a real value transfer to the new contract, like CREATE.
 --   * error IS NULL — the frame itself did not revert.
 --   * NOT inside a reverted SUBTREE. `error` is set only on the frame that
 --     reverted; its descendants carry NULL (863 of 909 reverted parents had
@@ -52,6 +53,8 @@ SELECT
   i."to"                        AS to_address,
   CASE WHEN i."from" IN ({{WATCHED}}) THEN i."from" ELSE i."to" END
                                 AS matched_watch_address,
+  CASE WHEN i."from" IN ({{WATCHED}}) THEN 'out' ELSE 'in' END
+                                AS direction,           -- only 'out' rows may expand the watchlist
   'native'                      AS asset_kind,
   NULL::bytea                   AS token_address,
   i.value                       AS amount_raw,
@@ -67,7 +70,7 @@ JOIN blocks   b  ON b.num      = i.block_num
 WHERE i.block_num BETWEEN {{BLOCK_LO}} AND {{BLOCK_HI}}
   AND i.block_timestamp >= '{{TS_LO}}'
   AND rc.status = 1
-  AND i.call_type IN ('CALL', 'CREATE', 'SELFDESTRUCT')
+  AND i.call_type IN ('CALL', 'CREATE', 'CREATE2', 'SELFDESTRUCT')
   AND i.error IS NULL
   AND i.value::numeric > 0
   AND (i."from" IN ({{WATCHED}}) OR i."to" IN ({{WATCHED}}))

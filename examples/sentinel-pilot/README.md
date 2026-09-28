@@ -2,25 +2,48 @@
 
 Deliverable for the "Minimal pilot" spec (8 Sep 2026). Three parameterized,
 per-source SQL queries against tidx's existing `/query` endpoint — **no new
-service, no materialized view** — plus cutoff/reorg helpers, a runner that
-preserves exact inputs and outputs, and acceptance fixtures on real Igra
-transactions (one local-chain fixture where Igra has no real example).
+service, no materialized view** — plus cutoff/reorg/coverage helpers, orphan
+twins of the three queries, a runner that preserves exact inputs and outputs,
+and acceptance fixtures on real Igra transactions (local-chain fixtures where
+Igra has no real instance).
 
-Everything here was executed against production tidx on 2026-09-28. Every
-claim about tidx behaviour below was verified on that date; where something is
-inferred it says so.
+Everything here was executed against production tidx on 2026-09-28 (image
+`iidx-local:igra-15fb1e0`, PR #29). Every claim about tidx behaviour below was
+verified on that date; where something is inferred or unresolved it says so.
 
 ```
-sql/q1_native.sql          top-level native iKAS transfers      (txs ⋈ receipts)
-sql/q2_internal.sql        internal native transfers via traces (internal_txs), reverted-subtree-safe
-sql/q3_erc20.sql           ERC-20 Transfer events, all tokens   (logs), NFT-excluded
-sql/q0a_cutoff_hash.sql    pin the complete-indexed cutoff
-sql/q0b_pin_check.sql      reorg detection on resume; also fetches TS_LO
-sql/q0c_orphaned_range.sql what a reorg invalidated (for corrections)
-fixtures/run.py            substitute → validate → POST /query → save input+output
-fixtures/*.params.json     exact inputs;  fixtures/*.output.json  exact responses
-config.example.json        watchlist / token decimals / contract classification
+sql/q1_native.sql             top-level native iKAS transfers      (txs ⋈ receipts ⋈ blocks)
+sql/q2_internal.sql           internal native transfers via traces (internal_txs), reverted-subtree-safe
+sql/q3_erc20.sql              ERC-20 Transfer events, all tokens   (logs), NFT- and zero-value-excluded
+sql/q1o_native_orphaned.sql   } the same three over the reorg archive, joined on reorg_id —
+sql/q2o_internal_orphaned.sql } return the ORPHANED block hash so a correction can be
+sql/q3o_erc20_orphaned.sql    } keyed on what was originally alerted
+sql/q0a_cutoff_hash.sql       pin the complete-indexed cutoff
+sql/q0b_pin_check.sql         reorg detection on resume and after each scan; also fetches TS_LO
+sql/q0c_orphaned_range.sql    which blocks a reorg invalidated, with reorg_id
+sql/q0d_internal_coverage.sql INTERIM trace-coverage signal for a window (see "Internal coverage")
+fixtures/run.py               substitute → validate → save input → POST /query → save outcome
+fixtures/acceptance.py        repeatable acceptance run (prod fixtures + local-chain fixtures)
+fixtures/*.params.json        exact inputs;  *.input.json  what was sent;  *.output.json  what came back
+fixtures/local/setup.sql      idempotent local-chain fixtures (F1c, F4/F4c, F10b) for a tidx test DB
+fixtures/local/run_local.py   runs the SAME sql files through psql against that DB
+config.example.json           watchlist / token decimals / contract classification
+benchmark.md                  measured cost per query × watchlist size × window
 ```
+
+## Repeatable acceptance command
+
+```sh
+# production fixtures only (network access to tidx.igralabs.com)
+python3 fixtures/acceptance.py --skip-local
+
+# production + local-chain fixtures; <db> is a libpq URL for psql, or
+# docker:<container>:<user>:<dbname> for a tidx test database (migrations applied)
+python3 fixtures/acceptance.py --local-db docker:tidx-test-pg:tidx:tidx
+```
+
+Exit code 0 only if every assertion holds. Each line prints PASS/FAIL with the
+evidence. Last run 2026-09-28: 23 production checks + 7 local checks, ALL PASS.
 
 ## How the bot uses it
 
@@ -29,23 +52,48 @@ config.example.json        watchlist / token decimals / contract classification
    `blocks` table contiguous. Pin it: `q0a` → store `(cutoff, cutoff_hash)`.
    **Never scan past `synced_num`.** If `gap_blocks > 0`, the window is not
    complete — report it, don't scan into it.
-2. **Window.** `[checkpoint+1, cutoff]`, capped at `max_window_blocks`
-   (200 000 recommended — see benchmark). `TS_LO` = `timestamp` of `BLOCK_LO`
-   via `q0b`. `TS_LO` is only an index-friendly prefilter; the exact bound is
-   always `block_num`.
-3. **Run q1, q2, q3** with the same window and watchlist, each paginated to
-   completion (below) **before** advancing the checkpoint.
-4. **Recipients.** Every `to_address` that is not a known contract joins the
-   *off-chain* watchlist. Then **rescan that address from its first observed
-   receipt through the pinned cutoff** (same window logic, watchlist = the new
-   address) so movements it made *later in the same block or before the
-   cutoff* are not missed. Rescans overlap earlier scans by construction —
-   deduplicate on the key below.
-5. **Classify** `called_contract`/`selector` against `config.contracts`:
-   exit, Hyperlane router, known pool/DEX, else *unknown* → all of these are
-   review flags. A designation is **never** propagated through a pool or
-   exchange to its other users; the bot adds only the direct counterparty.
-6. Advance the checkpoint to the cutoff. Persist `(checkpoint, hash)`.
+2. **Windows.** Split `[checkpoint+1, cutoff]` into windows of at most
+   `max_window_blocks` (200 000 recommended — see benchmark). `TS_LO` =
+   `timestamp` of `BLOCK_LO` via `q0b`. `TS_LO` is only an index-friendly
+   prefilter; the exact bound is always `block_num`.
+3. **Per window: run q1, q2, q3** with the same window and watchlist, each
+   paginated to completion (below), then `q0d` for the window (record its
+   `possibly_untraced`; if > 0 the window's internal coverage is
+   **unresolved**, see below).
+4. **Watchlist expansion — classify before adding.** A row may add an address
+   to the *off-chain* watchlist only if **all** of these hold:
+   * `direction = 'out'` — the watched address is the sender (`from_address`).
+     Inbound rows never expand the watchlist (they would add the payer).
+   * positive value — enforced in SQL (`value > 0` for q1/q2,
+     `abi_uint(data) > 0` for q3), so any returned row qualifies.
+   * eligible watch-start position — the row's `(block_num, tx_index,
+     log_index | trace_path)` is at or after the position from which the
+     sending address is watched (`watch_from_block` for a seed; the first
+     observed inbound row for an added recipient). Rows before it are history
+     and only reported.
+   * the **direct recipient** (`to_address`) classifies as *unknown EOA-like*:
+     not in `config.contracts` (exit, Hyperlane router, known pool/DEX), not
+     the zero address, and not a contract observed as `called_contract` /
+     token address anywhere in the run. The **top-level callee**
+     (`called_contract`, `selector`) is classified too: exit / router / pool
+     / unknown-contract. Any of those on either side → the row is a **review
+     flag**, not an expansion. Unknown contracts and services stay in human
+     review; only reviewed decisions add them to `config.contracts`.
+   A designation is never propagated through a pool, router or exchange to
+   its other users; the bot adds at most the direct counterparty.
+5. **Recipient rescan.** For every address added in step 4, run q1–q3 with
+   watchlist = that address from its first observed inbound position
+   through **the end of the current window**. This catches movements later
+   in the **same block** (F1c) and later in the same window (F1b) that the
+   original scan could not see. Rescans overlap earlier scans by
+   construction — deduplicate on the key below. Recurse for recipients found
+   by rescans, same rule.
+6. **Window checkpoint.** After every page of q1–q3 for the window *and* every
+   rescan it triggered are complete, re-run `q0b` on the window's last block:
+   hash unchanged → advance the checkpoint to that window end and persist
+   `(checkpoint, hash)`; changed → treat as a reorg (below) before advancing.
+   The **overall cutoff** is reached only after all windows and all recipient
+   rescans finish; never advance to the pinned cutoff early.
 
 ### Pagination (deterministic, keyset)
 Order is `(block_num, tx_index, log_index)` for q3, `(…, trace_path)` for q2,
@@ -60,70 +108,141 @@ signal. Never use `OFFSET`. Fixture F8 proves `page1 + page2 == one 10-row
 query`, no overlap; F9 proves an identical re-run returns identical rows.
 
 ### Failure is never an empty page
-`ok:false` (timeout, validator rejection — these come back as **HTTP 4xx with a
-JSON body**, not 200 — row-cap violation, transport error) → `run.py` exits 1
-and records it verbatim. Treat any non-ok as "retry this page", never as
-"nothing happened". Limits: default `timeout_ms` 5000 (max 30000); page cap
-10 000 (Postgres) — `LIMIT 10001` is rejected loudly.
+`run.py` records five outcomes: `ok`, `api_error` (HTTP 200 with `ok:false`),
+`http_error` (4xx/5xx — validator rejections and timeouts come back as **HTTP
+4xx with a JSON body**, saved verbatim), `malformed_response` (2xx but not the
+expected JSON shape), `transport_error` (DNS/TLS/connection/socket timeout).
+It writes `<fixture>.input.json` **before** the request and the outcome after,
+so a failed attempt leaves both. Exit code is 0 only for `ok`. Treat any
+non-ok as "retry this page", never as "nothing happened". Limits: default
+`timeout_ms` 5000 (max 30000); page cap 10 000 (Postgres) — `LIMIT 10001` is
+rejected loudly.
 
 ### Dedupe key (restart-safe alerts)
 `(chain_id, tx_hash, event_kind, log_index | trace_path)`. Store it with the
 alert; rescans and restarts re-emit the same rows (F9) and must be idempotent.
 
-### Reorg / gap
-Before each poll, `q0b` on the stored checkpoint block: hash equal → continue;
-different → replay from the fork point (`reorgs.fork_point`), enumerate what
-was invalidated via `q0c` and by re-pointing q1–q3 at `orphaned_txs` /
-`orphaned_internal_txs` / `orphaned_logs` (identical columns), and issue
-**corrections** for alerts in that range. Igra has recorded **0 reorgs** to
-date (F10); the path is exercised but has no live example.
+### Reorg handling
+tidx archives every reorg atomically (`reorgs` + `orphaned_blocks/txs/
+receipts/logs/internal_txs`, all keyed by `reorg_id`; PR #13). Igra has
+recorded **0 reorgs** to date (F10), so this path is exercised only on the
+local-chain fixture F10b.
+
+* **Detect.** `q0b` on the stored checkpoint block before each poll, and on
+  the window's last block after each scan (step 6). Hash differs → reorg.
+* **Identify.** `q0c` over `[checkpoint - depth_guess, checkpoint]` returns
+  the orphaned blocks with their `reorg_id`; `reorgs.fork_point` is the
+  replay start.
+* **Correct from the retained original observations.** Run `q1o`/`q2o`/`q3o`
+  with `REORG_ID` = that id and the same watchlist. They join
+  `orphaned_txs ⋈ orphaned_receipts ⋈ orphaned_blocks` (and `orphaned_logs`
+  / `orphaned_internal_txs`) **within the same `reorg_id`** — never the
+  canonical tables, which by then hold the replacement block (or nothing).
+  Each row carries the **orphaned** `block_hash`, i.e. exactly what was
+  alerted on; emit a correction keyed on the dedupe key + that hash.
+* **Replay** q1–q3 from `fork_point` over the canonical tables, then continue.
+
+Do not "re-point" q1–q3 at the orphaned tables ad hoc: their joins to
+canonical `txs`/`receipts`/`blocks` would drop rows or attach the
+replacement block hash. That is what the `*o` twins exist for.
+
+### Internal coverage — unresolved until tidx records trace outcomes
+`q0d` exists because tidx today has **no per-transaction trace outcome**
+(verified in source 2026-09-28):
+
+* the realtime tracer logs `Failed to trace tx; skipping` and moves on — no
+  retry, no marker (`src/sync/trace.rs`);
+* the gap-fill writer (`sync_range_standalone`) fetches blocks + receipts and
+  **never traces**;
+* a trace that succeeds with zero nested frames writes nothing, so "no rows"
+  is indistinguishable from "never traced";
+* `tidx backfill-traces` re-traces every tx lacking rows, blindly.
+
+So an empty q2 can mean missing evidence, and a maximum traced block number
+would not detect any of the above. `q0d` bounds the uncertainty per window:
+a receipt with `gas_used = 21000` cannot have nested frames (certainly
+covered); every other successful tx either has `internal_txs` rows (traced)
+or has none — **either** a leaf call that made no nested call (common: an
+ERC-20 `transfer()` emits a log but calls nothing) **or** untraced. It cannot
+tell those apart. Measured: F1b window (200 blocks, 126 txs) → 123 with
+frames, 3 possibly untraced, 106 ms; a 200k window → 85 603 / 1 191, 27 s
+(run it per poll window, not per replay chunk).
+
+**Bot rule:** report `internal_coverage: unresolved` for any window with
+`possibly_untraced > 0`; optionally run `tidx backfill-traces --from --to`
+on that range and re-run q2. The proper fix — a trace-outcome record per
+tx (`ok` / `empty` / `failed` + retry), written by both the realtime and the
+gap-fill paths — is a tidx change and is proposed as a separate PR; it is
+not part of this pilot.
 
 ## Correctness rules and where each is enforced
 
 | Rule (spec) | Enforcement | Verified |
 |---|---|---|
-| Committed only | q1/q2 join `receipts` and require `status = 1`. q3 does not: **logs exist only for successful txs** | 0 logs in 1 124 reverted txs (300k-block window) |
-| Reverted internal subtrees excluded | q2 CTE `reverted`: each reverted frame's DFS-preorder interval `(start_p, end_p)`; frames inside any are excluded. **`error IS NULL` alone is wrong** — descendants of a reverted frame carry `NULL` | 863 of 909 reverted parents had error-free children; fixture F4 |
-| DELEGATECALL value is not a transfer | q2 `call_type IN ('CALL','CREATE','SELFDESTRUCT')` | 25 DELEGATECALL frames with value>0 per 300k blocks |
+| Committed only | q1/q2 join `receipts` and require `status = 1`. q3 does not: **logs exist only for successful txs** | 0 logs in 1 124 reverted txs (300k-block window); F3 |
+| Reverted internal subtrees excluded | q2 CTE `reverted`: each reverted frame's DFS-preorder interval `(start_p, end_p)`; frames inside any are excluded. **`error IS NULL` alone is wrong** — descendants of a reverted frame carry `NULL` | 863 of 909 reverted parents had error-free children; F4 |
+| DELEGATECALL value is not a transfer | q2 `call_type IN ('CALL','CREATE','CREATE2','SELFDESTRUCT')` | 25 DELEGATECALL frames with value>0 per 300k blocks; F4 (p6) |
+| CREATE2 with value is a transfer | included in q2 with the same ancestor-revert check | F4c: CREATE2 outside a reverted subtree returned, CREATE2 inside one excluded. *Igra has 0 value-carrying CREATE2 frames on chain today* |
+| Positive amounts only | q1/q2 `value > 0`; q3 `abi_uint(data) > 0` evaluated server-side on NUMERIC (full uint256) — only *returned* `abi_uint` values hit the JSON 2^96 ceiling, which is why `amount_raw` uses `format_uint` | F3b |
 | No top-level/internal double count | `txs` = depth 0, `internal_txs` = depth ≥ 1, disjoint by construction | schema |
 | Bridge event not counted twice | an exit is one q1 row (native → exit contract); its internal frames are contract→contract, so q2 matches nothing for the watched sender | F7 |
 | ERC-20 ≠ NFT | q3 `topic3 IS NULL` | 273 407 ERC-20 vs 6 656 NFT events, clean split |
-| Exact amounts | `amount_raw` is text (`format_uint` for logs; `abi_uint` would NULL ≥ 2^96 through the JSON layer) | — |
+| Direction explicit | every row carries `direction` (`out` = watched address is the sender); only `out` rows may expand the watchlist | F1/F1b/F1c/F11 assert on `out` |
 | Unknown decimals stay unknown | q3 returns `decimals = NULL`; bot maps by `token_address` from config (WiKAS = 18 via `eth_call`) | — |
 
-## Acceptance fixtures (all with full hashes; inputs/outputs in `fixtures/`)
+## Acceptance fixtures (full hashes; inputs/outputs in `fixtures/`)
 
 | # | Case | Fixture | Result |
 |---|---|---|---|
-| F1 | seed → recipient → next recipient **between two polls** | seed `0x7826f542…cbe45`. Poll 1 `[17959300,17959360]`: WiKAS **277.36** → `0x13f197c7…0bd5` in `0xf210f33312bcd4b1fb65ed850022ebe5548820f13ab07befd88f4390f4358c2b` (blk 17959343). Recipient rescan `[17959343,17959360]` → only that inbound. Poll 2 `[17959361,17960200]` with both watched: `0x13f1…` → `0xc281cb25…14d7` **398.59** in `0xa8fdae0b11134066987a35f0562c43bc854cc0bb1854a5a9be975a0e361120d5` (17959374) and **186.83** in `0x553cc102008302d5c9cf833002608959daebb6b4432260684c0712b1f2a0505c` (17960101) | ✅ forwarding caught in poll 2; every leg has `called_contract = 0xa5b0946d…`, `selector 0x38ed1739` → **review flag** (router). Counter-legs of another token appear too (`token_address` distinguishes) |
+| F1 | seed → recipient → next recipient **between two polls** (router-mediated) | seed `0x7826f542…cbe45`. Poll 1 `[17959300,17959360]`: WiKAS **277.36** → `0x13f197c7…0bd5` in `0xf210f33312bcd4b1fb65ed850022ebe5548820f13ab07befd88f4390f4358c2b` (blk 17959343). Recipient rescan `[17959343,17959360]` → only that inbound. Poll 2 `[17959361,17960200]` with both watched: `0x13f1…` → `0xc281cb25…14d7` **398.59** in `0xa8fdae0b11134066987a35f0562c43bc854cc0bb1854a5a9be975a0e361120d5` (17959374) and **186.83** in `0x553cc102008302d5c9cf833002608959daebb6b4432260684c0712b1f2a0505c` (17960101) | ✅ forwarding caught in poll 2; every leg has `called_contract = 0xa5b0946d…`, `selector 0x38ed1739` → **review flag** (router), so under step 4 these do *not* expand the watchlist |
+| F1b | **ordinary-wallet forwarding inside the initial scanned range** | direct `transfer()` legs, A = `0xc87dfceb…`, B = `0x725836b4…`, C = `0x923ba6be…`, window `[17114600,17114800]`. Seed A: A→B **9 990** WiKAS in `0xca275fc2b46504f5b96b5734840363c5362bb30119b2e3fd68f848324f5d048a` (17114606). Rescan B over the SAME window: B→C **100** in `0x244884b027d68af104e215a5690f9869624b141cf1502b901d09a93490da53fe` (17114613) and B→A 9 700 in `0x0c2894dd8ef84cc04e94238d3a9c6be44fc13e94ce5d222f95a4b801f99d168d` (17114741) | ✅ both legs `direction = out`, `called_contract` = the token itself, `selector 0xa9059cbb`; B is an unlisted, EOA-like recipient → eligible |
+| F1c | forwarding **in the same block** | **local-chain** block 999002: tx#0 A→B 500 T, tx#1 B→C 200 T | ✅ poll with A returns tx#0 (`out`); rescan with B over the same one-block window returns tx#1 (`out`). *Igra has no real same-block instance among direct wallet transfers* |
 | F2 | small positive transfer | `0xaeb835081aa881a5cc86dc761cbf300fe7eae0cf7d36031d0d08fef84d335af6` (17315165), **105 raw** WiKAS from `0xe3ec9732…25b8` | ✅ returned |
-| F3 | failed transaction | `0x7b8ed91308ef638f2fbc53ed338d4a47b09734047b4e6b699c67ddbb28c3c48b` (17886245), 2 885 iKAS, `status = 0` | ✅ q1 returns **0 rows**; control query confirms the tx exists |
-| F4 | successful tx, reverted internal call with a **nonzero-value child** | **local-chain fixture** in the tidx test DB (block 999001): reverted frame p1 with value-5 child p2; sibling p5 value 7 outside; p6 DELEGATECALL value 9; trailing reverted p7 with value-11 child p8 | ✅ q2 returns **only p5 = 7**; control without the CTE returns p2, p8 too. *Igra has no real instance: 1 717 successful txs contain a reverted frame, none with value inside the subtree* |
-| F5 | native / WiKAS / other ERC-20 | F7 (native), F1/F2 (WiKAS), F1/F6 counter-legs (other tokens) | ✅ |
-| F6 | swap / pool — **no propagation** | `0x448cb992c152006e117640a23c7cf6692f6e8addc6108dc6eb899e60a8060b4c` (17962263): `0x30b3e9d6…7caa` → pool `0xbe3c61c2…e7bd` 264.55 WiKAS, receives 5.73e24 of another token | ✅ rows carry `called_contract = pool`, `selector 0x4d13dd92` → review; the pool's other users are **not** added |
-| F7 | bridge without duplicate value | `0x47071e4d10ad9a2a17f49accff69e23c765a8e400a573bd073504f2765904c75` (17949927): **10 020 iKAS** → canonical exit `0x4bb88c21…b2d0`, `selector 0x5f8b1cce` | ✅ q1 **1 row**, q2 **0 rows** — counted once. Its Hyperlane `Dispatch` is emitted by `0x3a867fcf…2aa7` in the same tx (link on `tx_hash`) |
+| F3 | failed transaction | `0x7b8ed91308ef638f2fbc53ed338d4a47b09734047b4e6b699c67ddbb28c3c48b` (17886245), 2 885 iKAS, `status = 0` | ✅ q1 returns **0 rows** |
+| F3b | zero-value Transfer event | `0x0effb1d6a66404f1e337fd7e939a6a6ae4716b8b09f402f91fb60fb7d06e6648` (17766544), Transfer of 0 involving `0xb5270013…` | ✅ q3 returns **0 rows** for that address/window |
+| F4 | successful tx, reverted internal call with a **nonzero-value child** | **local-chain** block 999001, 12 frames: reverted p1 with value-5 child p2; p5 value 7 outside; p6 DELEGATECALL 9; trailing reverted p7 with value-11 child p8; p9 CREATE2 13 outside; p10 reverted with CREATE2 17 child p11 | ✅ q2 returns **exactly p5 = 7 (CALL) and p9 = 13 (CREATE2)**; control without the CTE also returns p2, p8, p11. *Igra: 1 717 successful txs contain a reverted frame, none with value inside the subtree* |
+| F4c | CREATE2 inclusion + ancestor check | same fixture (p9 in, p11 out) | ✅ |
+| F5 | native / WiKAS / other ERC-20 | F7, F11 (native), F1/F1b/F2 (WiKAS), F1/F6 counter-legs (other tokens) | ✅ |
+| F6 | swap / pool — **no propagation** | `0x448cb992c152006e117640a23c7cf6692f6e8addc6108dc6eb899e60a8060b4c` (17962263): `0x30b3e9d6…7caa` → pool `0xbe3c61c2…e7bd` 264.55 WiKAS, receives 5.73e24 of another token | ✅ rows carry `called_contract = pool`, `selector 0x4d13dd92` → review; `to_address` is the pool → not eligible; the pool's other users are **not** added |
+| F7 | bridge without duplicate value | `0x47071e4d10ad9a2a17f49accff69e23c765a8e400a573bd073504f2765904c75` (17949927): **10 020 iKAS** → canonical exit `0x4bb88c21…b2d0`, `selector 0x5f8b1cce` | ✅ q1 **1 row**, q2 **0 rows** — counted once. Its Hyperlane `Dispatch` is emitted by `0x3a867fcf…2aa7` in the same tx |
 | F8 | full-page continuation | `0xc281cb25…14d7`, 2M blocks, page 5 | ✅ `page1+page2 == single 10-row query`; no overlap; cursor `(15978373, 4, 5)` |
-| F9 | restart without duplicate alerts | identical re-run of page 1 | ✅ identical rows → dedupe key makes re-emission a no-op |
-| F10 | reorg / gap | `/status` cutoff pinned via q0a; q0b on block 17959343 matches the stored hash `0x7c6e65d3…b764`; q0c over the F1 range → 0; `reorgs` = 0 | ✅ mechanism exercised; no live reorg exists |
+| F9 | identical re-run | identical re-run of page 1 | ✅ identical rows. **Restart persistence and alert dedup are bot-lifecycle behaviour — explicitly deferred to the bot deliverable**, not demonstrated here |
+| F10 | cutoff pin / reorg detection | `/status` cutoff pinned via q0a; q0b on block 17959343 matches `0x7c6e65d3…b764`; q0c over the F1 range → 0; `reorgs` = 0 | ✅ mechanism exercised; no live reorg exists on Igra |
+| F10b | **actual reorg correction** | **local-chain**: reorg 999 orphaned block 999003 (hash `0xdead…9003`) holding tx `feed…04` A→B 5 wei native + 900 T; canonical replacement block has no txs | ✅ q1o and q3o (REORG_ID 999, watched A) each return the movement **with the orphaned hash**; canonical q3 over the same range returns 0 rows |
+| F11 | representative **Hyperlane** movement | `0x244c4fdc9822fb620bc2e47ad81d8a6b5d931d665628a6403778e3643d7f3350` (17293324): `0xaaf9e5f4…` calls token router `0xa5b8bf90…35e7` (`selector 0x81b4e8b4`), which burns **176 479 296 raw** (Transfer → `0x0`) and emits `Dispatch`; the tx also sends **4.797 iKAS** native to the router | ✅ q3 1 row `out` to the zero address, q1 1 row `out` to the router → both classify as bridge-out via router → review, not expansion |
+| F0d | coverage is reported, not assumed | `q0d` over the F1b window and over a 200k window | ✅ counts partition `successful_txs` exactly; 3 (resp. 1 191) `possibly_untraced` → those windows are `unresolved` |
 
-Cross-table completeness (`fixtures/` run): every fixture tx is present and
-consistent in `txs`, `receipts`, `logs`, `internal_txs` (e.g. F1 legs: receipt 1,
-4 logs, 16 frames; F7: receipt 1, 6 logs, 11 frames; F3: receipt 0, 0 logs).
+Cross-table completeness: every fixture tx is present and consistent in
+`txs`, `receipts`, `logs`, `internal_txs` (e.g. F1 legs: receipt 1, 4 logs,
+16 frames; F7: receipt 1, 6 logs, 11 frames; F3: receipt 0, 0 logs).
+
+Local-chain fixtures run the **same SQL files** through psql; the only
+rendering difference is that `'0x…'` literals become `'\x…'::bytea` directly
+(what `/query`'s hex rewriter does server-side). Outputs are saved next to the
+runner as `*.local.output.csv`.
 
 ## Benchmark
-See `benchmark.md` (generated from `fixtures/B_*.output.json`).
+See `benchmark.md` (generated from `fixtures/B_*.output.json`; re-measured
+after the review edits).
 
 ## Coverage gaps (recorded, not hidden)
 
+* **Internal-trace coverage is unresolved** per window until tidx records
+  trace outcomes (above). q0d bounds it; it does not close it.
 * **Exits (payload 0x3) are not parsed by tidx.** L2→L1 exits have no L1-side
   provenance row. On the L2 side an exit **is** fully visible as a native tx
   to the canonical exit contract (F7) — alert on that.
 * **`l2_withdrawals` holds L1→L2 *entries* (deposits)**, not exits. Do not
   read it as exits.
-* **Hyperlane routers:** the nine fork-fixture addresses are not on the tidx
-  host and were **not guessed**. `config.example.json` has an empty slot for
-  them plus three evidence-based on-chain candidates (the sole `Dispatch`
-  emitter and two contracts present in every exit tx).
+* **Hyperlane routers: the nine fork-fixture addresses are still missing.**
+  `IgraLabs/igra-sentinel` is private and the tidx host's GitHub token gets
+  HTTP 404 on it (2026-09-28), so they could not be fetched and were **not
+  guessed**. `config.example.json` has the empty slot plus evidence-based
+  on-chain candidates with their observed roles — the Mailbox (sole
+  `Dispatch` emitter) is a different role from a token router (the contract
+  users call, which burns and dispatches; F11). Please paste the nine
+  addresses from `test/IgraFork.t.sol` @ `a3029464` into
+  `contracts.hyperlane_routers.from_fork_fixture`.
 * **NFT Transfer events** are excluded (`topic3 IS NULL`).
 * **`block_timestamp` is synthetic** (DAA-derived, ~10 min behind wall clock
   today). Exact bounds are `block_num`; `blocks.real_timestamp` is L1 time.

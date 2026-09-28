@@ -25,6 +25,8 @@ SELECT
   t."to"                        AS to_address,
   CASE WHEN t."from" IN ({{WATCHED}}) THEN t."from" ELSE t."to" END
                                 AS matched_watch_address,
+  CASE WHEN t."from" IN ({{WATCHED}}) THEN 'out' ELSE 'in' END
+                                AS direction,           -- only 'out' rows may expand the watchlist
   'native'                      AS asset_kind,
   NULL::bytea                   AS token_address,
   t.value                       AS amount_raw,        -- exact integer, wei-scale, as text

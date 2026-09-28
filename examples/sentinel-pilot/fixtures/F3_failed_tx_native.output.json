@@ -1,6 +1,8 @@
 {
+  "outcome": "ok",
   "http_status": 200,
-  "wall_ms": 29.2,
+  "wall_ms": 25.9,
+  "attempted_at": "2026-09-28T19:18:35Z",
   "response": {
     "columns": [
       "chain_id",
@@ -15,6 +17,7 @@
       "from_address",
       "to_address",
       "matched_watch_address",
+      "direction",
       "asset_kind",
       "token_address",
       "amount_raw",
@@ -26,7 +29,7 @@
     "rows": [],
     "row_count": 0,
     "engine": "postgres",
-    "query_time_ms": 4.079829999999999,
+    "query_time_ms": 1.4320279999999999,
     "ok": true
   }
 }
