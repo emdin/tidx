@@ -1,0 +1,17 @@
+{
+  "sql_file": "sql/q0a_cutoff_hash.sql",
+  "params": {
+    "BLOCK_LO": 0,
+    "BLOCK_HI": 17976809,
+    "TS_LO": "2026-01-01T00:00:00+00:00",
+    "CUTOFF": 17976809
+  },
+  "rendered_sql": "-- Q0a: pin the complete indexed cutoff.\n-- `sync_state` is NOT in the /query allowlist, so: (1) GET /status ->\n-- chains[0].synced_num (plus gap_blocks, gaps[], tip_num). synced_num is the\n-- highest block below which tidx has verified the table contiguous (its\n-- gap-fill loop only advances it after a bounded scan finds nothing). Never\n-- scan past it. (2) pin its hash and store both with the checkpoint:\nSELECT num AS cutoff, hash AS cutoff_hash, timestamp AS cutoff_ts\nFROM blocks\nWHERE num = 17976809\n",
+  "request": {
+    "sql": "-- Q0a: pin the complete indexed cutoff.\n-- `sync_state` is NOT in the /query allowlist, so: (1) GET /status ->\n-- chains[0].synced_num (plus gap_blocks, gaps[], tip_num). synced_num is the\n-- highest block below which tidx has verified the table contiguous (its\n-- gap-fill loop only advances it after a bounded scan finds nothing). Never\n-- scan past it. (2) pin its hash and store both with the checkpoint:\nSELECT num AS cutoff, hash AS cutoff_hash, timestamp AS cutoff_ts\nFROM blocks\nWHERE num = 17976809\n",
+    "chainId": 38833,
+    "timeout_ms": 30000,
+    "engine": "postgres"
+  },
+  "attempted_at": "2026-09-28T21:45:57Z"
+}

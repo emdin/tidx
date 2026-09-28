@@ -246,6 +246,24 @@ the repair loop re-traces the last 100k blocks (~42k txs on prod) over RPC.
 Failed txs are retried no sooner than 10 min after their last attempt, so an
 RPC outage costs one pass, not the attempt budget.
 
+### Historical trace coverage — established 2026-09-28 (fixtures `HIST_*`)
+Full history was brought under the trace record after the PR #30 deploy:
+
+| Step | Evidence |
+|---|---|
+| cutoff pinned via q0a | block **17 976 809**, hash `0x768b6481f2f69de1315791a70530301464826e7797012292848121f3b8300ac0`, ts 2026-09-28T21:36:31Z (`HIST_cutoff.output.json`) |
+| already-traced history stamped `ok` (no RPC) | 6 954 705 txs, 950 s |
+| `tidx backfill-traces --from 0 --to 17976809` | 160 438 never-traced txs traced in 27 min, **519 715 internal frames recovered**, 4 transient failures (`error decoding response body`) retried to `empty` (`HIST_backfill_traces.log`) |
+| q0e over `[0, 17976809]` (`HIST_q0e_full.rendered.sql` → `HIST_q0e_full.output.csv`) | `successful_txs 7 061 877 = ok 6 946 798 + empty 115 079`, **failed 0, untraced 0, resolved = true** |
+| every tx ≤ cutoff, any receipt status | 7 117 173 txs, 0 without an outcome, 0 failed |
+| pin re-check after the run (q0b) | hash unchanged (`HIST_pincheck.output.json`) |
+
+Above the cutoff the realtime path records outcomes as blocks land and the
+repair loop covers the trailing 100k blocks; re-run q0e per window to prove
+it for any later range. The 519 715 recovered frames are internal movements
+that were invisible before this change — gap-fill-synced blocks had never
+been traced.
+
 ## Correctness rules and where each is enforced
 
 | Rule (spec) | Enforcement | Verified |
