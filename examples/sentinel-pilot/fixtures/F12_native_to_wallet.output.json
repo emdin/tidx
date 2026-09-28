@@ -1,0 +1,58 @@
+{
+  "outcome": "ok",
+  "http_status": 200,
+  "wall_ms": 26.5,
+  "attempted_at": "2026-09-28T20:16:59Z",
+  "response": {
+    "columns": [
+      "chain_id",
+      "block_num",
+      "block_hash",
+      "block_timestamp",
+      "tx_hash",
+      "tx_index",
+      "event_kind",
+      "log_index",
+      "trace_path",
+      "from_address",
+      "to_address",
+      "matched_watch_address",
+      "direction",
+      "asset_kind",
+      "token_address",
+      "amount_raw",
+      "decimals",
+      "called_contract",
+      "selector",
+      "status"
+    ],
+    "rows": [
+      [
+        38833,
+        17950630,
+        "0xfef08c4360fec52b6b52f13bce49a60fc7233058bc2397a420d2b6052c6f317b",
+        "2026-09-28T13:40:05+00:00",
+        "0x076f281b28f45104e855594aa4a0a8822c6a6f68cfd36dbf8f6441326b2809f3",
+        0,
+        "native",
+        null,
+        null,
+        "0x2f296ed8e58a53c9642581e04da794bdd20431e6",
+        "0xa0416cdeb986a8bfcd7356c249cce5042bb0133c",
+        "0x2f296ed8e58a53c9642581e04da794bdd20431e6",
+        "out",
+        "native",
+        null,
+        "100000000000000000000",
+        18,
+        "0xa0416cdeb986a8bfcd7356c249cce5042bb0133c",
+        null,
+        1
+      ]
+    ],
+    "row_count": 1,
+    "engine": "postgres",
+    "query_time_ms": 1.167535,
+    "ok": true
+  }
+}

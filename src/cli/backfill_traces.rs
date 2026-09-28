@@ -1,13 +1,20 @@
 //! `tidx backfill-traces` — fetch `debug_traceTransaction` for txs in a block
-//! range and persist the flattened call frames to `internal_txs`.
+//! range, persist the flattened call frames to `internal_txs` and record an
+//! outcome per tx in `trace_outcomes`.
 //!
-//! Use after the schema migration has shipped (so `internal_txs` exists) to
-//! catch up history. The realtime engine writes traces inline when started
-//! with tracing enabled; this CLI fills in the past.
+//! Default selection is the same as the engine's repair loop: txs that were
+//! never traced (no `trace_outcomes` row) or `failed` with attempts left.
+//! Txs traced `ok`/`empty` are skipped, so the run is resumable and never
+//! re-traces a tx just because it made no nested call.
 //!
-//! Resumable: by default skips txs that already have at least one
-//! internal_txs row. Pass `--all` to re-trace everything (e.g. after a tracer
-//! bug fix).
+//! `--mark-existing` stamps an `ok` outcome (no RPC) on txs that already have
+//! `internal_txs` rows but no outcome — history traced before
+//! `trace_outcomes` existed — one chunk at a time, ahead of tracing that chunk.
+//! Run it once over full history when upgrading, BEFORE starting the new
+//! engine (whose repair loop would otherwise re-trace the last 100k blocks).
+//!
+//! `--all` re-traces every tx in range regardless of outcome (e.g. after a
+//! tracer bug fix).
 
 use anyhow::{Result, anyhow};
 use clap::Args as ClapArgs;
@@ -19,8 +26,8 @@ use tidx::db;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::fetcher::RpcClient;
 use tidx::sync::sink::SinkSet;
-use tidx::sync::trace::fetch_and_flatten_traces;
-use tidx::types::TxRow;
+use tidx::sync::trace::{DEFAULT_TRACE_ATTEMPTS, TraceStatus, trace_txs};
+use tidx::sync::writer::{load_txs_for_trace_repair, load_txs_in_range, mark_existing_traces};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -46,9 +53,18 @@ pub struct Args {
     #[arg(long, default_value = "500")]
     pub batch_size: u64,
 
-    /// Re-trace txs that already have internal_txs rows. Default skips them.
+    /// Re-trace every tx in range, ignoring recorded outcomes.
     #[arg(long)]
     pub all: bool,
+
+    /// Before tracing, record `ok` outcomes (no RPC) for txs that already
+    /// have internal_txs rows but no outcome row.
+    #[arg(long)]
+    pub mark_existing: bool,
+
+    /// Skip `failed` txs whose cumulative attempts reached this many.
+    #[arg(long, default_value = "12")]
+    pub max_attempts: i32,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -108,33 +124,48 @@ pub async fn run(args: Args) -> Result<()> {
         to = args.to,
         batch_size = args.batch_size,
         all = args.all,
+        mark_existing = args.mark_existing,
         "Starting internal_txs backfill"
     );
 
     let mut current = args.from;
     let mut scanned_txs = 0_u64;
     let mut written_rows = 0_u64;
+    let mut failed_txs = 0_u64;
+    let mut marked_txs = 0_u64;
 
     while current <= args.to {
         let batch_end = (current + args.batch_size - 1).min(args.to);
-        let txs = load_txs_in_range(&pool, current as i64, batch_end as i64, !args.all).await?;
+        if args.mark_existing {
+            marked_txs += mark_existing_traces(&pool, current as i64, batch_end as i64).await?;
+        }
+        let txs = if args.all {
+            load_txs_in_range(&pool, current as i64, batch_end as i64).await?
+        } else {
+            // retry_after 0: an explicit operator run retries failures now
+            load_txs_for_trace_repair(&pool, current as i64, batch_end as i64, args.max_attempts, 0, i64::MAX).await?
+        };
         if txs.is_empty() {
             current = batch_end + 1;
             continue;
         }
 
-        let trace_rows = fetch_and_flatten_traces(&rpc, &txs).await?;
-        if !trace_rows.is_empty() {
-            sinks.write_internal_txs(&trace_rows).await?;
-            written_rows += trace_rows.len() as u64;
-        }
-
+        let batch = trace_txs(&rpc, &txs, DEFAULT_TRACE_ATTEMPTS).await;
+        let failed = batch
+            .outcomes
+            .iter()
+            .filter(|o| o.status == TraceStatus::Failed)
+            .count() as u64;
+        sinks.write_traces(&batch).await?;
+        written_rows += batch.rows.len() as u64;
+        failed_txs += failed;
         scanned_txs += txs.len() as u64;
         info!(
             from = current,
             to = batch_end,
             txs = txs.len(),
-            internal_rows = trace_rows.len(),
+            internal_rows = batch.rows.len(),
+            failed,
             scanned_txs,
             written_rows,
             "Backfilled trace batch"
@@ -147,73 +178,14 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     if scanned_txs == 0 {
-        warn!("No txs found in the requested range — nothing to backfill");
+        warn!("No txs needed tracing in the requested range");
     }
     info!(
         scanned_txs,
-        written_rows, "internal_txs backfill complete"
+        written_rows,
+        failed_txs,
+        marked_txs,
+        "internal_txs backfill complete (failed txs stay 'failed' for the next pass)"
     );
     Ok(())
-}
-
-/// Load txs in `[from, to]`. When `skip_existing` is true, only returns txs
-/// that don't yet have any `internal_txs` rows (resumable backfill).
-async fn load_txs_in_range(
-    pool: &db::Pool,
-    from: i64,
-    to: i64,
-    skip_existing: bool,
-) -> Result<Vec<TxRow>> {
-    let conn = pool.get().await?;
-    let sql = if skip_existing {
-        // Anti-join against internal_txs: skip txs that already have at least
-        // one nested-call row. Index on internal_txs.tx_hash makes this cheap.
-        r#"SELECT t.block_num, t.block_timestamp, t.idx, t.hash, t.type, t."from", t."to",
-                  t.value, t.input, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas,
-                  t.gas_used, t.nonce_key, t.nonce, t.fee_token, t.fee_payer, t.calls,
-                  t.call_count, t.valid_before, t.valid_after, t.signature_type, t.selector
-           FROM txs t
-           WHERE t.block_num BETWEEN $1 AND $2
-             AND NOT EXISTS (
-                 SELECT 1 FROM internal_txs i WHERE i.tx_hash = t.hash
-             )
-           ORDER BY t.block_num, t.idx"#
-    } else {
-        r#"SELECT block_num, block_timestamp, idx, hash, type, "from", "to",
-                  value, input, gas_limit, max_fee_per_gas, max_priority_fee_per_gas,
-                  gas_used, nonce_key, nonce, fee_token, fee_payer, calls,
-                  call_count, valid_before, valid_after, signature_type, selector
-           FROM txs
-           WHERE block_num BETWEEN $1 AND $2
-           ORDER BY block_num, idx"#
-    };
-    let rows = conn.query(sql, &[&from, &to]).await?;
-    Ok(rows
-        .iter()
-        .map(|r| TxRow {
-            block_num: r.get(0),
-            block_timestamp: r.get(1),
-            idx: r.get(2),
-            hash: r.get(3),
-            tx_type: r.get(4),
-            from: r.get(5),
-            to: r.get(6),
-            value: r.get(7),
-            input: r.get(8),
-            gas_limit: r.get(9),
-            max_fee_per_gas: r.get(10),
-            max_priority_fee_per_gas: r.get(11),
-            gas_used: r.get(12),
-            nonce_key: r.get(13),
-            nonce: r.get(14),
-            fee_token: r.get(15),
-            fee_payer: r.get(16),
-            calls: r.get(17),
-            call_count: r.get(18),
-            valid_before: r.get(19),
-            valid_after: r.get(20),
-            signature_type: r.get(21),
-            selector: r.get(22),
-        })
-        .collect())
 }

@@ -1,0 +1,15 @@
+{
+  "sql_file": "/root/tidx-wt/examples/sentinel-pilot/fixtures/../sql/q0c_orphaned_range.sql",
+  "params": {
+    "BLOCK_LO": 17959300,
+    "BLOCK_HI": 17960200
+  },
+  "rendered_sql": "-- Q0c: blocks orphaned by a reorg in a range (for issuing corrections).\n-- Every orphaned_* table mirrors its source table's columns exactly (tidx\n-- asserts schema parity at boot), so q1/q2/q3 can be re-pointed at\n-- orphaned_txs / orphaned_internal_txs / orphaned_logs verbatim to enumerate\n-- the observations that are now invalid. reorgs(id, fork_point, prev_tip,\n-- depth, ...) has the event itself. Igra has recorded 0 reorgs to date.\nSELECT reorg_id, num, hash, orphaned_at\nFROM orphaned_blocks\nWHERE num BETWEEN 17959300 AND 17960200\nORDER BY num\n",
+  "request": {
+    "sql": "-- Q0c: blocks orphaned by a reorg in a range (for issuing corrections).\n-- Every orphaned_* table mirrors its source table's columns exactly (tidx\n-- asserts schema parity at boot), so q1/q2/q3 can be re-pointed at\n-- orphaned_txs / orphaned_internal_txs / orphaned_logs verbatim to enumerate\n-- the observations that are now invalid. reorgs(id, fork_point, prev_tip,\n-- depth, ...) has the event itself. Igra has recorded 0 reorgs to date.\nSELECT reorg_id, num, hash, orphaned_at\nFROM orphaned_blocks\nWHERE num BETWEEN 17959300 AND 17960200\nORDER BY num\n",
+    "chainId": 38833,
+    "timeout_ms": 30000,
+    "engine": "postgres"
+  },
+  "attempted_at": "2026-09-28T20:16:59Z"
+}

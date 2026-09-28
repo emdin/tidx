@@ -1,0 +1,19 @@
+{
+  "outcome": "ok",
+  "http_status": 200,
+  "wall_ms": 25.9,
+  "attempted_at": "2026-09-28T20:16:59Z",
+  "response": {
+    "columns": [
+      "reorg_id",
+      "num",
+      "hash",
+      "orphaned_at"
+    ],
+    "rows": [],
+    "row_count": 0,
+    "engine": "postgres",
+    "query_time_ms": 1.5646760000000002,
+    "ok": true
+  }
+}

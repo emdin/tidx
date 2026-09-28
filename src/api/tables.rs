@@ -259,6 +259,30 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
         },
         TableInfo {
+            name: "trace_outcomes",
+            description: "Per-transaction trace outcome. `internal_txs` alone cannot say whether a tx was traced: a trace that succeeds with no nested call writes no rows, and a failed trace writes nothing either. A tx with NO row here has never been traced (indexed before this table existed, or by a path with tracing disabled). Failed rows are retried by the engine's repair loop and by `tidx backfill-traces`. Dropped (not archived) for reorged blocks.",
+            engines: pg(),
+            columns: vec![
+                col("tx_hash", "BYTEA", "Primary key; the traced tx"),
+                col("block_num", "INT8", "Block containing the tx"),
+                col("outcome", "TEXT", "`ok` (≥1 frame in internal_txs), `empty` (traced, no nested call), `failed` (every attempt errored)"),
+                col("frames", "INT4", "Nested frames written for this tx"),
+                col("attempts", "INT4", "Cumulative debug_traceTransaction attempts across all passes"),
+                col("error", "TEXT", "Last error message for `failed`; NULL otherwise"),
+                col("traced_at", "TIMESTAMPTZ", "When the current outcome was recorded"),
+            ],
+            examples: vec![
+                QueryExample {
+                    description: "Trace coverage of a block window: ok / empty / failed / never traced",
+                    sql: "SELECT coalesce(o.outcome, 'untraced') AS outcome, count(*) FROM txs t LEFT JOIN trace_outcomes o ON o.tx_hash = t.hash WHERE t.block_num BETWEEN 17900000 AND 17900999 GROUP BY 1",
+                },
+                QueryExample {
+                    description: "Failed traces awaiting repair",
+                    sql: "SELECT block_num, encode(tx_hash,'hex'), attempts, error FROM trace_outcomes WHERE outcome = 'failed' ORDER BY block_num DESC LIMIT 100",
+                },
+            ],
+        },
+        TableInfo {
             name: "kaspa_l2_submissions",
             description: "Confirmed Kaspa L1 transactions that submitted L2 batches to Igra. Promoted from kaspa_pending_l2_submissions after the configured finality delay (12h on mainnet).",
             engines: pg_ch(),
@@ -599,6 +623,7 @@ mod tests {
             "receipts",
             "l2_withdrawals",
             "internal_txs",
+            "trace_outcomes",
             "kaspa_provenance_meta",
             "kaspa_sync_state",
             "kaspa_provenance_gaps",
@@ -634,6 +659,7 @@ mod tests {
             "receipts",
             "l2_withdrawals",
             "internal_txs",
+            "trace_outcomes",
             "kaspa_provenance_meta",
             "kaspa_sync_state",
             "kaspa_provenance_gaps",

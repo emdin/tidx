@@ -18,10 +18,11 @@ use super::decoder::{
 };
 use super::fetcher::{ReceiptFetchMode, RpcClient};
 use super::sink::SinkSet;
+use super::trace::{DEFAULT_TRACE_ATTEMPTS, trace_txs};
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, gaps_above_watermark,
-    get_block_hash, has_gaps, load_sync_state, save_sync_state, update_sync_rate,
-    update_synced_num, update_tip_num,
+    get_block_hash, has_gaps, load_sync_state, load_txs_for_trace_repair, save_sync_state,
+    update_sync_rate, update_synced_num, update_tip_num,
 };
 
 /// RPC concurrency limits
@@ -309,6 +310,7 @@ impl SyncEngine {
                 self.chain_id,
                 self.batch_size,
                 self.concurrency,
+                self.enable_tracing,
                 &mut progress,
             )
             .await
@@ -372,6 +374,7 @@ impl SyncEngine {
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
         let gapfill_head_delay_blocks = self.head_delay.current_shared();
+        let gapfill_tracing = self.enable_tracing;
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
                 gapfill_sinks,
@@ -381,6 +384,7 @@ impl SyncEngine {
                 gapfill_batch_size,
                 gapfill_concurrency,
                 gapfill_head_delay_blocks,
+                gapfill_tracing,
                 gapfill_shutdown,
             )
             .await
@@ -400,6 +404,20 @@ impl SyncEngine {
             )
             .await
         });
+
+        // Retries failed traces and traces anything recent that was never
+        // traced, so an empty internal_txs is never silently "no calls".
+        let repair_handle = if self.enable_tracing {
+            let sinks = self.sinks.clone();
+            let rpc = self.backfill_rpc.clone();
+            let chain_id = self.chain_id;
+            let shutdown = shutdown.resubscribe();
+            Some(tokio::spawn(async move {
+                run_trace_repair_loop(sinks, rpc, chain_id, shutdown).await
+            }))
+        } else {
+            None
+        };
 
         // Run realtime loop in foreground
         loop {
@@ -424,6 +442,9 @@ impl SyncEngine {
         // Abort background tasks
         gapfill_handle.abort();
         receipt_handle.abort();
+        if let Some(h) = repair_handle {
+            h.abort();
+        }
         Ok(())
     }
 
@@ -527,8 +548,8 @@ impl SyncEngine {
                     .await?;
                 if enable_tracing {
                     let traces =
-                        super::trace::fetch_and_flatten_traces(&realtime_rpc, &all_txs).await?;
-                    sinks.write_internal_txs(&traces).await?;
+                        trace_txs(&realtime_rpc, &all_txs, DEFAULT_TRACE_ATTEMPTS).await;
+                    sinks.write_traces(&traces).await?;
                 }
                 let write_ms = write_start.elapsed().as_millis();
                 Ok::<_, anyhow::Error>(write_ms)
@@ -810,9 +831,8 @@ impl SyncEngine {
             .await?;
 
         if self.enable_tracing {
-            let traces =
-                super::trace::fetch_and_flatten_traces(&self.realtime_rpc, &all_txs).await?;
-            self.sinks.write_internal_txs(&traces).await?;
+            let traces = trace_txs(&self.realtime_rpc, &all_txs, DEFAULT_TRACE_ATTEMPTS).await;
+            self.sinks.write_traces(&traces).await?;
         }
 
         Ok(())
@@ -862,9 +882,8 @@ impl SyncEngine {
             .await?;
 
         if self.enable_tracing {
-            let traces =
-                super::trace::fetch_and_flatten_traces(&self.realtime_rpc, &txs).await?;
-            self.sinks.write_internal_txs(&traces).await?;
+            let traces = trace_txs(&self.realtime_rpc, &txs, DEFAULT_TRACE_ATTEMPTS).await;
+            self.sinks.write_traces(&traces).await?;
         }
 
         // Update sync state
@@ -999,6 +1018,7 @@ async fn run_gapfill_loop(
     batch_size: u64,
     concurrency: usize,
     head_delay_blocks: Arc<AtomicU64>,
+    enable_tracing: bool,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(sinks.pool(), chain_id)
@@ -1023,7 +1043,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, head_delay_blocks.load(Ordering::Relaxed), &mut progress) => {
+            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, head_delay_blocks.load(Ordering::Relaxed), enable_tracing, &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1046,6 +1066,7 @@ async fn tick_gapfill_parallel(
     batch_size: u64,
     concurrency: usize,
     head_delay_blocks: u64,
+    enable_tracing: bool,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let pool = sinks.pool();
@@ -1168,7 +1189,7 @@ async fn tick_gapfill_parallel(
                         );
                     }
                 };
-                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end, enable_tracing).await;
                 (start, end, result)
             });
         }
@@ -1252,7 +1273,7 @@ async fn tick_gapfill_parallel(
                                 );
                             }
                         };
-                        let result = sync_range_standalone(&sinks1, &rpc1, start, mid).await;
+                        let result = sync_range_standalone(&sinks1, &rpc1, start, mid, enable_tracing).await;
                         (start, mid, result)
                     });
 
@@ -1272,7 +1293,7 @@ async fn tick_gapfill_parallel(
                                 );
                             }
                         };
-                        let result = sync_range_standalone(&sinks2, &rpc2, mid + 1, end).await;
+                        let result = sync_range_standalone(&sinks2, &rpc2, mid + 1, end, enable_tracing).await;
                         (mid + 1, end, result)
                     });
                 } else {
@@ -1298,7 +1319,7 @@ async fn tick_gapfill_parallel(
                                 );
                             }
                         };
-                        let result = sync_range_standalone(&sinks, &rpc, start, end).await;
+                        let result = sync_range_standalone(&sinks, &rpc, start, end, enable_tracing).await;
                         (start, end, result)
                     });
                 }
@@ -1322,7 +1343,7 @@ async fn tick_gapfill_parallel(
                         );
                     }
                 };
-                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end, enable_tracing).await;
                 (start, end, result)
             });
         }
@@ -1366,6 +1387,7 @@ async fn tick_gapfill_parallel_no_throttle(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    enable_tracing: bool,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let pool = sinks.pool();
@@ -1425,7 +1447,7 @@ async fn tick_gapfill_parallel_no_throttle(
             let sinks = sinks.clone();
             let rpc = rpc.clone();
             join_set.spawn(async move {
-                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end, enable_tracing).await;
                 (start, end, result)
             });
         }
@@ -1474,7 +1496,7 @@ async fn tick_gapfill_parallel_no_throttle(
                     let rpc1 = rpc.clone();
                     join_set.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        let result = sync_range_standalone(&sinks1, &rpc1, start, mid).await;
+                        let result = sync_range_standalone(&sinks1, &rpc1, start, mid, enable_tracing).await;
                         (start, mid, result)
                     });
 
@@ -1483,7 +1505,7 @@ async fn tick_gapfill_parallel_no_throttle(
                     let rpc2 = rpc.clone();
                     join_set.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        let result = sync_range_standalone(&sinks2, &rpc2, mid + 1, end).await;
+                        let result = sync_range_standalone(&sinks2, &rpc2, mid + 1, end, enable_tracing).await;
                         (mid + 1, end, result)
                     });
                 } else {
@@ -1497,7 +1519,7 @@ async fn tick_gapfill_parallel_no_throttle(
                     let rpc = rpc.clone();
                     join_set.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let result = sync_range_standalone(&sinks, &rpc, start, end).await;
+                        let result = sync_range_standalone(&sinks, &rpc, start, end, enable_tracing).await;
                         (start, end, result)
                     });
                 }
@@ -1510,7 +1532,7 @@ async fn tick_gapfill_parallel_no_throttle(
             let sinks = sinks.clone();
             let rpc = rpc.clone();
             join_set.spawn(async move {
-                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end, enable_tracing).await;
                 (start, end, result)
             });
         }
@@ -1594,7 +1616,13 @@ fn next_backfill_num(prev: Option<u64>, lowest_block: u64) -> Option<u64> {
 }
 
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
-async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
+async fn sync_range_standalone(
+    sinks: &SinkSet,
+    rpc: &RpcClient,
+    from: u64,
+    to: u64,
+    enable_tracing: bool,
+) -> Result<()> {
     use super::decoder::{
         decode_block, decode_log, decode_receipt, decode_transaction, decode_withdrawals,
         enrich_txs_from_receipts, timestamp_from_secs,
@@ -1665,7 +1693,96 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         )
         .await?;
 
+    // Gap-filled blocks get the same trace treatment as realtime ones; before
+    // this, gap-fill silently produced blocks with no internal_txs and no
+    // record that they had never been traced.
+    if enable_tracing {
+        let traces = trace_txs(rpc, &all_txs, DEFAULT_TRACE_ATTEMPTS).await;
+        sinks.write_traces(&traces).await?;
+    }
+
     Ok(())
+}
+
+/// Trace repair loop. Every tick re-traces up to `TRACE_REPAIR_BATCH` txs that
+/// are `failed` (with attempts left) or never traced, within the last
+/// `TRACE_REPAIR_LOOKBACK` blocks below `synced_num`. Older history is left to
+/// `tidx backfill-traces`, which is explicit about its range and RPC cost.
+async fn run_trace_repair_loop(
+    sinks: SinkSet,
+    rpc: RpcClient,
+    chain_id: u64,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<()> {
+    info!(chain_id, "Trace repair: starting");
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = shutdown.recv() => {
+                info!(chain_id, "Trace repair: shutting down");
+                break;
+            }
+            result = tick_trace_repair(&sinks, &rpc, chain_id) => {
+                match result {
+                    Ok(0) => tokio::time::sleep(TRACE_REPAIR_IDLE).await,
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!(chain_id, error = %e, "Trace repair tick failed");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+const TRACE_REPAIR_LOOKBACK: u64 = 100_000;
+const TRACE_REPAIR_BATCH: i64 = 200;
+const TRACE_REPAIR_MAX_ATTEMPTS: i32 = 12;
+/// A failed tx is not retried sooner than this, so an RPC outage costs one
+/// pass per window instead of the whole attempt budget.
+const TRACE_REPAIR_RETRY_AFTER_SECS: i64 = 600;
+const TRACE_REPAIR_IDLE: Duration = Duration::from_secs(60);
+
+/// One repair pass; returns how many txs it traced SUCCESSFULLY, so a pass
+/// where everything failed (RPC down) idles like an empty one instead of
+/// re-ticking immediately.
+async fn tick_trace_repair(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) -> Result<usize> {
+    let pool = sinks.pool();
+    let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
+    let to = state.synced_num as i64;
+    let from = state.synced_num.saturating_sub(TRACE_REPAIR_LOOKBACK) as i64;
+    let txs = load_txs_for_trace_repair(
+        pool,
+        from,
+        to,
+        TRACE_REPAIR_MAX_ATTEMPTS,
+        TRACE_REPAIR_RETRY_AFTER_SECS,
+        TRACE_REPAIR_BATCH,
+    )
+    .await?;
+    if txs.is_empty() {
+        return Ok(0);
+    }
+    let batch = trace_txs(rpc, &txs, DEFAULT_TRACE_ATTEMPTS).await;
+    let failed = batch
+        .outcomes
+        .iter()
+        .filter(|o| o.status == super::trace::TraceStatus::Failed)
+        .count();
+    sinks.write_traces(&batch).await?;
+    info!(
+        chain_id,
+        from,
+        to,
+        txs = txs.len(),
+        frames = batch.rows.len(),
+        failed,
+        "Trace repair: pass complete"
+    );
+    Ok(txs.len() - failed)
 }
 
 /// Receipt backfill loop: repairs any blocks missing receipts/logs.

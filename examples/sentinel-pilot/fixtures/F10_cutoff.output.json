@@ -1,0 +1,24 @@
+{
+  "outcome": "ok",
+  "http_status": 200,
+  "wall_ms": 35.4,
+  "attempted_at": "2026-09-28T20:16:59Z",
+  "response": {
+    "columns": [
+      "cutoff",
+      "cutoff_hash",
+      "cutoff_ts"
+    ],
+    "rows": [
+      [
+        17964796,
+        "0xa774b37de90f292856561227488b648929210fd477df57fc5d0935d99837a7b5",
+        "2026-09-28T17:58:34+00:00"
+      ]
+    ],
+    "row_count": 1,
+    "engine": "postgres",
+    "query_time_ms": 0.49332499999999996,
+    "ok": true
+  }
+}

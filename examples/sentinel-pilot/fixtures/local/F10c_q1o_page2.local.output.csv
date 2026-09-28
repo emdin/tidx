@@ -1,0 +1,2 @@
+chain_id,reorg_id,orphaned_at,block_num,block_hash,block_timestamp,tx_hash,tx_index,event_kind,log_index,trace_path,from_address,to_address,matched_watch_address,direction,amount_raw,status
+38833,999,2026-09-28 19:41:26.392091+00,999003,\xdead000000000000000000000000000000000000000000000000000000999003,2026-09-28 12:00:02+00,\xfeed000000000000000000000000000000000000000000000000000000000005,1,native,,,\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,\x1717171717171717171717171717171717171717,\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,out,7,1

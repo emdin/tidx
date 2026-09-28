@@ -1,0 +1,35 @@
+{
+  "outcome": "ok",
+  "http_status": 200,
+  "wall_ms": 30.5,
+  "attempted_at": "2026-09-28T20:16:58Z",
+  "response": {
+    "columns": [
+      "chain_id",
+      "block_num",
+      "block_hash",
+      "block_timestamp",
+      "tx_hash",
+      "tx_index",
+      "event_kind",
+      "log_index",
+      "trace_path",
+      "from_address",
+      "to_address",
+      "matched_watch_address",
+      "direction",
+      "asset_kind",
+      "token_address",
+      "amount_raw",
+      "decimals",
+      "called_contract",
+      "selector",
+      "status"
+    ],
+    "rows": [],
+    "row_count": 0,
+    "engine": "postgres",
+    "query_time_ms": 1.467287,
+    "ok": true
+  }
+}

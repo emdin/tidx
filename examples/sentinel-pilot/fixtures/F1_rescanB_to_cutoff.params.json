@@ -1,0 +1,12 @@
+{
+  "WATCHED": [
+    "0x13f197c71474a60cc8b1973ff8f8d4eab3430bd5"
+  ],
+  "BLOCK_LO": 17959343,
+  "BLOCK_HI": 17959360,
+  "TS_LO": "2026-09-28T16:17:00+00:00",
+  "CUR_BLOCK": -1,
+  "CUR_TX": -1,
+  "CUR_LOG": -1,
+  "PAGE_PLUS_1": 101
+}

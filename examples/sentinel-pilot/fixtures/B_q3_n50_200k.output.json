@@ -1,0 +1,34 @@
+{
+  "outcome": "ok",
+  "http_status": 200,
+  "wall_ms": 493.5,
+  "attempted_at": "2026-09-28T19:14:52Z",
+  "response": {
+    "columns": [
+      "chain_id",
+      "block_num",
+      "block_hash",
+      "block_timestamp",
+      "tx_hash",
+      "tx_index",
+      "event_kind",
+      "log_index",
+      "trace_path",
+      "from_address",
+      "to_address",
+      "matched_watch_address",
+      "direction",
+      "asset_kind",
+      "token_address",
+      "amount_raw",
+      "decimals",
+      "called_contract",
+      "selector"
+    ],
+    "row_count": 5537,
+    "engine": "postgres",
+    "query_time_ms": 261.987621,
+    "ok": true,
+    "rows": "<5537 rows omitted from the repo copy; reproducible via run.py>"
+  }
+}

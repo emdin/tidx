@@ -15,6 +15,7 @@ const ALLOWED_TABLES: &[&str] = &[
     "receipts",
     "l2_withdrawals",
     "internal_txs",
+    "trace_outcomes",
     "kaspa_provenance_meta",
     "kaspa_sync_state",
     "kaspa_provenance_gaps",
