@@ -1,0 +1,14 @@
+{
+  "sql_file": "sql/q0b_pin_check.sql",
+  "params": {
+    "PINNED_BLOCK": 17976809
+  },
+  "rendered_sql": "-- Q0b: reorg detection on resume / before each poll. Compare to the stored\n-- hash for the pinned block. Same -> continue from the checkpoint. Different ->\n-- everything observed above the fork point must be replayed (q0c lists what\n-- was orphaned) and prior alerts in that range corrected, not silently dropped.\n-- Also fetch TS_LO for a window with this query (num = BLOCK_LO).\nSELECT num, hash, timestamp\nFROM blocks\nWHERE num = 17976809\n",
+  "request": {
+    "sql": "-- Q0b: reorg detection on resume / before each poll. Compare to the stored\n-- hash for the pinned block. Same -> continue from the checkpoint. Different ->\n-- everything observed above the fork point must be replayed (q0c lists what\n-- was orphaned) and prior alerts in that range corrected, not silently dropped.\n-- Also fetch TS_LO for a window with this query (num = BLOCK_LO).\nSELECT num, hash, timestamp\nFROM blocks\nWHERE num = 17976809\n",
+    "chainId": 38833,
+    "timeout_ms": 30000,
+    "engine": "postgres"
+  },
+  "attempted_at": "2026-09-28T22:14:27Z"
+}
