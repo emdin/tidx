@@ -1705,7 +1705,7 @@ async fn sync_range_standalone(
 }
 
 /// Trace repair loop. Every tick re-traces up to `TRACE_REPAIR_BATCH` txs that
-/// are `failed` (with attempts left) or never traced, within the last
+/// are `failed` (once their backoff has elapsed) or never traced, within the last
 /// `TRACE_REPAIR_LOOKBACK` blocks below `synced_num`. Older history is left to
 /// `tidx backfill-traces`, which is explicit about its range and RPC cost.
 async fn run_trace_repair_loop(
@@ -1740,9 +1740,8 @@ async fn run_trace_repair_loop(
 
 const TRACE_REPAIR_LOOKBACK: u64 = 100_000;
 const TRACE_REPAIR_BATCH: i64 = 200;
-const TRACE_REPAIR_MAX_ATTEMPTS: i32 = 12;
-/// A failed tx is not retried sooner than this, so an RPC outage costs one
-/// pass per window instead of the whole attempt budget.
+/// Base retry delay for a failed tx; doubles per failed pass, capped at a day
+/// (see `load_txs_for_trace_repair`). No attempt cap: the loop never gives up.
 const TRACE_REPAIR_RETRY_AFTER_SECS: i64 = 600;
 const TRACE_REPAIR_IDLE: Duration = Duration::from_secs(60);
 
@@ -1758,7 +1757,7 @@ async fn tick_trace_repair(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) -> R
         pool,
         from,
         to,
-        TRACE_REPAIR_MAX_ATTEMPTS,
+        i32::MAX,
         TRACE_REPAIR_RETRY_AFTER_SECS,
         TRACE_REPAIR_BATCH,
     )

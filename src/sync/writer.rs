@@ -549,10 +549,13 @@ fn tx_row_from(r: &tokio_postgres::Row) -> TxRow {
 }
 
 /// Txs in `[from, to]` that still need a trace: never traced (no outcome row)
-/// or `failed` with fewer than `max_attempts` cumulative attempts AND last
-/// tried more than `retry_after_secs` ago. The age gate is what stops an RPC
-/// outage from burning a tx's whole attempt budget in seconds and stranding
-/// it. Oldest first, at most `limit`.
+/// or `failed` with fewer than `max_attempts` cumulative attempts and whose
+/// backoff has elapsed. Backoff doubles per failed pass (a pass is
+/// `DEFAULT_TRACE_ATTEMPTS` = 3 attempts): `retry_after_secs * 2^(passes-1)`,
+/// capped at one day, so an RPC outage costs a few passes rather than the
+/// whole budget, and a tx is never abandoned by the repair loop. Pass
+/// `retry_after_secs = 0` to ignore the backoff (explicit operator runs).
+/// Oldest first, at most `limit`.
 pub async fn load_txs_for_trace_repair(
     pool: &Pool,
     from: i64,
@@ -569,7 +572,9 @@ pub async fn load_txs_for_trace_repair(
           WHERE t.block_num BETWEEN $1 AND $2
             AND (o.tx_hash IS NULL
                  OR (o.outcome = 'failed' AND o.attempts < $3
-                     AND o.traced_at < now() - ($4::int8 * interval '1 second')))
+                     AND o.traced_at < now() - least(
+                           $4::int8 * power(2, greatest(o.attempts / 3 - 1, 0))::int8,
+                           86400) * interval '1 second'))
           ORDER BY t.block_num, t.idx
           LIMIT $5"
     );

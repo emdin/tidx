@@ -62,8 +62,8 @@ pub struct Args {
     #[arg(long)]
     pub mark_existing: bool,
 
-    /// Skip `failed` txs whose cumulative attempts reached this many.
-    #[arg(long, default_value = "12")]
+    /// Skip `failed` txs whose cumulative attempts reached this many (default: no cap).
+    #[arg(long, default_value_t = i32::MAX)]
     pub max_attempts: i32,
 }
 

@@ -256,6 +256,47 @@ async fn repair_selection_picks_failed_and_untraced_only() {
 }
 
 // ---------------------------------------------------------------------------
+// repair backoff: delay doubles per failed pass (3 attempts), capped at 24 h
+// ---------------------------------------------------------------------------
+
+async fn set_failed(pool: &Pool, tag: u8, block: i64, attempts: i32, ago_secs: i64) {
+    write_trace_outcomes(pool, &[outcome(tag, block, TraceStatus::Failed, 0, attempts, Some("x"))]).await.unwrap();
+    pool.get().await.unwrap()
+        .execute(
+            "UPDATE trace_outcomes SET attempts = $2, traced_at = now() - ($3::int8 * interval '1 second') WHERE tx_hash = $1",
+            &[&vec![tag; 32], &attempts, &ago_secs],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn repair_backoff_doubles_per_pass_and_caps_at_a_day() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    db.pool.get().await.unwrap().batch_execute("TRUNCATE trace_outcomes, internal_txs").await.unwrap();
+    seed_block_with_txs(&db.pool, 400, &[0x41, 0x42, 0x43, 0x44, 0x45, 0x46]).await;
+
+    // base 600 s. passes = attempts / 3; delay = 600 * 2^(passes-1), max 86 400.
+    set_failed(&db.pool, 0x41, 400, 3, 11 * 60).await;          // 1 pass, due after 10 min  -> due
+    set_failed(&db.pool, 0x42, 400, 6, 15 * 60).await;          // 2 passes, due after 20 min -> NOT due
+    set_failed(&db.pool, 0x43, 400, 6, 21 * 60).await;          // 2 passes, 21 min           -> due
+    set_failed(&db.pool, 0x44, 400, 12, 79 * 60).await;         // 4 passes, due after 80 min -> NOT due
+    set_failed(&db.pool, 0x45, 400, 60, 23 * 3600).await;       // 20 passes, capped at 24 h  -> NOT due
+    set_failed(&db.pool, 0x46, 400, 60, 25 * 3600).await;       // capped, 25 h               -> due (no attempt cap)
+
+    let picked = load_txs_for_trace_repair(&db.pool, 400, 400, i32::MAX, 600, 1000).await.unwrap();
+    let mut tags: Vec<u8> = picked.iter().map(|t| t.hash[0]).collect();
+    tags.sort();
+    assert_eq!(tags, vec![0x41, 0x43, 0x46]);
+
+    // an explicit operator run (base 0) ignores the backoff entirely
+    let picked = load_txs_for_trace_repair(&db.pool, 400, 400, i32::MAX, 0, 1000).await.unwrap();
+    assert_eq!(picked.len(), 6);
+}
+
+// ---------------------------------------------------------------------------
 // mark_existing_traces: frames present ⇒ ok, no RPC; nothing else touched
 // ---------------------------------------------------------------------------
 
