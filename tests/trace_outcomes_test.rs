@@ -156,6 +156,46 @@ async fn trace_txs_records_ok_empty_and_failed_with_retries() {
     assert_eq!(calls[&hex(0x04)], 3, "bounded by max_attempts");
 }
 
+#[tokio::test]
+async fn trace_falls_back_to_secondary_rpc_when_primary_errors() {
+    // Primary node answers "block not found" for 0x11/0x12 (stale tx index after
+    // a short reorg); the secondary has the canonical block. 0x13 is fine on
+    // the primary and must never touch the fallback.
+    let (primary, primary_fake) = start_fake(HashMap::from([
+        (hex(0x11), vec![]),
+        (hex(0x12), vec![]),
+        (hex(0x13), vec![Ok(frame(1))]),
+    ]))
+    .await;
+    let (secondary, secondary_fake) = start_fake(HashMap::from([
+        (hex(0x11), vec![Ok(frame(2))]),
+        (hex(0x12), vec![]),
+    ]))
+    .await;
+    let rpc = primary.with_trace_fallback(secondary);
+    let txs = vec![tx(20, 0, 0x11), tx(20, 1, 0x12), tx(20, 2, 0x13)];
+
+    let batch = trace_txs(&rpc, &txs, 2).await;
+
+    let by_hash: HashMap<Vec<u8>, &TraceOutcome> =
+        batch.outcomes.iter().map(|o| (o.tx_hash.clone(), o)).collect();
+    let o11 = by_hash[&vec![0x11; 32]];
+    assert_eq!((o11.status, o11.frames, o11.attempts), (TraceStatus::Ok, 2, 1));
+    let o12 = by_hash[&vec![0x12; 32]];
+    assert_eq!((o12.status, o12.attempts), (TraceStatus::Failed, 2));
+    let err = o12.error.as_deref().unwrap_or("");
+    assert!(err.contains("fallback"), "both endpoints' errors are recorded: {err}");
+    let o13 = by_hash[&vec![0x13; 32]];
+    assert_eq!((o13.status, o13.frames), (TraceStatus::Ok, 1));
+
+    let p = primary_fake.calls.lock().await;
+    let s = secondary_fake.calls.lock().await;
+    assert_eq!((p[&hex(0x11)], s[&hex(0x11)]), (1, 1));
+    assert_eq!((p[&hex(0x12)], s[&hex(0x12)]), (2, 2), "fallback tried on every attempt");
+    assert_eq!(p[&hex(0x13)], 1);
+    assert!(!s.contains_key(&hex(0x13)), "healthy primary never hits the fallback");
+}
+
 // ---------------------------------------------------------------------------
 // write_trace_outcomes: upsert semantics
 // ---------------------------------------------------------------------------

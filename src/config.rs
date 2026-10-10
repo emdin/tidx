@@ -106,6 +106,11 @@ pub struct ChainConfig {
     /// RPC URL
     pub rpc_url: String,
 
+    /// Optional second RPC used only when `debug_traceTransaction` fails on
+    /// `rpc_url`.
+    #[serde(default)]
+    pub trace_fallback_rpc_url: Option<String>,
+
     /// Database connection URL for this chain.
     /// If `pg_password_env` is set, the password in this URL will be replaced
     /// with the value from that environment variable.
@@ -445,6 +450,22 @@ mod tests {
         assert_eq!(config.max_head_delay_blocks, 100);
         assert_eq!(config.head_delay_window_secs, 600);
         assert_eq!(config.concurrency, 4);
+        assert_eq!(config.trace_fallback_rpc_url, None);
+    }
+
+    #[test]
+    fn test_trace_fallback_rpc_url_parses() {
+        let config: ChainConfig = toml::from_str(
+            r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            trace_fallback_rpc_url = "https://rpc.example:8545"
+            pg_url = "postgres://localhost/test"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.trace_fallback_rpc_url.as_deref(), Some("https://rpc.example:8545"));
     }
 
     #[test]
@@ -532,6 +553,7 @@ mod tests {
             name: "test".to_string(),
             chain_id: 1,
             rpc_url: "http://localhost:8545".to_string(),
+            trace_fallback_rpc_url: None,
             pg_url: "postgres://user:pass@localhost/db".to_string(),
             pg_password_env: None,
             backfill: true,
@@ -562,6 +584,7 @@ mod tests {
             name: "test".to_string(),
             chain_id: 1,
             rpc_url: "http://localhost:8545".to_string(),
+            trace_fallback_rpc_url: None,
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
             pg_password_env: Some("PATH".to_string()),
             backfill: true,
@@ -591,6 +614,7 @@ mod tests {
             name: "test".to_string(),
             chain_id: 1,
             rpc_url: "http://localhost:8545".to_string(),
+            trace_fallback_rpc_url: None,
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
             pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
             backfill: true,

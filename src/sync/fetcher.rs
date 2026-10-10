@@ -44,6 +44,11 @@ pub struct RpcClient {
     concurrency_limiter: Arc<Semaphore>,
     /// Learned receipt strategy for the current RPC endpoint.
     receipt_fetch_mode: Arc<AtomicU8>,
+    /// Second endpoint for `debug_traceTransaction` only. A node can answer
+    /// "block not found" for a tx it briefly indexed under a non-canonical
+    /// block while another node traces it fine; JSON-RPC errors come back as
+    /// HTTP 200, so an HTTP-level failover proxy never switches.
+    trace_fallback: Option<Arc<RpcClient>>,
 }
 
 #[derive(Serialize)]
@@ -88,7 +93,13 @@ impl RpcClient {
             log_chunk_size: Arc::new(AtomicU64::new(1000)),
             concurrency_limiter: Arc::new(Semaphore::new(max_concurrent)),
             receipt_fetch_mode: Arc::new(AtomicU8::new(ReceiptFetchMode::Unknown as u8)),
+            trace_fallback: None,
         }
+    }
+
+    pub fn with_trace_fallback(mut self, fallback: RpcClient) -> Self {
+        self.trace_fallback = Some(Arc::new(fallback));
+        self
     }
 
     /// Returns the number of available permits (for monitoring)
@@ -152,6 +163,22 @@ impl RpcClient {
     /// `tracerConfig` with `onlyTopCall: false` so nested frames are included
     /// (we drop the top-level frame ourselves; it's already in `txs`).
     pub async fn trace_transaction(
+        &self,
+        tx_hash: &str,
+    ) -> Result<crate::sync::trace::CallFrame> {
+        match self.trace_transaction_once(tx_hash).await {
+            Ok(frame) => Ok(frame),
+            Err(primary) => match &self.trace_fallback {
+                Some(fallback) => fallback
+                    .trace_transaction_once(tx_hash)
+                    .await
+                    .map_err(|e| anyhow!("{primary}; fallback: {e}")),
+                None => Err(primary),
+            },
+        }
+    }
+
+    async fn trace_transaction_once(
         &self,
         tx_hash: &str,
     ) -> Result<crate::sync::trace::CallFrame> {
