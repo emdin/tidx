@@ -214,6 +214,20 @@ impl SyncEngine {
         self
     }
 
+    pub fn with_trace_fallback(mut self, url: Option<&str>) -> Self {
+        if let Some(url) = url {
+            self.realtime_rpc = self.realtime_rpc.with_trace_fallback(RpcClient::with_concurrency(
+                url,
+                REALTIME_RPC_CONCURRENCY,
+            ));
+            self.backfill_rpc = self.backfill_rpc.with_trace_fallback(RpcClient::with_concurrency(
+                url,
+                BACKFILL_RPC_CONCURRENCY,
+            ));
+        }
+        self
+    }
+
     pub fn with_tracing(mut self, enable: bool) -> Self {
         self.enable_tracing = enable;
         self

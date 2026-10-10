@@ -115,7 +115,10 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let rpc = RpcClient::new(&chain.rpc_url);
+    let mut rpc = RpcClient::new(&chain.rpc_url);
+    if let Some(url) = &chain.trace_fallback_rpc_url {
+        rpc = rpc.with_trace_fallback(RpcClient::new(url));
+    }
 
     info!(
         chain = %chain.name,

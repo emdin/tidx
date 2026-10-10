@@ -437,6 +437,7 @@ fn spawn_sync_engine(
                             chain.head_delay_window_secs,
                         )
                         .with_trust_rpc(trust_rpc)
+                        .with_trace_fallback(chain.trace_fallback_rpc_url.as_deref())
                         .with_tracing(enable_tracing);
                 }
                 Err(e) => {
