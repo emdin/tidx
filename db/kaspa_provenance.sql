@@ -108,6 +108,26 @@ ALTER TABLE kaspa_l2_submissions
     ADD COLUMN IF NOT EXISTS l1_fee_sompi         INT8,
     ADD COLUMN IF NOT EXISTS l1_fee_enriched_at   TIMESTAMPTZ;
 
+-- Kaspa acceptance order, from the same api.kaspa.org batch response as the
+-- senders. An L2 tx can have several L1 carriers; the accepting block's blue
+-- score orders them (equal scores = accepted by the same chain block).
+ALTER TABLE kaspa_entries
+    ADD COLUMN IF NOT EXISTS accepting_block_hash BYTEA,
+    ADD COLUMN IF NOT EXISTS accepting_blue_score INT8;
+
+ALTER TABLE kaspa_l2_submissions
+    ADD COLUMN IF NOT EXISTS accepting_block_hash BYTEA,
+    ADD COLUMN IF NOT EXISTS accepting_blue_score INT8;
+
+-- Batch enrichment pages newest-first on (created_at, kaspa_txid). Without
+-- this every 500-row page is a full scan (6.5 s on 7.9M rows). Build it
+-- CONCURRENTLY by hand on large existing tables before upgrading; this
+-- statement is then a no-op.
+CREATE INDEX IF NOT EXISTS idx_kaspa_l2_submissions_created_at
+    ON kaspa_l2_submissions (created_at, kaspa_txid);
+CREATE INDEX IF NOT EXISTS idx_kaspa_entries_created_at
+    ON kaspa_entries (created_at, kaspa_txid);
+
 CREATE INDEX IF NOT EXISTS idx_kaspa_entries_fee_pending
     ON kaspa_entries (kaspa_txid)
     WHERE l1_fee_sompi IS NULL;
