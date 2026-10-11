@@ -54,6 +54,10 @@ pub struct Args {
     /// Don't write; only count what would be enriched (skips DB pool entirely).
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Only L2 txs carried by more than one L1 tx (submissions table only).
+    #[arg(long)]
+    pub multi_carrier_only: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -88,7 +92,8 @@ pub async fn run(args: Args) -> Result<()> {
         "enrich-l1-senders starting");
 
     let do_subs = args.table == "both" || args.table == "submissions";
-    let do_entries = args.table == "both" || args.table == "entries";
+    let do_entries =
+        (args.table == "both" || args.table == "entries") && !args.multi_carrier_only;
 
     if do_subs {
         enrich_table(
@@ -99,6 +104,7 @@ pub async fn run(args: Args) -> Result<()> {
             args.concurrency,
             args.batch_size,
             args.max_rows,
+            args.multi_carrier_only,
         )
         .await?;
     }
@@ -111,6 +117,7 @@ pub async fn run(args: Args) -> Result<()> {
             args.concurrency,
             args.batch_size,
             args.max_rows,
+            false,
         )
         .await?;
     }

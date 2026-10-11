@@ -71,6 +71,11 @@ pub struct ApiTransaction {
     pub inputs: Vec<ApiInput>,
     #[serde(default)]
     pub outputs: Vec<ApiOutput>,
+    /// Chain block that accepted the tx; absent while unaccepted.
+    #[serde(default)]
+    pub accepting_block_hash: Option<String>,
+    #[serde(default)]
+    pub accepting_block_blue_score: Option<i64>,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq)]
@@ -129,6 +134,9 @@ pub fn build_search_body(txids: &[Vec<u8>]) -> String {
 /// that already has senders but no fee gets its fee filled without
 /// re-touching the sender data (and vice versa). Matching WHERE clause
 /// picks up rows missing EITHER field.
+/// Rows the batch enrichment still has work for.
+const PENDING: &str = "l1_senders IS NULL OR l1_fee_sompi IS NULL OR accepting_blue_score IS NULL";
+
 pub fn build_update_sql(table: &str) -> String {
     format!(
         "UPDATE {table}
@@ -136,9 +144,11 @@ pub fn build_update_sql(table: &str) -> String {
              l1_sender_amounts_sompi = COALESCE(l1_sender_amounts_sompi, $3),
              l1_enriched_at          = COALESCE(l1_enriched_at, now()),
              l1_fee_sompi            = COALESCE(l1_fee_sompi, $4),
-             l1_fee_enriched_at      = COALESCE(l1_fee_enriched_at, now())
+             l1_fee_enriched_at      = COALESCE(l1_fee_enriched_at, now()),
+             accepting_block_hash    = COALESCE(accepting_block_hash, $5),
+             accepting_blue_score    = COALESCE(accepting_blue_score, $6)
          WHERE kaspa_txid = $1
-           AND (l1_senders IS NULL OR l1_fee_sompi IS NULL)"
+           AND ({PENDING})"
     )
 }
 
@@ -167,6 +177,9 @@ pub struct EnrichedTx {
     /// `None` for coinbase (no inputs) — the caller skips writing the fee
     /// column in that case.
     pub fee_sompi: Option<i64>,
+    /// Orders multiple L1 carriers of one L2 tx (lower = accepted earlier).
+    pub accepting_block_hash: Option<Vec<u8>>,
+    pub accepting_blue_score: Option<i64>,
 }
 
 /// Fetch one tx's resolved sender + output data from api.kaspa.org and
@@ -263,7 +276,13 @@ fn extract_enriched(tx: &ApiTransaction) -> EnrichedTx {
         sender_amounts.push(input.previous_outpoint_amount.unwrap_or(0));
     }
     let fee_sompi = compute_fee_from_api_tx(tx);
-    EnrichedTx { senders, sender_amounts, fee_sompi }
+    EnrichedTx {
+        senders,
+        sender_amounts,
+        fee_sompi,
+        accepting_block_hash: tx.accepting_block_hash.as_deref().and_then(|h| hex::decode(h).ok()),
+        accepting_blue_score: tx.accepting_block_blue_score,
+    }
 }
 
 /// Fetch a whole batch of txs via `POST /transactions/search`. Returns a
@@ -392,8 +411,18 @@ pub async fn enrich_table(
     _concurrency: usize,
     batch_size: usize,
     max_rows: Option<usize>,
+    multi_carrier_only: bool,
 ) -> Result<EnrichmentStats> {
-    info!(table = %table, "starting enrichment scan (batch mode)");
+    info!(table = %table, multi_carrier_only, "starting enrichment scan (batch mode)");
+    // Restrict to L2 txs carried by more than one L1 tx (submissions only):
+    // the rows whose acceptance order consumers need first.
+    let scope = if multi_carrier_only {
+        format!(
+            "AND l2_tx_hash IN (SELECT l2_tx_hash FROM {table} GROUP BY l2_tx_hash HAVING count(*) > 1)"
+        )
+    } else {
+        String::new()
+    };
     let mut stats = EnrichmentStats::default();
     let search_url = build_search_url(rest_base);
     let req_batch = batch_size.clamp(1, MAX_SEARCH_BATCH);
@@ -407,7 +436,7 @@ pub async fn enrich_table(
                 conn.query(
                     &format!(
                         "SELECT kaspa_txid, created_at FROM {table}
-                         WHERE l1_senders IS NULL OR l1_fee_sompi IS NULL
+                         WHERE ({PENDING}) {scope}
                          ORDER BY created_at DESC, kaspa_txid DESC
                          LIMIT $1"
                     ),
@@ -419,7 +448,7 @@ pub async fn enrich_table(
                 conn.query(
                     &format!(
                         "SELECT kaspa_txid, created_at FROM {table}
-                         WHERE (l1_senders IS NULL OR l1_fee_sompi IS NULL)
+                         WHERE ({PENDING}) {scope}
                            AND (created_at, kaspa_txid) < ($2, $3)
                          ORDER BY created_at DESC, kaspa_txid DESC
                          LIMIT $1"
@@ -463,7 +492,14 @@ pub async fn enrich_table(
                     for (txid, e) in &updates {
                         tx.execute(
                             &sql,
-                            &[&txid.as_slice(), &e.senders, &e.sender_amounts, &e.fee_sompi],
+                            &[
+                                &txid.as_slice(),
+                                &e.senders,
+                                &e.sender_amounts,
+                                &e.fee_sompi,
+                                &e.accepting_block_hash,
+                                &e.accepting_blue_score,
+                            ],
                         )
                         .await?;
                     }
@@ -541,6 +577,26 @@ mod tests {
             Some("kaspa:qq5xkhfdmm4zzwc25udlmkcg24vefhc54snklphd3slrvcrexspcg40fvxxh4")
         );
         assert_eq!(parsed.inputs[0].previous_outpoint_amount, Some(10985439355));
+    }
+
+    #[test]
+    fn extracts_acceptance_order_from_batch_response() {
+        let json = r#"{
+            "transaction_id": "97b12b17",
+            "inputs": [],
+            "outputs": [],
+            "accepting_block_hash": "02d06de6f88584b9e7d5f0d835f82cc33ff009c90dfa8559f84e482ba4d1d9e1",
+            "accepting_block_blue_score": 561270990
+        }"#;
+        let e = extract_enriched(&serde_json::from_str(json).unwrap());
+        assert_eq!(
+            e.accepting_block_hash.as_deref().map(hex::encode).as_deref(),
+            Some("02d06de6f88584b9e7d5f0d835f82cc33ff009c90dfa8559f84e482ba4d1d9e1")
+        );
+        assert_eq!(e.accepting_blue_score, Some(561270990));
+
+        let unaccepted = extract_enriched(&serde_json::from_str(r#"{"inputs": []}"#).unwrap());
+        assert_eq!((unaccepted.accepting_block_hash, unaccepted.accepting_blue_score), (None, None));
     }
 
     #[test]
@@ -724,6 +780,8 @@ mod tests {
                 previous_outpoint_amount: Some(1000),
             }],
             outputs: vec![ApiOutput { amount: Some(900) }],
+            accepting_block_hash: None,
+            accepting_block_blue_score: None,
         };
         assert_eq!(compute_fee_from_api_tx(&tx), Some(100));
     }
@@ -733,6 +791,8 @@ mod tests {
         let tx = ApiTransaction { transaction_id: None,
             inputs: vec![],
             outputs: vec![ApiOutput { amount: Some(50_000_000_000) }],
+            accepting_block_hash: None,
+            accepting_block_blue_score: None,
         };
         assert_eq!(compute_fee_from_api_tx(&tx), None);
     }
@@ -746,6 +806,8 @@ mod tests {
                 previous_outpoint_amount: Some(100),
             }],
             outputs: vec![ApiOutput { amount: Some(200) }],
+            accepting_block_hash: None,
+            accepting_block_blue_score: None,
         };
         assert_eq!(compute_fee_from_api_tx(&tx), None);
     }
@@ -758,6 +820,8 @@ mod tests {
                 previous_outpoint_amount: Some(1000),
             }],
             outputs: vec![ApiOutput { amount: Some(1000) }],
+            accepting_block_hash: None,
+            accepting_block_blue_score: None,
         };
         assert_eq!(compute_fee_from_api_tx(&tx), Some(0));
     }
