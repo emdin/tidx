@@ -333,8 +333,36 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
             .try_get::<_, bool>(idx)
             .ok()
             .map_or(serde_json::Value::Null, serde_json::Value::Bool),
+        "_int2" => array_json::<i16>(row, idx, |v| v.into()),
+        "_int4" => array_json::<i32>(row, idx, |v| v.into()),
+        "_int8" => array_json::<i64>(row, idx, |v| v.into()),
+        "_text" | "_varchar" => array_json::<String>(row, idx, serde_json::Value::String),
+        "_bool" => array_json::<bool>(row, idx, serde_json::Value::Bool),
+        "_bytea" => array_json::<Vec<u8>>(row, idx, |v| {
+            serde_json::Value::String(format!("0x{}", hex::encode(v)))
+        }),
         _ => serde_json::Value::Null,
     }
+}
+
+fn array_json<T>(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    to_json: impl Fn(T) -> serde_json::Value,
+) -> serde_json::Value
+where
+    T: for<'a> tokio_postgres::types::FromSql<'a>,
+{
+    row.try_get::<_, Vec<Option<T>>>(idx)
+        .ok()
+        .map_or(serde_json::Value::Null, |items| {
+            serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| v.map_or(serde_json::Value::Null, &to_json))
+                    .collect(),
+            )
+        })
 }
 
 pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
