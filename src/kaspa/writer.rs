@@ -304,10 +304,13 @@ impl KaspaProvenanceWriter {
                     DELETE FROM kaspa_pending_l2_submissions p
                     USING due d
                     WHERE p.kaspa_txid = d.kaspa_txid
-                      AND EXISTS (
-                        SELECT 1 FROM kaspa_l2_submissions f
-                        WHERE f.kaspa_txid = p.kaspa_txid
-                      )
+                      -- CTEs share one snapshot: EXISTS cannot see rows
+                      -- `inserted` just wrote, so check both.
+                      AND (p.kaspa_txid IN (SELECT kaspa_txid FROM inserted)
+                        OR EXISTS (
+                          SELECT 1 FROM kaspa_l2_submissions f
+                          WHERE f.kaspa_txid = p.kaspa_txid
+                        ))
                  )
                  SELECT l2_tx_hash, kaspa_txid, created_at FROM inserted",
                 &[],
@@ -331,10 +334,11 @@ impl KaspaProvenanceWriter {
                     DELETE FROM kaspa_pending_entries p
                     USING due d
                     WHERE p.kaspa_txid = d.kaspa_txid
-                      AND EXISTS (
-                        SELECT 1 FROM kaspa_entries f
-                        WHERE f.kaspa_txid = p.kaspa_txid
-                      )
+                      AND (p.kaspa_txid IN (SELECT kaspa_txid FROM inserted)
+                        OR EXISTS (
+                          SELECT 1 FROM kaspa_entries f
+                          WHERE f.kaspa_txid = p.kaspa_txid
+                        ))
                  )
                  SELECT kaspa_txid, recipient, amount_sompi, created_at FROM inserted",
                 &[],

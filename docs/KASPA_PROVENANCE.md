@@ -17,7 +17,7 @@ rpc_url = "ws://host.docker.internal:17111"
 txid_prefix = "97b1"
 poll_interval_ms = 1000
 initial_tip_distance = 100
-promotion_delay_secs = 43200
+promotion_delay_secs = 60
 ```
 
 Use Borsh wRPC locally. The staging Kaspa node exposes:
