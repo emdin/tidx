@@ -243,8 +243,14 @@ fn default_kaspa_tip_distance() -> u64 {
     100
 }
 
+/// Reorgs only evict rows while they are pending. Sync already reads
+/// `initial_tip_distance` blocks behind the virtual tip (~10 s at 10 BPS), and
+/// in prod 2026-10 no reorg ever removed a pending row, so one minute keeps
+/// the guard while making L2→L1 links final about as fast as the L2 engine
+/// (head_delay 30 blocks ≈ 30 s). The 12 h value it replaces held every
+/// link back for half a day.
 fn default_kaspa_promotion_delay_secs() -> u64 {
-    43_200
+    60
 }
 
 /// Configuration for ClickHouse OLAP engine

@@ -251,7 +251,7 @@ enabled = true
 rpc_url = "ws://host.docker.internal:17111"
 txid_prefix = "97b1"
 initial_tip_distance = 100
-promotion_delay_secs = 43200
+promotion_delay_secs = 60
 ```
 
 Start all services:
@@ -436,7 +436,7 @@ Kaspa finality behavior:
 
 - matching Igra Kaspa payloads first enter `kaspa_pending_entries` / `kaspa_pending_l2_submissions`
 - explorer shows pending rows as `Pending finality until ...`
-- after `promotion_delay_secs = 43200`, pending rows promote to `kaspa_entries` / `kaspa_l2_submissions`
+- after `promotion_delay_secs = 60`, pending rows promote to `kaspa_entries` / `kaspa_l2_submissions`
 - final rows are shown as `Final`
 
 ## Verified Contracts
