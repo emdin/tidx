@@ -19,6 +19,9 @@ services:
 
   postgres:
     image: postgres:16
+    # Default 64 MB /dev/shm is too small for parallel hash joins on the
+    # 7M+ row tables ("could not resize shared memory segment").
+    shm_size: 1g
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
