@@ -564,11 +564,26 @@ pub async fn load_txs_for_trace_repair(
     retry_after_secs: i64,
     limit: i64,
 ) -> Result<Vec<TxRow>> {
-    let conn = pool.get().await?;
-    let sql = format!(
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    // Serial plan: a parallel one needs more /dev/shm than the prod container
+    // has (2026-10-12: every tick failed until this was set).
+    tx.batch_execute("SET LOCAL max_parallel_workers_per_gather = 0").await?;
+    let rows = tx
+        .query(&trace_repair_sql(), &[&from, &to, &max_attempts, &retry_after_secs, &limit])
+        .await?;
+    tx.commit().await?;
+    Ok(rows.iter().map(tx_row_from).collect())
+}
+
+/// Params: `$1..$2` block range, `$3` max attempts, `$4` retry-after secs,
+/// `$5` limit.
+pub fn trace_repair_sql() -> String {
+    format!(
         "SELECT {TX_ROW_COLUMNS}
            FROM txs t
-           LEFT JOIN trace_outcomes o ON o.tx_hash = t.hash
+           LEFT JOIN trace_outcomes o
+                  ON o.tx_hash = t.hash AND o.block_num BETWEEN $1 AND $2
           WHERE t.block_num BETWEEN $1 AND $2
             AND (o.tx_hash IS NULL
                  OR (o.outcome = 'failed' AND o.attempts < $3
@@ -577,11 +592,7 @@ pub async fn load_txs_for_trace_repair(
                            86400) * interval '1 second'))
           ORDER BY t.block_num, t.idx
           LIMIT $5"
-    );
-    let rows = conn
-        .query(&sql, &[&from, &to, &max_attempts, &retry_after_secs, &limit])
-        .await?;
-    Ok(rows.iter().map(tx_row_from).collect())
+    )
 }
 
 /// Every tx in `[from, to]` (for `backfill-traces --all`).

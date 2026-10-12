@@ -17,7 +17,8 @@ use tidx::db::Pool;
 use tidx::sync::fetcher::RpcClient;
 use tidx::sync::trace::{TraceOutcome, TraceStatus, trace_txs};
 use tidx::sync::writer::{
-    delete_blocks_from, load_txs_for_trace_repair, mark_existing_traces, write_trace_outcomes,
+    delete_blocks_from, load_txs_for_trace_repair, mark_existing_traces, trace_repair_sql,
+    write_trace_outcomes,
 };
 use tidx::types::TxRow;
 use tokio::sync::Mutex;
@@ -293,6 +294,64 @@ async fn repair_selection_picks_failed_and_untraced_only() {
     let picked = load_txs_for_trace_repair(&db.pool, 100, 100, 10, 0, 1).await.unwrap();
     let tags: Vec<u8> = picked.iter().map(|t| t.hash[0]).collect();
     assert_eq!(tags, vec![0x23]);
+}
+
+/// Prod 2026-10-12: with 7.5M outcome rows the repair query hash-joined a
+/// parallel seq scan of all of `trace_outcomes` against the ~40k txs in the
+/// lookback window; the parallel hash outgrew the 64 MB /dev/shm and every
+/// tick failed with "could not resize shared memory segment". Outcomes for
+/// the window must be read by block range, not by scanning the table.
+#[tokio::test]
+#[serial(db)]
+async fn repair_selection_reads_only_the_window_of_outcomes() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    // 500k traced txs across blocks 37_500..50_000; the window is the last
+    // 500 blocks (20k txs, all `ok`) plus two untraced txs at block 50_001.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "TRUNCATE trace_outcomes, internal_txs;
+             INSERT INTO txs (block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input,
+                              gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce_key, nonce)
+             SELECT g / 40, now(), g % 40, sha256(int8send(g)), 2, '\\xaa', '\\xaa', '0', '\\x',
+                    21000, '1', '1', '\\x00', 0
+               FROM generate_series(1980000, 1999999) g;
+             INSERT INTO trace_outcomes (tx_hash, block_num, outcome)
+             SELECT sha256(int8send(g)), g / 40, 'ok' FROM generate_series(1500000, 1999999) g;",
+        )
+        .await
+        .unwrap();
+    seed_block_with_txs(&db.pool, 50_001, &[0x31, 0x32]).await;
+    db.pool.get().await.unwrap().batch_execute("ANALYZE txs; ANALYZE trace_outcomes").await.unwrap();
+
+    let mut conn = db.pool.get().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    tx.batch_execute(
+        "SET LOCAL parallel_setup_cost = 0; SET LOCAL parallel_tuple_cost = 0;
+         SET LOCAL min_parallel_table_scan_size = 0; SET LOCAL min_parallel_index_scan_size = 0",
+    )
+    .await
+    .unwrap();
+    let plan: Vec<String> = tx
+        .query(
+            &format!("EXPLAIN {}", trace_repair_sql()),
+            &[&49_500_i64, &50_001_i64, &10_i32, &600_i64, &200_i64],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on trace_outcomes"), "{plan}");
+    drop(tx);
+
+    let picked = load_txs_for_trace_repair(&db.pool, 49_500, 50_001, 10, 600, 200).await.unwrap();
+    let tags: Vec<u8> = picked.iter().map(|t| t.hash[0]).collect();
+    assert_eq!(tags, vec![0x31, 0x32]);
 }
 
 // ---------------------------------------------------------------------------
