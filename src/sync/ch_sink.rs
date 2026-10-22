@@ -158,6 +158,25 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    /// `ensure_schema` until it succeeds. On host boot ClickHouse may still be
+    /// starting when tidx runs; giving up after one attempt left the sync
+    /// engine running without the CH sink for the life of the process.
+    pub async fn ensure_schema_with_retry(&self, base_delay: Duration, max_delay: Duration) {
+        let mut attempt: u32 = 0;
+        while let Err(e) = self.ensure_schema().await {
+            let delay = retry_delay(attempt, base_delay, max_delay);
+            attempt = attempt.saturating_add(1);
+            warn!(
+                error = %e,
+                database = %self.database,
+                attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                "ClickHouse schema init failed, retrying"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     async fn ensure_txs_columns(&self) -> Result<()> {
         for ddl in TXS_COLUMN_ALTERS {
             self.client
@@ -763,6 +782,12 @@ impl ChInternalTxWire {
     }
 }
 
+/// `base * 2^attempt`, capped at `max`.
+fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
+    base.checked_mul(2u32.checked_pow(attempt).unwrap_or(u32::MAX))
+        .map_or(max, |d| d.min(max))
+}
+
 /// Hex-encode bytes with 0x prefix.
 fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
@@ -1042,6 +1067,175 @@ mod tests {
         assert_eq!(
             mat, 0,
             "logs has no DEFAULT-computed columns; MATERIALIZE shouldn't be needed"
+        );
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Reads one HTTP/1.1 request (Content-Length or chunked body).
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> bool {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let header_end = loop {
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let chunked = head.contains("transfer-encoding: chunked");
+        let content_length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        loop {
+            let body = &buf[header_end..];
+            let done = if chunked {
+                body.ends_with(b"0\r\n\r\n")
+            } else {
+                body.len() >= content_length
+            };
+            if done {
+                return true;
+            }
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// Fake ClickHouse HTTP endpoint: the first `fail_first` requests get a
+    /// 500, the rest 200. Returns the number of requests answered with 200.
+    async fn serve_fake_clickhouse(
+        listener: tokio::net::TcpListener,
+        fail_first: usize,
+    ) -> Arc<AtomicUsize> {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let ok = Arc::new(AtomicUsize::new(0));
+        let ok_ret = ok.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (seen, ok) = (seen.clone(), ok.clone());
+                tokio::spawn(async move {
+                    while read_http_request(&mut sock).await {
+                        let (status, body) = if seen.fetch_add(1, Ordering::SeqCst) < fail_first {
+                            (
+                                "500 Internal Server Error",
+                                "Code: 999. DB::Exception: starting up",
+                            )
+                        } else {
+                            ok.fetch_add(1, Ordering::SeqCst);
+                            ("200 OK", "")
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        ok_ret
+    }
+
+    /// Statements one successful `ensure_schema` sends.
+    async fn schema_statement_count() -> usize {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let ok = serve_fake_clickhouse(listener, 0).await;
+        let sink = ClickHouseSink::new(&url, "tidx_test", None, None).unwrap();
+        sink.ensure_schema().await.unwrap();
+        ok.load(Ordering::SeqCst)
+    }
+
+    const FAST: Duration = Duration::from_millis(10);
+    const FAST_MAX: Duration = Duration::from_millis(50);
+
+    /// Host boot: tidx can start before ClickHouse listens. A single failed
+    /// attempt must not leave the process running without the CH sink.
+    #[tokio::test]
+    async fn ensure_schema_with_retry_waits_for_clickhouse_to_listen() {
+        let expected = schema_statement_count().await;
+        assert!(expected > 7, "schema sends DB + 6 tables + alters");
+
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+        let sink = ClickHouseSink::new(&format!("http://{addr}"), "tidx_test", None, None).unwrap();
+
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            serve_fake_clickhouse(listener, 0).await
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sink.ensure_schema_with_retry(FAST, FAST_MAX),
+        )
+        .await
+        .expect("retry loop should finish once ClickHouse listens");
+        let ok = server.await.unwrap();
+        assert_eq!(
+            ok.load(Ordering::SeqCst),
+            expected,
+            "full schema applied after connect"
+        );
+    }
+
+    /// ClickHouse accepting connections but erroring (e.g. still loading
+    /// tables) is retried too, and the schema is then applied in full.
+    #[tokio::test]
+    async fn ensure_schema_with_retry_retries_server_errors() {
+        let expected = schema_statement_count().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let ok = serve_fake_clickhouse(listener, 3).await;
+        let sink = ClickHouseSink::new(&url, "tidx_test", None, None).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sink.ensure_schema_with_retry(FAST, FAST_MAX),
+        )
+        .await
+        .expect("retry loop should finish once ClickHouse answers 200");
+        assert_eq!(ok.load(Ordering::SeqCst), expected);
+    }
+
+    /// Already-reachable ClickHouse: one pass, no extra statements.
+    #[tokio::test]
+    async fn ensure_schema_with_retry_single_pass_when_healthy() {
+        let expected = schema_statement_count().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let ok = serve_fake_clickhouse(listener, 0).await;
+        let sink = ClickHouseSink::new(&url, "tidx_test", None, None).unwrap();
+        sink.ensure_schema_with_retry(FAST, FAST_MAX).await;
+        assert_eq!(ok.load(Ordering::SeqCst), expected);
+    }
+
+    #[test]
+    fn retry_backoff_doubles_and_caps() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        let delays: Vec<u64> = (0..8)
+            .map(|a| retry_delay(a, base, max).as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(
+            retry_delay(u32::MAX, base, max),
+            max,
+            "no overflow on long outages"
         );
     }
 }
