@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{Method, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware,
     response::{
         IntoResponse, Response, Sse,
@@ -93,13 +93,53 @@ impl AppState {
     /// Check if an IP address is in the trusted CIDRs.
     /// When no CIDRs are configured, only loopback peers are trusted.
     pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
+        self.is_trusted_cidr(addr.ip())
+    }
+
+    /// Core predicate: is `ip` within a configured trusted CIDR? With no CIDRs
+    /// configured, only loopback is trusted.
+    fn is_trusted_cidr(&self, ip: IpAddr) -> bool {
         if self.trusted_cidrs.is_empty() {
-            return addr.ip().is_loopback();
+            return ip.is_loopback();
         }
-        let ip = addr.ip();
         self.trusted_cidrs
             .iter()
             .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+    }
+
+    /// The effective client IP for a trust decision, accounting for the
+    /// in-cluster reverse proxy (Caddy). For public traffic the TCP peer is
+    /// ALWAYS the proxy, so trusting the peer alone made every internet client
+    /// "trusted" (the /views abuse of 2026-10-22). Rule:
+    ///   - If the direct peer is NOT one of our trusted networks, it is a real
+    ///     external client connecting directly — ignore its X-Forwarded-For
+    ///     entirely (it is attacker-controlled) and use the peer.
+    ///   - If the peer IS trusted (the proxy, or an internal caller), walk
+    ///     X-Forwarded-For right-to-left and return the first hop that is not
+    ///     itself a trusted proxy. Caddy appends the real client to the right,
+    ///     so a spoofed left-hand entry cannot grant trust.
+    pub fn effective_client_ip(&self, peer: IpAddr, forwarded_for: Option<&str>) -> IpAddr {
+        if !self.is_trusted_cidr(peer) {
+            return peer;
+        }
+        if let Some(xff) = forwarded_for {
+            for hop in xff.split(',').rev() {
+                if let Ok(ip) = hop.trim().parse::<IpAddr>() {
+                    if !self.is_trusted_cidr(ip) {
+                        return ip;
+                    }
+                }
+            }
+        }
+        peer
+    }
+
+    /// Trust decision for privileged endpoints. Evaluates the EFFECTIVE client
+    /// IP (see [`effective_client_ip`]) rather than the TCP peer, so a request
+    /// proxied through Caddy is judged by the real originating client.
+    pub fn is_trusted_request(&self, peer: &SocketAddr, headers: &HeaderMap) -> bool {
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        self.is_trusted_cidr(self.effective_client_ip(peer.ip(), xff))
     }
 }
 
@@ -1012,6 +1052,71 @@ mod tests {
             trusted_cidrs: Arc::new(trusted_cidrs),
             kaspa_explorer_base_url: "https://kaspa.stream".to_string(),
         }
+    }
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    // trusted = the internal networks where Caddy and internal callers live.
+    fn proxy_state() -> AppState {
+        test_state(parse_cidrs(&[
+            "172.16.0.0/12".to_string(),
+            "100.64.0.0/10".to_string(),
+        ]))
+    }
+
+    #[test]
+    fn external_client_via_proxy_is_not_trusted() {
+        // The 2026-10-22 bug: Caddy (172.18.x) forwards a public client; the
+        // peer is the proxy, but the real client (XFF right-most) is external.
+        let state = proxy_state();
+        let proxy: SocketAddr = "172.18.0.10:40000".parse().unwrap();
+        assert!(!state.is_trusted_request(&proxy, &xff("203.0.113.7")));
+    }
+
+    #[test]
+    fn spoofed_xff_through_proxy_is_not_trusted() {
+        // Attacker sends a trusted-looking left-hand entry; Caddy appends the
+        // real client on the right, which is what we must judge.
+        let state = proxy_state();
+        let proxy: SocketAddr = "172.18.0.10:40000".parse().unwrap();
+        assert!(!state.is_trusted_request(&proxy, &xff("10.0.0.5, 203.0.113.7")));
+    }
+
+    #[test]
+    fn direct_external_peer_xff_is_ignored() {
+        // A direct (non-proxy) connection: its XFF is attacker-controlled and
+        // must never be honored.
+        let state = proxy_state();
+        let attacker: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        assert!(!state.is_trusted_request(&attacker, &xff("10.0.0.5")));
+    }
+
+    #[test]
+    fn internal_client_via_proxy_is_trusted() {
+        // e.g. the operator over tailscale (100.64/10) reaching tidx via Caddy.
+        let state = proxy_state();
+        let proxy: SocketAddr = "172.18.0.10:40000".parse().unwrap();
+        assert!(state.is_trusted_request(&proxy, &xff("100.64.1.2")));
+    }
+
+    #[test]
+    fn direct_internal_peer_without_xff_is_trusted() {
+        let state = proxy_state();
+        let internal: SocketAddr = "172.18.0.5:5000".parse().unwrap();
+        assert!(state.is_trusted_request(&internal, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn loopback_default_config_still_trusted() {
+        let state = test_state(Vec::new());
+        let lo: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(state.is_trusted_request(&lo, &HeaderMap::new()));
+        let ext: SocketAddr = "203.0.113.7:8080".parse().unwrap();
+        assert!(!state.is_trusted_request(&ext, &xff("127.0.0.1")));
     }
 
     #[test]

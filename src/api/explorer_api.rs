@@ -13,6 +13,7 @@ use alloy::{
 use axum::{
     Json,
     extract::{ConnectInfo, Path, Query, State},
+    http::HeaderMap,
 };
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -748,10 +749,11 @@ struct SelectorResolution {
 pub async fn admin_capabilities(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<AdminCapabilitiesResponse>, ApiError> {
     Ok(Json(AdminCapabilitiesResponse {
         ok: true,
-        can_write_metadata: state.is_trusted_ip(&addr),
+        can_write_metadata: state.is_trusted_request(&addr, &headers),
     }))
 }
 
@@ -1088,11 +1090,12 @@ pub async fn contract_verification(
 pub async fn verify_contract(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(address): Path<String>,
     Query(query): Query<ChainQuery>,
     Json(payload): Json<VerifyContractRequest>,
 ) -> Result<Json<ContractVerificationResponse>, ApiError> {
-    if !state.is_trusted_ip(&addr) {
+    if !state.is_trusted_request(&addr, &headers) {
         return Err(ApiError::Forbidden(
             "Contract verification writes are only allowed from trusted IPs".to_string(),
         ));
@@ -1124,11 +1127,12 @@ pub async fn verify_contract(
 pub async fn upsert_label(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(address): Path<String>,
     Query(query): Query<ChainQuery>,
     Json(payload): Json<LabelUpsertRequest>,
 ) -> Result<Json<AddressInspectResponse>, ApiError> {
-    if !state.is_trusted_ip(&addr) {
+    if !state.is_trusted_request(&addr, &headers) {
         return Err(ApiError::Forbidden(
             "Label writes are only allowed from trusted IPs".to_string(),
         ));
@@ -1155,10 +1159,11 @@ pub async fn upsert_label(
 pub async fn refresh_address_metadata(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(address): Path<String>,
     Query(query): Query<ChainQuery>,
 ) -> Result<Json<AddressInspectResponse>, ApiError> {
-    if !state.is_trusted_ip(&addr) {
+    if !state.is_trusted_request(&addr, &headers) {
         return Err(ApiError::Forbidden(
             "Metadata refresh is only allowed from trusted IPs".to_string(),
         ));
