@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -146,10 +147,11 @@ pub struct CreateViewResponse {
 pub async fn create_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreateViewRequest>,
 ) -> Result<Json<CreateViewResponse>, ApiError> {
-    // Check trusted IP access
-    if !state.is_trusted_ip(&addr) {
+    // Check trusted IP access (effective client, not the reverse-proxy hop)
+    if !state.is_trusted_request(&addr, &headers) {
         return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
     }
 
@@ -278,11 +280,12 @@ pub struct DeleteViewResponse {
 pub async fn delete_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(params): Query<ChainQuery>,
 ) -> Result<Json<DeleteViewResponse>, ApiError> {
-    // Check trusted IP access
-    if !state.is_trusted_ip(&addr) {
+    // Check trusted IP access (effective client, not the reverse-proxy hop)
+    if !state.is_trusted_request(&addr, &headers) {
         return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
     }
 
