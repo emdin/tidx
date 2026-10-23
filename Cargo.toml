@@ -105,6 +105,10 @@ serde_nested_with = { git = "https://github.com/murar8/serde_nested_with.git", t
 [dev-dependencies]
 # Testing & Benchmarks
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+# Inspect the compiled-in TLS trust anchors (transitive via reqwest/rustls) to
+# guard against regressing below the webpki-roots release that dropped the
+# compromised eMudhra roots (CVE-2026-111943). Unifies with the tree version.
+webpki-roots = "1"
 hex-literal = "0.4"
 insta = "1.46.3"
 serial_test = "3"
