@@ -132,7 +132,9 @@ impl ClickHouseEngine {
         limit: i64,
     ) -> Result<QueryResult> {
         let sql = Self::prepare_public_sql(sql, signatures, limit)?;
-        self.run(&sql).await
+        // Defense in depth: even if SQL validation is bypassed, run the public
+        // query under ClickHouse readonly mode so it cannot INSERT/DDL/write.
+        self.run(&sql, true).await
     }
 
     /// Trusted entry point (no validation, no cap) for internal callers such as
@@ -140,7 +142,7 @@ impl ClickHouseEngine {
     /// `query_public`.
     pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
         let sql = Self::wrap_signatures(sql, signatures)?;
-        self.run(&sql).await
+        self.run(&sql, false).await
     }
 
     /// Execute already-prepared SQL, failing over across instances on
@@ -149,7 +151,7 @@ impl ClickHouseEngine {
     /// an execution concern for every CH statement: columns are lowercase
     /// 0x-strings compared case-sensitively, so a checksummed literal would
     /// silently match nothing. It is a no-op on DDL.
-    async fn run(&self, sql: &str) -> Result<QueryResult> {
+    async fn run(&self, sql: &str, readonly: bool) -> Result<QueryResult> {
         let sql = normalize_hex_literals_clickhouse(sql);
 
         let start = std::time::Instant::now();
@@ -160,7 +162,7 @@ impl ClickHouseEngine {
             let idx = (starting + attempt) % n;
             let inst = &self.instances[idx];
 
-            match self.try_query(inst, &sql, start).await {
+            match self.try_query(inst, &sql, start, readonly).await {
                 Ok(result) => {
                     if attempt > 0 {
                         self.active.store(idx, Ordering::Relaxed);
@@ -193,12 +195,9 @@ impl ClickHouseEngine {
         inst: &Instance,
         sql: &str,
         start: std::time::Instant,
+        readonly: bool,
     ) -> Result<QueryResult> {
-        let url = format!(
-            "{}/?database={}&default_format=JSON",
-            inst.url.trim_end_matches('/'),
-            self.database
-        );
+        let url = build_query_url(&inst.url, &self.database, readonly);
 
         let mut req = inst.http_client.post(&url).body(sql.to_string());
         if let Some(ref user) = inst.user {
@@ -283,6 +282,23 @@ impl ClickHouseEngine {
     }
 }
 
+/// Build the ClickHouse HTTP query URL. For public (`readonly`) queries we send
+/// `readonly=2`, which makes ClickHouse reject any INSERT/DDL/write — defense in
+/// depth behind SQL validation — while still permitting the `default_format`
+/// setting we pass (`readonly=1` would reject that). The trusted internal path
+/// (e.g. `views.rs` DDL) passes `readonly=false` and is unrestricted.
+fn build_query_url(base_url: &str, database: &str, readonly: bool) -> String {
+    let mut url = format!(
+        "{}/?database={}&default_format=JSON",
+        base_url.trim_end_matches('/'),
+        database
+    );
+    if readonly {
+        url.push_str("&readonly=2");
+    }
+    url
+}
+
 /// Returns true for errors that indicate the ClickHouse instance is unreachable
 /// (connection refused, timeout, DNS failure, etc.) — as opposed to query-level
 /// errors that would happen on any instance.
@@ -310,6 +326,28 @@ pub struct QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_query_url_is_readonly() {
+        // The public /query path must run under readonly=2 so a validation
+        // bypass still cannot write/DDL (the 2026-10-22 /views abuse).
+        let u = build_query_url("http://clickhouse:8123", "tidx_38833", true);
+        assert!(u.contains("readonly=2"), "public URL not readonly: {u}");
+        assert!(u.contains("database=tidx_38833"));
+        assert!(u.contains("default_format=JSON"));
+    }
+
+    #[test]
+    fn trusted_query_url_is_not_readonly() {
+        // The trusted internal path issues DDL (views.rs); it must NOT be
+        // readonly. Also check trailing-slash normalization.
+        let u = build_query_url("http://clickhouse:8123/", "tidx_38833", false);
+        assert!(
+            !u.contains("readonly"),
+            "trusted URL must not be readonly: {u}"
+        );
+        assert!(u.starts_with("http://clickhouse:8123/?"));
+    }
 
     #[test]
     fn test_is_connection_error() {
