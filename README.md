@@ -222,7 +222,9 @@ database = "tidx_38833"
 ├── batch_size              u64       = 100          Blocks per RPC batch request
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
-    └── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+    ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+    ├── query_user          string    (optional)     User for public /query (SELECT-only); falls back to `user`
+    └── query_password_env  string    (optional)     Env var name for `query_user`'s password
 ```
 
 ## CLI

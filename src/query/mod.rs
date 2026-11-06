@@ -8,8 +8,8 @@ pub use parser::{
 };
 pub use router::QueryEngine;
 pub use validator::{
-    engine_limit_cap, validate_query, validate_query_with_cap, ALLOWED_FUNCTIONS,
-    HARD_LIMIT_CLICKHOUSE, HARD_LIMIT_MAX,
+    engine_limit_cap, reject_ambiguous_lexing, validate_query, validate_query_with_cap, SqlEngine,
+    ALLOWED_FUNCTIONS, ALLOWED_TABLES, HARD_LIMIT_CLICKHOUSE, HARD_LIMIT_MAX,
 };
 
 use sqlparser::ast::{BinaryOperator, Expr, Value, visit_expressions_mut};

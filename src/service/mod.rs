@@ -161,6 +161,36 @@ impl Default for QueryOptions {
     }
 }
 
+/// Open the transaction untrusted `/query` SQL runs in: read-only, with the
+/// caller's timeout, as the unprivileged `tidx_query` role (db/query_role.sql).
+///
+/// Everything is SET LOCAL so it dies with the transaction. The pool is shared
+/// with the sync engine: a session-level `statement_timeout` once leaked to its
+/// gap scans (2026-09-14), and a leaked role would break its writes. If the
+/// future is dropped mid-query, the Transaction's Drop rolls back and the
+/// settings with it.
+///
+/// The role switch is what stops a validator bypass from reaching superuser-only
+/// functions (2026-11-06: pg_read_file / lo_export led to code execution). A
+/// superuser session could switch back with `set_config('role', ...)`, so that
+/// function must stay off the validator allowlist.
+pub async fn begin_public_query(
+    conn: &mut deadpool_postgres::Object,
+    timeout_ms: u64,
+) -> Result<deadpool_postgres::Transaction<'_>> {
+    let tx = conn.transaction().await?;
+    // standard_conforming_strings keeps backslashes in '...' literal, which is
+    // how the validator's parser reads them (see reject_ambiguous_lexing).
+    tx.batch_execute(&format!(
+        "SET TRANSACTION READ ONLY; \
+         SET LOCAL statement_timeout = {timeout_ms}; \
+         SET LOCAL standard_conforming_strings = on; \
+         SET LOCAL ROLE tidx_query"
+    ))
+    .await?;
+    Ok(tx)
+}
+
 /// Execute a query on PostgreSQL.
 pub async fn execute_query_postgres(
     pool: &Pool,
@@ -168,6 +198,8 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    crate::query::reject_ambiguous_lexing(sql, crate::query::SqlEngine::Postgres)?;
+
     // Generate CTE SQL if signatures are provided
     let sql = if !signatures.is_empty() {
         let sigs: Vec<EventSignature> = signatures
@@ -209,17 +241,7 @@ pub async fn execute_query_postgres(
     let sql = crate::query::convert_hex_literals_postgres(&sql);
 
     let mut conn = pool.get().await?;
-
-    // SET LOCAL inside a transaction, so the timeout dies with it. The old
-    // session-level SET persisted on the pooled connection and leaked to
-    // whoever got that connection next — the pool is shared with the sync
-    // engine, whose gap scans then died to a /query caller's 5 s default (or a
-    // deliberate `?timeout_ms=100`), wedging gap-fill from an unauthenticated
-    // endpoint. If this future is dropped mid-query (client-side timeout
-    // below), the Transaction's Drop rolls back and the setting with it.
-    let tx = conn.transaction().await?;
-    tx.batch_execute(&format!("SET LOCAL statement_timeout = {}", options.timeout_ms))
-        .await?;
+    let tx = begin_public_query(&mut conn, options.timeout_ms).await?;
 
     let start = Instant::now();
     let result = tokio::time::timeout(

@@ -14,15 +14,25 @@ use tracing::{error, warn};
 use crate::config::ClickHouseConfig;
 use crate::query::{
     enforce_limit, extract_raw_column_predicates, normalize_hex_literals_clickhouse,
-    validate_query_with_cap, EventSignature, HARD_LIMIT_CLICKHOUSE,
+    reject_ambiguous_lexing, validate_query_with_cap, EventSignature, SqlEngine,
+    HARD_LIMIT_CLICKHOUSE,
 };
+
+/// Credentials sent as `X-ClickHouse-User` / `X-ClickHouse-Key`.
+#[derive(Clone, Default)]
+struct Credentials {
+    user: Option<String>,
+    password: Option<String>,
+}
 
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
     http_client: reqwest::Client,
     url: String,
-    user: Option<String>,
-    password: Option<String>,
+    /// tidx's own user: sync writes and trusted DDL (`views.rs`).
+    main: Credentials,
+    /// Public `/query` user; same as `main` when `query_user` is not configured.
+    public: Credentials,
 }
 
 /// ClickHouse engine for OLAP queries.
@@ -48,14 +58,20 @@ impl ClickHouseEngine {
             .clone()
             .unwrap_or_else(|| format!("tidx_{chain_id}"));
 
-        let password = config.resolved_password()?;
+        let main = Credentials {
+            user: config.user.clone(),
+            password: config.resolved_password()?,
+        };
+        let public = match &config.query_user {
+            Some(user) => Credentials {
+                user: Some(user.clone()),
+                password: config.resolved_query_password()?,
+            },
+            None => main.clone(),
+        };
         let mut instances = Vec::new();
         for url in config.all_urls() {
-            instances.push(Self::make_instance(
-                url,
-                config.user.clone(),
-                password.clone(),
-            )?);
+            instances.push(Self::make_instance(url, main.clone(), public.clone())?);
         }
 
         Ok(Self {
@@ -65,11 +81,7 @@ impl ClickHouseEngine {
         })
     }
 
-    fn make_instance(
-        url: &str,
-        user: Option<String>,
-        password: Option<String>,
-    ) -> Result<Instance> {
+    fn make_instance(url: &str, main: Credentials, public: Credentials) -> Result<Instance> {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             .build()
@@ -77,8 +89,8 @@ impl ClickHouseEngine {
         Ok(Instance {
             http_client,
             url: url.to_string(),
-            user,
-            password,
+            main,
+            public,
         })
     }
 
@@ -119,6 +131,7 @@ impl ClickHouseEngine {
     /// `default` with `readonly=0`. Trusted internal callers that need DDL
     /// (`views.rs`) use `query` directly and are not subject to this.
     pub fn prepare_public_sql(sql: &str, signatures: &[&str], limit: i64) -> Result<String> {
+        reject_ambiguous_lexing(sql, SqlEngine::ClickHouse)?;
         let sql = Self::wrap_signatures(sql, signatures)?;
         validate_query_with_cap(&sql, HARD_LIMIT_CLICKHOUSE)?;
         Ok(enforce_limit(&sql, limit, HARD_LIMIT_CLICKHOUSE))
@@ -199,11 +212,12 @@ impl ClickHouseEngine {
     ) -> Result<QueryResult> {
         let url = build_query_url(&inst.url, &self.database, readonly);
 
+        let creds = if readonly { &inst.public } else { &inst.main };
         let mut req = inst.http_client.post(&url).body(sql.to_string());
-        if let Some(ref user) = inst.user {
+        if let Some(ref user) = creds.user {
             req = req.header("X-ClickHouse-User", user);
         }
-        if let Some(ref password) = inst.password {
+        if let Some(ref password) = creds.password {
             req = req.header("X-ClickHouse-Key", password);
         }
         let resp = req
@@ -443,6 +457,22 @@ mod tests {
         assert!(ClickHouseEngine::prepare_public_sql("SELECT 1; DROP TABLE logs", &[], 100).is_err());
     }
 
+    // ClickHouse reads `\'` inside '...' as an escaped quote; the validator's
+    // parser does not, so the two would disagree on where the string ends.
+    #[test]
+    fn public_sql_rejects_backslashes_and_hash_comments() {
+        // Both parse cleanly with GenericDialect, so only the lexing guard stops them.
+        for sql in [
+            r"SELECT num FROM blocks WHERE hash = 'a\b'",
+            r"SELECT num FROM blocks WHERE hash = 'a\\'",
+        ] {
+            assert!(
+                ClickHouseEngine::prepare_public_sql(sql, &[], 100).is_err(),
+                "must reject: {sql}"
+            );
+        }
+    }
+
     #[test]
     fn public_sql_appends_caller_page_size_when_no_limit() {
         let sql = ClickHouseEngine::prepare_public_sql("SELECT num FROM blocks", &[], 250).unwrap();
@@ -496,5 +526,83 @@ mod tests {
         )
         .expect("pushdown-rewritten signature query must validate");
         assert!(sql.contains("LIMIT 100"), "got: {sql}");
+    }
+
+    // ---- which ClickHouse user each path authenticates as ----
+
+    /// Minimal HTTP server: answers every request with an empty JSON result and
+    /// reports the `X-ClickHouse-User` header it carried (None if absent).
+    async fn spawn_user_recorder() -> (String, tokio::sync::mpsc::UnboundedReceiver<Option<String>>)
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = sock.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_lowercase();
+                    let user = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("x-clickhouse-user:"))
+                        .map(|v| v.trim().to_string());
+                    tx.send(user).unwrap();
+                    let body = r#"{"meta":[],"data":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    // 2026-11-06: public /query reached url()/remote() and system tables because
+    // it ran as the same all-powerful user as tidx's own writes.
+    #[tokio::test]
+    async fn public_queries_authenticate_as_query_user() {
+        let (url, mut users) = spawn_user_recorder().await;
+        let config = ClickHouseConfig {
+            enabled: true,
+            url,
+            user: Some("tidx".to_string()),
+            query_user: Some("tidx_query".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 38833).unwrap();
+
+        engine.query_public("SELECT num FROM blocks", &[], 10).await.unwrap();
+        assert_eq!(users.recv().await.unwrap().as_deref(), Some("tidx_query"));
+
+        engine.query("SELECT 1", &[]).await.unwrap();
+        assert_eq!(users.recv().await.unwrap().as_deref(), Some("tidx"));
+    }
+
+    #[tokio::test]
+    async fn public_queries_fall_back_to_main_user_without_query_user() {
+        let (url, mut users) = spawn_user_recorder().await;
+        let config = ClickHouseConfig {
+            enabled: true,
+            url,
+            user: Some("tidx".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 38833).unwrap();
+
+        engine.query_public("SELECT num FROM blocks", &[], 10).await.unwrap();
+        assert_eq!(users.recv().await.unwrap().as_deref(), Some("tidx"));
     }
 }

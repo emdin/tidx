@@ -282,6 +282,16 @@ pub struct ClickHouseConfig {
     /// When set, the password is read from this env var at startup.
     #[serde(default)]
     pub password_env: Option<String>,
+
+    /// ClickHouse user for the public `/query` path; `user` is used when unset.
+    /// Give it SELECT on the chain databases only, without URL/REMOTE/FILE
+    /// source grants (2026-11-06: public SQL reached url() and system tables).
+    #[serde(default)]
+    pub query_user: Option<String>,
+
+    /// Environment variable holding `query_user`'s password.
+    #[serde(default)]
+    pub query_password_env: Option<String>,
 }
 
 impl ClickHouseConfig {
@@ -294,17 +304,24 @@ impl ClickHouseConfig {
 
     /// Resolve the ClickHouse password from the environment variable specified by `password_env`.
     pub fn resolved_password(&self) -> Result<Option<String>> {
-        match &self.password_env {
-            Some(env_var) => {
-                let password = std::env::var(env_var).with_context(|| {
-                    format!(
-                        "clickhouse password_env '{env_var}' is set but environment variable not found"
-                    )
-                })?;
-                Ok(Some(password))
-            }
-            None => Ok(None),
+        resolve_env_password("password_env", self.password_env.as_deref())
+    }
+
+    /// Resolve `query_user`'s password from `query_password_env`.
+    pub fn resolved_query_password(&self) -> Result<Option<String>> {
+        resolve_env_password("query_password_env", self.query_password_env.as_deref())
+    }
+}
+
+fn resolve_env_password(field: &str, env_var: Option<&str>) -> Result<Option<String>> {
+    match env_var {
+        Some(env_var) => {
+            let password = std::env::var(env_var).with_context(|| {
+                format!("clickhouse {field} '{env_var}' is set but environment variable not found")
+            })?;
+            Ok(Some(password))
         }
+        None => Ok(None),
     }
 }
 
@@ -317,6 +334,8 @@ impl Default for ClickHouseConfig {
             database: None,
             user: None,
             password_env: None,
+            query_user: None,
+            query_password_env: None,
         }
     }
 }
