@@ -85,6 +85,10 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/extensions.sql"))
         .await?;
 
+    // Last, so its GRANT ... ON ALL TABLES covers every table created above.
+    conn.batch_execute(include_str!("../../db/query_role.sql"))
+        .await?;
+
     drop(conn);
     // Fail fast at boot if a source-table migration has drifted from its
     // orphaned_* twin: the reorg handler would corrupt at 3 a.m. otherwise.

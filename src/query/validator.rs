@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
-    Statement, TableFactor, TableWithJoins,
+    Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -98,9 +99,48 @@ pub fn validate_query_with_cap(sql: &str, cap: i64) -> Result<()> {
         Statement::Query(query) => {
             let cte_names = extract_cte_names(query);
             validate_query_ast(query, &cte_names, 0)?;
+            reject_hidden_calls(stmt)?;
             validate_limit_clause(query, cap)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
+    }
+}
+
+/// Second pass over the whole statement that does not depend on the match arms
+/// in `validate_expr`: every function call anywhere must be allowlisted and no
+/// table function may appear. A missed arm (2026-11-06: the left side of
+/// `= ANY(...)`) then cannot reopen the hole on its own.
+fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
+    struct HiddenCalls;
+
+    impl Visitor for HiddenCalls {
+        type Break = String;
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<String> {
+            if let Expr::Function(func) = expr {
+                let name = func.name.to_string().to_lowercase();
+                if !is_allowed_function(&name) {
+                    return ControlFlow::Break(format!("Function '{name}' is not allowed"));
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<String> {
+            match factor {
+                TableFactor::Table { args: Some(_), .. }
+                | TableFactor::TableFunction { .. }
+                | TableFactor::Function { .. } => {
+                    ControlFlow::Break("Table functions are not allowed".to_string())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    match stmt.visit(&mut HiddenCalls) {
+        ControlFlow::Break(reason) => Err(anyhow!(reason)),
+        ControlFlow::Continue(()) => Ok(()),
     }
 }
 
@@ -475,7 +515,8 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         }
 
         // ANY/ALL operators
-        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => {
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            validate_expr(left, cte_names, depth)?;
             validate_expr(right, cte_names, depth)
         }
 
@@ -1108,5 +1149,80 @@ mod tests {
         // change behavior.
         assert_eq!(engine_limit_cap(Some("ClickHouse")), HARD_LIMIT_MAX);
         assert_eq!(engine_limit_cap(Some("CLICKHOUSE")), HARD_LIMIT_MAX);
+    }
+
+    // 2026-11-06 incident: public /query requests that passed validation and ran
+    // pg_read_file as the Postgres superuser, and url() in ClickHouse. The
+    // forbidden call sat on the LEFT of `= ANY(...)`, which was never checked.
+    #[test]
+    fn rejects_attacker_queries_from_2026_11_06() {
+        for sql in [
+            "select 1 as y where (pg_read_file('/etc/hostname')) = ANY(ARRAY['x'])",
+            "select 1 as y where (cast((select (pg_read_file('/tmp/agent13.pid'))) as int)) = ANY(ARRAY[0])",
+            "select 1 as y where (cast((select (pg_read_file('/tmp/agent91.pid', 0, 180))) as int)) = ANY(ARRAY[0])",
+            "SELECT 1 FROM logs WHERE (SELECT s FROM url('http://127.0.0.1:8123/?query=SELECT%201', 'RawBLOB', 's String')) = ANY(ARRAY['x'])",
+        ] {
+            assert!(validate_query(sql).is_err(), "must reject: {sql}");
+        }
+    }
+
+    // The public Postgres path drops to the `tidx_query` role with SET LOCAL ROLE;
+    // set_config('role', ...) would switch it back to the superuser session role.
+    #[test]
+    fn rejects_role_and_setting_changes() {
+        for sql in [
+            "SELECT set_config('role', 'tidx', true)",
+            "SELECT 1 WHERE set_config('role', 'tidx', true) = ANY(ARRAY['tidx'])",
+            "SELECT set_config('session_preload_libraries', 'x', false)",
+        ] {
+            assert!(validate_query(sql).is_err(), "must reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_forbidden_function_left_of_all() {
+        assert!(validate_query("SELECT 1 WHERE pg_read_file('/x') = ALL(ARRAY['a'])").is_err());
+    }
+
+    #[test]
+    fn allows_plain_any_and_all_comparisons() {
+        validate_query("SELECT num FROM blocks WHERE num = ANY(ARRAY[1, 2])").unwrap();
+        validate_query("SELECT num FROM blocks WHERE num > ALL(ARRAY[1, 2])").unwrap();
+    }
+
+    // Defense in depth: a forbidden function hidden in any expression position
+    // must be rejected, so one missed match arm can't reopen the hole.
+    #[test]
+    fn rejects_forbidden_function_in_every_expression_position() {
+        let f = "pg_read_file('/x')";
+        for sql in [
+            format!("SELECT 1 WHERE {f} = ANY(ARRAY['a'])"),
+            format!("SELECT 1 WHERE 'a' = ANY(ARRAY[{f}])"),
+            format!("SELECT ARRAY[{f}]"),
+            format!("SELECT ({f})[1]"),
+            format!("SELECT ({f}, 1)"),
+            format!("SELECT ROW({f})"),
+            format!("SELECT CAST({f} AS text)"),
+            format!("SELECT {f}::text"),
+            format!("SELECT {f} COLLATE \"C\""),
+            format!("SELECT {f} AT TIME ZONE 'UTC'"),
+            format!("SELECT SUBSTRING({f} FROM 1 FOR 2)"),
+            format!("SELECT TRIM({f})"),
+            format!("SELECT POSITION('a' IN {f})"),
+            format!("SELECT EXTRACT(YEAR FROM {f}::timestamp)"),
+            format!("SELECT CASE WHEN {f} = 'a' THEN 1 END"),
+            format!("SELECT 1 FROM blocks ORDER BY {f}"),
+            format!("SELECT 1 FROM blocks GROUP BY {f}"),
+            format!("SELECT count(*) FROM blocks HAVING {f} = 'a'"),
+            format!("SELECT num FROM blocks WHERE EXISTS (SELECT {f})"),
+            format!("SELECT num FROM blocks WHERE num IN (SELECT length({f}))"),
+            format!("WITH t AS (SELECT {f} AS v) SELECT v FROM t"),
+            format!("SELECT num FROM blocks UNION SELECT length({f})"),
+            format!("SELECT {f} IS DISTINCT FROM 'a'"),
+            format!("SELECT {f} LIKE 'a%'"),
+            format!("SELECT {f} BETWEEN 'a' AND 'b'"),
+        ] {
+            assert!(validate_query(&sql).is_err(), "must reject: {sql}");
+        }
     }
 }
