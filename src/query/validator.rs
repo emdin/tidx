@@ -9,7 +9,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-const ALLOWED_TABLES: &[&str] = &[
+pub const ALLOWED_TABLES: &[&str] = &[
     "blocks",
     "txs",
     "logs",
@@ -106,15 +106,128 @@ pub fn validate_query_with_cap(sql: &str, cap: i64) -> Result<()> {
     }
 }
 
+/// The database a validated query will run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlEngine {
+    Postgres,
+    ClickHouse,
+}
+
+/// Reject raw SQL whose strings, identifiers or comments the target database
+/// could tokenize differently from sqlparser's `GenericDialect`, which is what
+/// validates it. If the two disagree on where a string ends, text the validator
+/// saw as string content runs as SQL (2026-11-06 review: ClickHouse reads `\'`
+/// inside '...' as an escaped quote; sqlparser does not).
+///
+/// Rejected everywhere: `$` (dollar-quoted strings / heredocs) and nested
+/// comments. ClickHouse also: any backslash and `#` comments. Postgres also:
+/// `E'...'` and `U&'...'` strings; plain '...' keeps backslashes literal there
+/// (standard_conforming_strings is pinned on for public queries).
+pub fn reject_ambiguous_lexing(sql: &str, engine: SqlEngine) -> Result<()> {
+    let b = sql.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let reject = |what: &str| Err(anyhow!("{what} is not allowed in /query SQL"));
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                if q == b'\'' && engine == SqlEngine::Postgres {
+                    let prefixed = |at: usize, set: &[u8]| {
+                        i > at && set.contains(&b[i - 1 - at]) && (i < at + 2 || !is_ident(b[i - 2 - at]))
+                    };
+                    if prefixed(0, b"eE") {
+                        return reject("An E'...' escape string");
+                    }
+                    if i >= 2 && b[i - 1] == b'&' && prefixed(1, b"uU") {
+                        return reject("A U&'...' string");
+                    }
+                }
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return Err(anyhow!("Unterminated quoted text")),
+                        Some(&c) if c == q && b.get(i + 1) == Some(&q) => i += 2,
+                        Some(&c) if c == q => break,
+                        Some(b'\\') if engine == SqlEngine::ClickHouse => {
+                            return reject("A backslash");
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                loop {
+                    match (b.get(i), b.get(i + 1)) {
+                        (None, _) => return Err(anyhow!("Unterminated comment")),
+                        (Some(b'*'), Some(b'/')) => break,
+                        (Some(b'/'), Some(b'*')) => return reject("A nested comment"),
+                        _ => i += 1,
+                    }
+                }
+                i += 2;
+            }
+            b'$' => return reject("A '$' (dollar quoting)"),
+            b'#' if engine == SqlEngine::ClickHouse => return reject("A '#' comment"),
+            b'\\' if engine == SqlEngine::ClickHouse => return reject("A backslash"),
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
 /// Second pass over the whole statement that does not depend on the match arms
 /// in `validate_expr`: every function call anywhere must be allowlisted and no
 /// table function may appear. A missed arm (2026-11-06: the left side of
 /// `= ANY(...)`) then cannot reopen the hole on its own.
 fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
-    struct HiddenCalls;
+    struct CteNames(HashSet<String>);
 
-    impl Visitor for HiddenCalls {
+    impl Visitor for CteNames {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            self.0.extend(extract_cte_names(query));
+            ControlFlow::Continue(())
+        }
+    }
+
+    struct HiddenCalls<'a> {
+        cte_names: &'a HashSet<String>,
+    }
+
+    impl Visitor for HiddenCalls<'_> {
         type Break = String;
+
+        // Clauses the first pass never looks at (DISTINCT ON, QUALIFY, named
+        // WINDOW, PREWHERE, ...) can hold subqueries: every table must still
+        // be allowlisted.
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<String> {
+            match validate_table_name(relation, self.cte_names) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(e) => ControlFlow::Break(e.to_string()),
+            }
+        }
+
+        // SETTINGS would let a caller change ClickHouse settings under readonly=2.
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<String> {
+            if query.settings.is_some()
+                || query.format_clause.is_some()
+                || query.for_clause.is_some()
+                || !query.pipe_operators.is_empty()
+            {
+                return ControlFlow::Break(
+                    "SETTINGS, FORMAT, FOR and pipe clauses are not allowed".to_string(),
+                );
+            }
+            ControlFlow::Continue(())
+        }
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<String> {
             if let Expr::Function(func) = expr {
@@ -138,7 +251,9 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
         }
     }
 
-    match stmt.visit(&mut HiddenCalls) {
+    let mut ctes = CteNames(HashSet::new());
+    let _ = stmt.visit(&mut ctes);
+    match stmt.visit(&mut HiddenCalls { cte_names: &ctes.0 }) {
         ControlFlow::Break(reason) => Err(anyhow!(reason)),
         ControlFlow::Continue(()) => Ok(()),
     }
@@ -1224,5 +1339,86 @@ mod tests {
         ] {
             assert!(validate_query(&sql).is_err(), "must reject: {sql}");
         }
+    }
+
+    // Clauses the first pass does not walk must not smuggle in other tables.
+    #[test]
+    fn rejects_disallowed_tables_in_rarely_used_clauses() {
+        let sub = "(SELECT count(*) FROM pg_authid)";
+        for sql in [
+            format!("SELECT DISTINCT ON ({sub}) num FROM blocks"),
+            format!("SELECT num FROM blocks QUALIFY {sub} > 0"),
+            format!("SELECT num FROM blocks WINDOW w AS (ORDER BY {sub})"),
+            format!("SELECT num FROM blocks PREWHERE {sub} > 0"),
+        ] {
+            assert!(validate_query(&sql).is_err(), "must reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_settings_and_format_clauses() {
+        for sql in [
+            "SELECT num FROM blocks SETTINGS max_threads = 1",
+            "SELECT num FROM blocks FORMAT JSON",
+        ] {
+            assert!(validate_query(sql).is_err(), "must reject: {sql}");
+        }
+    }
+
+    // ---- lexing: both parsers must agree where strings/comments end ----
+    // 2026-11-06 review: ClickHouse reads `\'` inside '...' as an escaped quote,
+    // sqlparser (GenericDialect) as a backslash followed by the closing quote.
+
+    #[test]
+    fn clickhouse_rejects_tokens_its_lexer_reads_differently() {
+        for sql in [
+            r"SELECT num FROM blocks WHERE hash = 'a\'b'",
+            r"SELECT num FROM blocks WHERE hash = 'a\\b'",
+            r#"SELECT "a\"b" FROM blocks"#,
+            "SELECT num FROM blocks # comment",
+            "SELECT $$x$$",
+            "SELECT num FROM blocks /* a /* b */ c */",
+        ] {
+            assert!(
+                reject_ambiguous_lexing(sql, SqlEngine::ClickHouse).is_err(),
+                "must reject: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_rejects_escape_unicode_and_dollar_strings() {
+        for sql in [
+            r"SELECT E'a\'b'",
+            r"SELECT e'x'",
+            r"SELECT U&'d\0061t'",
+            "SELECT $$x$$",
+            "SELECT $q$x$q$",
+            "SELECT 1 /* a /* b */ c */",
+        ] {
+            assert!(
+                reject_ambiguous_lexing(sql, SqlEngine::Postgres).is_err(),
+                "must reject: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sql_passes_the_lexing_check() {
+        for engine in [SqlEngine::Postgres, SqlEngine::ClickHouse] {
+            for sql in [
+                "SELECT num FROM blocks WHERE hash = '0xabc' AND note = 'it''s'",
+                "SELECT \"num\" FROM blocks -- trailing comment",
+                "SELECT num FROM blocks /* note */ WHERE num > 1",
+                "SELECT num FROM blocks WHERE miner LIKE'a%'",
+                "SELECT num FROM blocks WHERE type = 'e'",
+            ] {
+                reject_ambiguous_lexing(sql, engine).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+        }
+        // Postgres keeps standard_conforming_strings on, so '\x..' bytea text is
+        // a literal backslash for both parsers and stays allowed there.
+        reject_ambiguous_lexing(r"SELECT num FROM blocks WHERE hash = '\xab'", SqlEngine::Postgres)
+            .unwrap();
     }
 }

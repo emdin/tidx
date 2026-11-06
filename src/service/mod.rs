@@ -179,9 +179,12 @@ pub async fn begin_public_query(
     timeout_ms: u64,
 ) -> Result<deadpool_postgres::Transaction<'_>> {
     let tx = conn.transaction().await?;
+    // standard_conforming_strings keeps backslashes in '...' literal, which is
+    // how the validator's parser reads them (see reject_ambiguous_lexing).
     tx.batch_execute(&format!(
         "SET TRANSACTION READ ONLY; \
          SET LOCAL statement_timeout = {timeout_ms}; \
+         SET LOCAL standard_conforming_strings = on; \
          SET LOCAL ROLE tidx_query"
     ))
     .await?;
@@ -195,6 +198,8 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    crate::query::reject_ambiguous_lexing(sql, crate::query::SqlEngine::Postgres)?;
+
     // Generate CTE SQL if signatures are provided
     let sql = if !signatures.is_empty() {
         let sigs: Vec<EventSignature> = signatures

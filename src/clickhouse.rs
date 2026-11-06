@@ -14,7 +14,8 @@ use tracing::{error, warn};
 use crate::config::ClickHouseConfig;
 use crate::query::{
     enforce_limit, extract_raw_column_predicates, normalize_hex_literals_clickhouse,
-    validate_query_with_cap, EventSignature, HARD_LIMIT_CLICKHOUSE,
+    reject_ambiguous_lexing, validate_query_with_cap, EventSignature, SqlEngine,
+    HARD_LIMIT_CLICKHOUSE,
 };
 
 /// Credentials sent as `X-ClickHouse-User` / `X-ClickHouse-Key`.
@@ -130,6 +131,7 @@ impl ClickHouseEngine {
     /// `default` with `readonly=0`. Trusted internal callers that need DDL
     /// (`views.rs`) use `query` directly and are not subject to this.
     pub fn prepare_public_sql(sql: &str, signatures: &[&str], limit: i64) -> Result<String> {
+        reject_ambiguous_lexing(sql, SqlEngine::ClickHouse)?;
         let sql = Self::wrap_signatures(sql, signatures)?;
         validate_query_with_cap(&sql, HARD_LIMIT_CLICKHOUSE)?;
         Ok(enforce_limit(&sql, limit, HARD_LIMIT_CLICKHOUSE))
@@ -453,6 +455,22 @@ mod tests {
     fn public_sql_rejects_non_select() {
         assert!(ClickHouseEngine::prepare_public_sql("DROP TABLE logs", &[], 100).is_err());
         assert!(ClickHouseEngine::prepare_public_sql("SELECT 1; DROP TABLE logs", &[], 100).is_err());
+    }
+
+    // ClickHouse reads `\'` inside '...' as an escaped quote; the validator's
+    // parser does not, so the two would disagree on where the string ends.
+    #[test]
+    fn public_sql_rejects_backslashes_and_hash_comments() {
+        // Both parse cleanly with GenericDialect, so only the lexing guard stops them.
+        for sql in [
+            r"SELECT num FROM blocks WHERE hash = 'a\b'",
+            r"SELECT num FROM blocks WHERE hash = 'a\\'",
+        ] {
+            assert!(
+                ClickHouseEngine::prepare_public_sql(sql, &[], 100).is_err(),
+                "must reject: {sql}"
+            );
+        }
     }
 
     #[test]
