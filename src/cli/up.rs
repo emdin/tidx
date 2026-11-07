@@ -118,7 +118,9 @@ pub async fn run(args: Args) -> Result<()> {
         let api_pool = match chain.resolved_api_pg_url()? {
             Some(api_url) => {
                 info!(chain = %chain.name, "Creating separate API pool with dedicated credentials");
-                db::create_pool(&api_url).await?
+                let pool = db::create_pool(&api_url).await?;
+                warn_if_superuser(&pool, &chain.name).await;
+                pool
             }
             None => throttled_pool.pool.clone(),
         };
@@ -189,7 +191,10 @@ pub async fn run(args: Args) -> Result<()> {
                     Ok(throttled_pool) => {
                         let api_pool = match event.chain.resolved_api_pg_url() {
                             Ok(Some(api_url)) => match db::create_pool(&api_url).await {
-                                Ok(pool) => pool,
+                                Ok(pool) => {
+                                    warn_if_superuser(&pool, &event.chain.name).await;
+                                    pool
+                                }
                                 Err(_) => throttled_pool.pool.clone(),
                             },
                             _ => throttled_pool.pool.clone(),
@@ -493,5 +498,13 @@ async fn seed_metrics_from_db(pool: &tidx::db::Pool) {
                 tidx::metrics::increment_sink_row_count("postgres", &table, count as u64);
             }
         }
+    }
+}
+
+/// The public /query transaction runs on the API pool; as a superuser session
+/// its SET LOCAL ROLE could be undone. run_migrations warns for the main pool.
+async fn warn_if_superuser(pool: &db::Pool, chain: &str) {
+    if db::connected_as_superuser(pool).await.unwrap_or(false) {
+        warn!(chain = %chain, "api_pg_url connects as a Postgres superuser; use the app role from db/app_role.sql");
     }
 }

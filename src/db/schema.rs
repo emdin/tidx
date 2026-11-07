@@ -3,27 +3,32 @@ use tracing::{info, warn};
 
 use super::Pool;
 
-/// Whether the pool's role is a superuser. The engine should connect as the
-/// ordinary owner role from `db/app_role.sql`: as a superuser, any /query
-/// validator gap is file access and code execution (2026-11-06).
+/// The ordinary owner role `db/app_role.sql` creates for the engine.
+pub const APP_ROLE: &str = "tidx_app";
+
+/// Whether the pool's role is a superuser. The engine should connect as
+/// [`APP_ROLE`]: as a superuser, any /query validator gap is file access and
+/// code execution (2026-11-06).
 pub async fn connected_as_superuser(pool: &Pool) -> Result<bool> {
     let conn = pool.get().await?;
+    is_superuser(&conn).await
+}
+
+async fn is_superuser(conn: &tokio_postgres::Client) -> Result<bool> {
     let row = conn
-        .query_one(
-            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
-            &[],
-        )
+        .query_one("SELECT current_setting('is_superuser') = 'on'", &[])
         .await?;
     Ok(row.get(0))
 }
 
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
-    if connected_as_superuser(pool).await? {
+    let conn = pool.get().await?;
+    let superuser = is_superuser(&conn).await?;
+    if superuser {
         warn!(
-            "Connected to Postgres as a superuser; run db/app_role.sql and point pg_url at tidx_app"
+            "Connected to Postgres as a superuser; run db/app_role.sql and point pg_url at {APP_ROLE}"
         );
     }
-    let conn = pool.get().await?;
 
     // Best-effort cleanup of other connections before running migrations.
     // We cannot always terminate admin/superuser sessions from the app role,
@@ -75,6 +80,35 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         );
     }
 
+    // A superuser (e.g. a backfill CLI still on the old URL) migrates as the
+    // app role when it exists, so the app role can ALTER and CREATE OR REPLACE
+    // everything on its next boot.
+    let as_app_role = superuser
+        && conn
+            .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&APP_ROLE])
+            .await?
+            .is_some();
+    if as_app_role {
+        // Idempotent: also hands over anything a superuser created since.
+        conn.batch_execute(include_str!("../../db/app_role.sql"))
+            .await?;
+        conn.batch_execute(&format!("SET ROLE {APP_ROLE}")).await?;
+    }
+    let applied = apply_migrations(&conn).await;
+    if as_app_role {
+        conn.batch_execute("RESET ROLE").await?;
+    }
+    applied?;
+
+    drop(conn);
+    // Fail fast at boot if a source-table migration has drifted from its
+    // orphaned_* twin: the reorg handler would corrupt at 3 a.m. otherwise.
+    crate::sync::reorg_archive::assert_schema_parity(pool).await?;
+
+    Ok(())
+}
+
+async fn apply_migrations(conn: &tokio_postgres::Client) -> Result<()> {
     info!("Running schema migrations");
     conn.batch_execute(include_str!("../../db/blocks.sql"))
         .await?;
@@ -107,11 +141,5 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     // Last, so its GRANT ... ON ALL TABLES covers every table created above.
     conn.batch_execute(include_str!("../../db/query_role.sql"))
         .await?;
-
-    drop(conn);
-    // Fail fast at boot if a source-table migration has drifted from its
-    // orphaned_* twin: the reorg handler would corrupt at 3 a.m. otherwise.
-    crate::sync::reorg_archive::assert_schema_parity(pool).await?;
-
     Ok(())
 }

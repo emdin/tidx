@@ -204,10 +204,12 @@ Run the engine as an ordinary role, not the Postgres superuser. With a superuser
 
 ```
 psql -U <superuser> -d tidx_igra -f db/app_role.sql
-psql -U <superuser> -d tidx_igra -c "ALTER ROLE tidx_app PASSWORD '...'"
+psql -U <superuser> -d tidx_igra      # then: \password tidx_app
 ```
 
-The script is idempotent. On a database that already has data, stop the engine first, because changing owners briefly locks each table. `tidx up` logs a warning at startup while it is connected as a superuser.
+Set the password with `\password` (it sends a hash) or after `SET log_statement = 'none'` in the same session. With `log_statement = ddl`, a plain `ALTER ROLE ... PASSWORD '...'` is written to the Postgres log in clear text.
+
+The script is idempotent: it also strips extra attributes and role memberships from existing `tidx_app`/`tidx_query` roles. On a database that already has data, stop the engine first, because changing owners briefly locks each table. `tidx up` logs a warning at startup while it is connected as a superuser, including through `api_pg_url`. When a superuser does run the migrations (for example a backfill CLI still on the old URL) and `tidx_app` exists, it re-applies `app_role.sql` and migrates as `tidx_app`, so everything stays owned by it.
 
 ### Reference
 

@@ -4,7 +4,11 @@
 -- pg_url at it:
 --
 --   psql -U tidx -d tidx_igra -f db/app_role.sql
---   psql -U tidx -d tidx_igra -c "ALTER ROLE tidx_app PASSWORD '...'"
+--   psql -U tidx -d tidx_igra    then:  \password tidx_app
+--
+-- Use \password (it sends a hash) or SET log_statement = 'none' in the same
+-- session: with log_statement=ddl a plain ALTER ROLE ... PASSWORD '...' lands
+-- in the Postgres log in clear text.
 --
 -- 2026-11-06: tidx connected as the bootstrap superuser, so a /query validator
 -- gap became pg_read_file, lo_export and code execution in the container.
@@ -25,6 +29,31 @@ BEGIN
         CREATE ROLE tidx_query NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
     END IF;
     EXECUTE format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO tidx_app', current_database());
+END $$;
+
+-- Enforced on every run, not only at creation: a role left over with extra
+-- powers (an earlier manual attempt, or an intruder with superuser) must not
+-- keep them.
+ALTER ROLE tidx_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE tidx_query NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+
+-- No role memberships besides tidx_app -> tidx_query (e.g. not
+-- pg_read_server_files or pg_execute_server_program).
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT m.rolname AS member, g.rolname AS granted, gr.rolname AS grantor
+        FROM pg_auth_members am
+        JOIN pg_roles m ON m.oid = am.member
+        JOIN pg_roles g ON g.oid = am.roleid
+        JOIN pg_roles gr ON gr.oid = am.grantor
+        WHERE m.rolname IN ('tidx_app', 'tidx_query')
+          AND NOT (m.rolname = 'tidx_app' AND g.rolname = 'tidx_query')
+    LOOP
+        EXECUTE format('REVOKE %I FROM %I GRANTED BY %I CASCADE', r.granted, r.member, r.grantor);
+    END LOOP;
 END $$;
 
 -- The public /query transaction runs SET LOCAL ROLE tidx_query.
@@ -52,12 +81,18 @@ BEGIN
         EXECUTE format('ALTER %s %s OWNER TO tidx_app', r.kind, r.obj);
     END LOOP;
 
-    -- After the tables: a sequence owned by a column moved with its table.
+    -- Standalone sequences only: one owned by a column (serial, identity)
+    -- moves with its table and cannot be re-owned on its own.
     FOR r IN
         SELECT c.oid::regclass AS obj
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'S'
           AND c.relowner <> 'tidx_app'::regrole
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
+          )
     LOOP
         EXECUTE format('ALTER SEQUENCE %s OWNER TO tidx_app', r.obj);
     END LOOP;

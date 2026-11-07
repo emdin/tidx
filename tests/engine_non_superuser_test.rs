@@ -42,6 +42,14 @@ async fn app_pool(db: &TestDb) -> Pool {
     create_pool(&app_role_url()).await.expect("tidx_app pool")
 }
 
+async fn superuser_name(db: &TestDb) -> String {
+    let conn = db.pool.get().await.unwrap();
+    conn.query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
 async fn sqlstate(pool: &Pool, sql: &str) -> String {
     let conn = pool.get().await.unwrap();
     let err = conn
@@ -165,6 +173,8 @@ async fn engine_role_writes_and_serves_public_queries() {
 async fn engine_role_has_no_superuser_powers() {
     let db = TestDb::empty().await;
     let pool = app_pool(&db).await;
+    let superuser = superuser_name(&db).await;
+    let set_role_superuser = format!("SET ROLE \"{superuser}\"");
 
     for sql in [
         "SELECT pg_read_file('/etc/passwd')",
@@ -173,7 +183,7 @@ async fn engine_role_has_no_superuser_powers() {
         "COPY (SELECT 1) TO '/tmp/tidx_app_test'",
         "SELECT lo_import('/etc/passwd')",
         "CREATE ROLE tidx_app_escalation",
-        "SET ROLE tidx",
+        set_role_superuser.as_str(),
     ] {
         assert_eq!(sqlstate(&pool, sql).await, INSUFFICIENT_PRIVILEGE, "{sql}");
     }
@@ -202,4 +212,139 @@ async fn superuser_connection_is_detected() {
     assert!(connected_as_superuser(&db.pool).await.unwrap());
     let pool = app_pool(&db).await;
     assert!(!connected_as_superuser(&pool).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn script_strips_powers_from_existing_roles() {
+    // Review of #46: attributes were only set when the role was created, so a
+    // tidx_app left over with extra powers kept them.
+    let db = TestDb::empty().await;
+    setup_app_role(&db).await;
+    let conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "ALTER ROLE tidx_app CREATEROLE CREATEDB BYPASSRLS;
+         GRANT pg_read_server_files, pg_execute_server_program TO tidx_app;
+         ALTER ROLE tidx_query LOGIN INHERIT;
+         GRANT pg_read_all_data TO tidx_query;",
+    )
+    .await
+    .unwrap();
+
+    setup_app_role(&db).await;
+
+    let row = conn
+        .query_one(
+            "SELECT a.rolcreaterole OR a.rolcreatedb OR a.rolbypassrls OR a.rolsuper OR a.rolreplication,
+                    q.rolcanlogin OR q.rolinherit OR q.rolcreaterole OR q.rolsuper
+             FROM pg_roles a, pg_roles q WHERE a.rolname = 'tidx_app' AND q.rolname = 'tidx_query'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!row.get::<_, bool>(0), "tidx_app kept extra attributes");
+    assert!(!row.get::<_, bool>(1), "tidx_query kept extra attributes");
+    let memberships: Vec<String> = conn
+        .query(
+            "SELECT m.rolname::text || ' -> ' || r.rolname::text
+             FROM pg_auth_members am JOIN pg_roles m ON m.oid = am.member JOIN pg_roles r ON r.oid = am.roleid
+             WHERE m.rolname IN ('tidx_app', 'tidx_query') ORDER BY 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(memberships, vec!["tidx_app -> tidx_query".to_string()]);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn script_handles_range_types() {
+    // A range type comes with a multirange type; both must be handed over
+    // (Postgres 16 re-owns them separately).
+    let db = TestDb::empty().await;
+    let conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "DROP TYPE IF EXISTS tidx_test_range; CREATE TYPE tidx_test_range AS RANGE (subtype = int8)",
+    )
+    .await
+    .unwrap();
+    setup_app_role(&db).await;
+    let owner: String = conn
+        .query_one(
+            "SELECT pg_get_userbyid(typowner)::text FROM pg_type WHERE typname = 'tidx_test_range'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    conn.batch_execute("DROP TYPE tidx_test_range")
+        .await
+        .unwrap();
+    assert_eq!(owner, "tidx_app");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn superuser_migrations_create_objects_owned_by_the_app_role() {
+    // Review of #46: a backfill CLI still on the superuser URL runs migrations
+    // too; anything it created was owned by the superuser and tidx_app could
+    // not CREATE OR REPLACE / ALTER it on its next boot.
+    let db = TestDb::empty().await;
+    let app = app_pool(&db).await;
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP FUNCTION abi_uint(BYTEA);
+             ALTER FUNCTION abi_int(BYTEA) OWNER TO \"{}\"",
+            superuser_name(&db).await
+        ))
+        .await
+        .unwrap();
+
+    // run_migrations ends other sessions first, so connect afterwards.
+    run_migrations(&db.pool)
+        .await
+        .expect("migrations as the superuser");
+
+    let conn = db.pool.get().await.unwrap();
+    let owner: String = conn
+        .query_one(
+            "SELECT pg_get_userbyid(proowner)::text FROM pg_proc WHERE oid = 'abi_uint(bytea)'::regprocedure",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(owner, "tidx_app");
+    // ...and an object the superuser created earlier is handed over too.
+    let healed: String = conn
+        .query_one(
+            "SELECT pg_get_userbyid(proowner)::text FROM pg_proc WHERE oid = 'abi_int(bytea)'::regprocedure",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(healed, "tidx_app");
+    let role: String = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(
+        role, "tidx_app",
+        "the superuser pool must not be left switched to tidx_app"
+    );
+    run_migrations(&app)
+        .await
+        .expect("tidx_app migrates after a superuser run");
 }
