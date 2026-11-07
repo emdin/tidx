@@ -90,11 +90,15 @@ pub enum AdminToken {
 
 impl AdminToken {
     pub fn from_config(http_config: &HttpConfig) -> Self {
+        Self::resolve(http_config, |var| std::env::var(var).ok())
+    }
+
+    fn resolve(http_config: &HttpConfig, env: impl Fn(&str) -> Option<String>) -> Self {
         let Some(var) = &http_config.admin_token_env else {
             return Self::NotRequired;
         };
-        match std::env::var(var) {
-            Ok(token) if !token.is_empty() => Self::Required(token.into()),
+        match env(var) {
+            Some(token) if !token.is_empty() => Self::Required(token.into()),
             _ => {
                 tracing::error!(
                     env = %var,
@@ -112,14 +116,22 @@ impl AdminToken {
             Self::Required(expected) => headers
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())),
+                .and_then(|v| v.trim().split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .is_some_and(|(_, got)| digests_equal(got.trim(), expected)),
         }
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// Compares SHA3 digests in constant time, so neither the content nor the
+/// length of the token shows up in response timing.
+fn digests_equal(a: &str, b: &str) -> bool {
+    use sha3::{Digest, Sha3_256};
+    let (a, b) = (Sha3_256::digest(a), Sha3_256::digest(b));
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 impl AppState {
@@ -192,26 +204,40 @@ impl AppState {
     /// proxied through Caddy is judged by the real originating client, and,
     /// when configured, requires the admin token as well.
     pub fn is_trusted_request(&self, peer: &SocketAddr, headers: &HeaderMap) -> bool {
-        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        self.is_trusted_cidr(self.effective_client_ip(peer.ip(), xff))
+        self.is_trusted_cidr(self.client_ip(peer.ip(), headers))
             && self.admin_token.accepts(headers)
+    }
+
+    fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        self.effective_client_ip(peer, xff)
     }
 }
 
 /// Parse CIDR strings into (network, prefix_len) tuples
+/// A bare address is a single host (/32 or /128). Unparseable entries are
+/// dropped with a warning.
 pub fn parse_cidrs(cidrs: &[String]) -> Vec<(IpAddr, u8)> {
     cidrs
         .iter()
         .filter_map(|cidr| {
-            let parts: Vec<&str> = cidr.split('/').collect();
-            if parts.len() != 2 {
-                return None;
+            let parsed = parse_cidr(cidr);
+            if parsed.is_none() {
+                tracing::warn!(entry = %cidr, "ignoring unparseable CIDR");
             }
-            let ip: IpAddr = parts[0].parse().ok()?;
-            let prefix: u8 = parts[1].parse().ok()?;
-            Some((ip, prefix))
+            parsed
         })
         .collect()
+}
+
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (ip, prefix) = match cidr.split_once('/') {
+        Some((ip, prefix)) => (ip.parse::<IpAddr>().ok()?, Some(prefix.parse::<u8>().ok()?)),
+        None => (cidr.parse::<IpAddr>().ok()?, None),
+    };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = prefix.unwrap_or(max);
+    (prefix <= max).then_some((ip, prefix))
 }
 
 /// Check if an IP is within a CIDR range
@@ -784,10 +810,11 @@ fn check_query_rate(
     let (Some(limiter), Some(Extension(ConnectInfo(peer)))) = (&state.query_limiter, peer) else {
         return Ok(());
     };
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let client = state.effective_client_ip(peer.ip(), xff);
     limiter
-        .check(client, std::time::Instant::now())
+        .check(
+            state.client_ip(peer.ip(), headers),
+            std::time::Instant::now(),
+        )
         .map_err(|retry| ApiError::TooManyRequests(retry.as_secs_f64().ceil().max(1.0) as u64))
 }
 
@@ -1130,7 +1157,7 @@ impl IntoResponse for ApiError {
             ApiError::TooManyRequests(retry_after) => {
                 let body = serde_json::json!({
                     "ok": false,
-                    "error": format!("Rate limit exceeded; retry in {retry_after}s")
+                    "error": self.to_string()
                 });
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -1200,6 +1227,17 @@ mod tests {
     }
 
     #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        let peer: SocketAddr = IMPORTER.parse().unwrap();
+        for value in ["bearer s3cret", "BEARER s3cret", "Bearer   s3cret"] {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", value.parse().unwrap());
+            assert!(state.is_trusted_request(&peer, &h), "{value}");
+        }
+    }
+
+    #[test]
     fn wrong_or_malformed_token_is_rejected() {
         let state = with_token(AdminToken::Required("s3cret".into()));
         let peer: SocketAddr = IMPORTER.parse().unwrap();
@@ -1230,30 +1268,29 @@ mod tests {
 
     #[test]
     fn admin_token_resolves_from_the_configured_env_var() {
-        let none = HttpConfig::default();
-        assert!(matches!(
-            AdminToken::from_config(&none),
-            AdminToken::NotRequired
-        ));
-
-        // SAFETY: test-unique variable names; nothing else reads them.
-        unsafe { std::env::set_var("TIDX_TEST_ADMIN_TOKEN_SET", "s3cret") };
-        let set = HttpConfig {
-            admin_token_env: Some("TIDX_TEST_ADMIN_TOKEN_SET".to_string()),
+        let env = |var: &str| match var {
+            "SET" => Some("s3cret".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let cfg = |var: Option<&str>| HttpConfig {
+            admin_token_env: var.map(str::to_string),
             ..HttpConfig::default()
         };
-        assert!(
-            matches!(AdminToken::from_config(&set), AdminToken::Required(t) if &*t == "s3cret")
-        );
-
-        unsafe { std::env::set_var("TIDX_TEST_ADMIN_TOKEN_EMPTY", "") };
-        for var in ["TIDX_TEST_ADMIN_TOKEN_EMPTY", "TIDX_TEST_ADMIN_TOKEN_UNSET"] {
-            let cfg = HttpConfig {
-                admin_token_env: Some(var.to_string()),
-                ..HttpConfig::default()
-            };
+        assert!(matches!(
+            AdminToken::resolve(&cfg(None), env),
+            AdminToken::NotRequired
+        ));
+        assert!(matches!(
+            AdminToken::resolve(&cfg(Some("SET")), env),
+            AdminToken::Required(t) if &*t == "s3cret"
+        ));
+        for var in ["EMPTY", "UNSET"] {
             assert!(
-                matches!(AdminToken::from_config(&cfg), AdminToken::Missing),
+                matches!(
+                    AdminToken::resolve(&cfg(Some(var)), env),
+                    AdminToken::Missing
+                ),
                 "{var}"
             );
         }
@@ -1342,11 +1379,26 @@ mod tests {
     fn test_parse_cidrs_invalid() {
         let cidrs = vec![
             "invalid".to_string(),
-            "100.64.0.0".to_string(),     // Missing prefix
             "100.64.0.0/abc".to_string(), // Invalid prefix
+            "10.0.0.0/33".to_string(),    // Prefix out of range
+            "::1/129".to_string(),
         ];
         let parsed = parse_cidrs(&cidrs);
         assert_eq!(parsed.len(), 0);
+    }
+
+    #[test]
+    fn bare_ip_parses_as_a_single_host() {
+        // Review of #45: `query_rate_limit_exempt = ["159.195.144.236"]` was
+        // silently dropped, so the exemption never applied.
+        let parsed = parse_cidrs(&["159.195.144.236".to_string(), "2001:db8::5".to_string()]);
+        assert_eq!(
+            parsed,
+            vec![
+                ("159.195.144.236".parse().unwrap(), 32),
+                ("2001:db8::5".parse().unwrap(), 128)
+            ]
+        );
     }
 
     #[test]

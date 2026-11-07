@@ -16,7 +16,15 @@ pub struct RateLimiter {
     refill_per_sec: f64,
     exempt: Vec<(IpAddr, u8)>,
     max_tracked: usize,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    state: Mutex<State>,
+}
+
+struct State {
+    buckets: HashMap<IpAddr, Bucket>,
+    /// When the table is full, sweep at most once per refill interval so an
+    /// untracked request is not an O(n) scan under the lock.
+    next_sweep: Option<Instant>,
+    sweeps: usize,
 }
 
 struct Bucket {
@@ -42,13 +50,28 @@ impl RateLimiter {
             refill_per_sec: f64::from(per_minute) / 60.0,
             exempt,
             max_tracked,
-            buckets: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                buckets: HashMap::new(),
+                next_sweep: None,
+                sweeps: 0,
+            }),
         }
+    }
+
+    #[cfg(test)]
+    fn sweeps(&self) -> usize {
+        self.state.lock().unwrap().sweeps
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.state.lock().unwrap().buckets.len()
     }
 
     /// `Ok` when the client may proceed; `Err(retry_after)` when it is over
     /// its rate.
     pub fn check(&self, client: IpAddr, now: Instant) -> Result<(), Duration> {
+        let client = unmap_ipv4(client);
         if self
             .exempt
             .iter()
@@ -57,11 +80,20 @@ impl RateLimiter {
             return Ok(());
         }
         let key = bucket_key(client);
-        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let State {
+            buckets,
+            next_sweep,
+            sweeps,
+        } = &mut *state;
         if !buckets.contains_key(&key) && buckets.len() >= self.max_tracked {
-            // A bucket that has refilled completely carries no state.
             let refill_time = Duration::from_secs_f64(self.capacity / self.refill_per_sec);
-            buckets.retain(|_, b| now.saturating_duration_since(b.updated) < refill_time);
+            if next_sweep.is_none_or(|at| now >= at) {
+                // A bucket that has refilled completely carries no state.
+                buckets.retain(|_, b| now.saturating_duration_since(b.updated) < refill_time);
+                *next_sweep = Some(now + refill_time);
+                *sweeps += 1;
+            }
             if buckets.len() >= self.max_tracked {
                 // Too many clients mid-burst to track one more; a per-client
                 // limit cannot stop a distributed flood anyway, so let it pass.
@@ -86,15 +118,19 @@ impl RateLimiter {
     }
 }
 
+fn unmap_ipv4(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 /// IPv6 clients are keyed by their /64: one subscriber usually owns a whole
 /// /64 and could otherwise take a fresh bucket per address.
 fn bucket_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
-        },
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
     }
 }
 
@@ -191,6 +227,36 @@ mod tests {
     }
 
     #[test]
+    fn exempt_matches_the_ipv4_mapped_form() {
+        let rl = RateLimiter::new(60, 1, vec![(ip("159.195.144.236"), 32)]);
+        let t = Instant::now();
+        for _ in 0..10 {
+            assert!(rl.check(ip("::ffff:159.195.144.236"), t).is_ok());
+        }
+    }
+
+    #[test]
+    fn full_table_is_swept_at_most_once_per_refill_interval() {
+        // Review of #45: sweeping on every untracked request made each one an
+        // O(n) scan under the lock once the table was full.
+        let rl = RateLimiter::with_max_tracked(60, 1, vec![], 2);
+        let t = Instant::now();
+        assert!(rl.check(ip("203.0.113.1"), t).is_ok());
+        assert!(rl.check(ip("203.0.113.2"), t).is_ok());
+        for i in 3..50 {
+            let at = t + Duration::from_millis(10 * i);
+            assert!(rl.check(ip(&format!("203.0.113.{i}")), at).is_ok());
+        }
+        assert_eq!(rl.sweeps(), 1);
+        // One refill interval (1 s for burst 1 at 60/min) later: sweep again.
+        assert!(
+            rl.check(ip("203.0.113.99"), t + Duration::from_millis(1600))
+                .is_ok()
+        );
+        assert_eq!(rl.sweeps(), 2);
+    }
+
+    #[test]
     fn memory_stays_bounded_and_idle_buckets_are_dropped() {
         let rl = RateLimiter::with_max_tracked(60, 1, vec![], 3);
         let t = Instant::now();
@@ -199,11 +265,11 @@ mod tests {
         }
         // Full and all mid-burst: a 4th client passes untracked.
         assert!(rl.check(ip("203.0.113.4"), t).is_ok());
-        assert_eq!(rl.buckets.lock().unwrap().len(), 3);
+        assert_eq!(rl.tracked(), 3);
         // Once the old buckets have refilled they are dropped to make room.
         let later = t + Duration::from_secs(2);
         assert!(rl.check(ip("203.0.113.5"), later).is_ok());
-        assert_eq!(rl.buckets.lock().unwrap().len(), 1);
+        assert_eq!(rl.tracked(), 1);
         assert!(rl.check(ip("203.0.113.5"), later).is_err());
     }
 }

@@ -3,8 +3,8 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query,
-    SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    ArrayElemTypeDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    ObjectName, Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -131,15 +131,17 @@ pub fn reject_ambiguous_lexing(sql: &str, engine: SqlEngine) -> Result<()> {
     while i < b.len() {
         match b[i] {
             q @ (b'\'' | b'"' | b'`') => {
-                if q == b'\'' && engine == SqlEngine::Postgres {
+                if engine == SqlEngine::Postgres && q != b'`' {
                     let prefixed = |at: usize, set: &[u8]| {
                         i > at && set.contains(&b[i - 1 - at]) && (i < at + 2 || !is_ident(b[i - 2 - at]))
                     };
-                    if prefixed(0, b"eE") {
+                    if q == b'\'' && prefixed(0, b"eE") {
                         return reject("An E'...' escape string");
                     }
+                    // U&"..." identifiers too: sqlparser reads `U & "..."`, so a
+                    // cast to U&"\0072egclass" passed the type check (#45 review).
                     if i >= 2 && b[i - 1] == b'&' && prefixed(1, b"uU") {
-                        return reject("A U&'...' string");
+                        return reject("A U&'...' string or U&\"...\" identifier");
                     }
                 }
                 i += 1;
@@ -274,20 +276,30 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
 /// a name up in the system catalogs while casting, so `'pg_authid'::regclass`
 /// tells a caller whether any relation exists, whatever the table allowlist
 /// says. No other built-in PostgreSQL or ClickHouse type name starts with "reg".
-/// Single-quoted literals inside the type (time zones, enum labels) are skipped.
+/// Only type names are checked (through arrays and wrappers), not field names
+/// or literal arguments such as time zones and enum labels.
 fn is_catalog_lookup_type(data_type: &DataType) -> bool {
-    let mut words = String::new();
-    let mut in_literal = false;
-    for c in data_type.to_string().chars() {
-        if c == '\'' {
-            in_literal = !in_literal;
-        } else if !in_literal {
-            words.push(c.to_ascii_lowercase());
+    match data_type {
+        DataType::Regclass => true,
+        DataType::Custom(name, _) => name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .is_some_and(|ident| ident.value.to_ascii_lowercase().starts_with("reg")),
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::Parenthesis(inner),
+        )
+        | DataType::Nullable(inner)
+        | DataType::LowCardinality(inner) => is_catalog_lookup_type(inner),
+        DataType::Map(key, value) => is_catalog_lookup_type(key) || is_catalog_lookup_type(value),
+        DataType::Tuple(fields) | DataType::Struct(fields, _) => {
+            fields.iter().any(|f| is_catalog_lookup_type(&f.field_type))
         }
+        DataType::Nested(columns) => columns.iter().any(|c| is_catalog_lookup_type(&c.data_type)),
+        _ => false,
     }
-    words
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|word| word.starts_with("reg"))
 }
 
 fn extract_cte_names(query: &Query) -> HashSet<String> {
@@ -1259,6 +1271,9 @@ mod tests {
             // Quoted literals inside a type are not type names.
             "SELECT CAST(timestamp AS DateTime64(3, 'America/Regina')) AS t FROM blocks",
             "SELECT CAST('a' AS Enum8('regular' = 1, 'other' = 2)) AS e",
+            // Field names are not type names.
+            "SELECT CAST(num AS Tuple(region String, registered UInt8)) AS t FROM blocks",
+            "SELECT CAST(num AS Nullable(String)) AS t FROM blocks",
         ] {
             assert!(validate_query(sql).is_ok(), "should allow: {sql}");
         }
@@ -1467,6 +1482,11 @@ mod tests {
             r"SELECT E'a\'b'",
             r"SELECT e'x'",
             r"SELECT U&'d\0061t'",
+            // Code review of #45: sqlparser reads this as a cast to type U, AND,
+            // an identifier; Postgres reads a cast to regclass.
+            r#"SELECT 'pg_authid'::U&"\0072egclass"::text AS t"#,
+            r#"SELECT 'pg_authid'::u&"\0072egclass" AS t"#,
+            r#"SELECT U&"\0070g_authid".x FROM blocks"#,
             "SELECT $$x$$",
             "SELECT $q$x$q$",
             "SELECT 1 /* a /* b */ c */",
@@ -1487,6 +1507,8 @@ mod tests {
                 "SELECT num FROM blocks /* note */ WHERE num > 1",
                 "SELECT num FROM blocks WHERE miner LIKE'a%'",
                 "SELECT num FROM blocks WHERE type = 'e'",
+                r#"SELECT 'U&"x"' AS t"#,
+                r#"SELECT num & "num" FROM blocks"#,
             ] {
                 reject_ambiguous_lexing(sql, engine).unwrap_or_else(|e| panic!("{sql}: {e}"));
             }

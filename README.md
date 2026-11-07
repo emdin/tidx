@@ -206,10 +206,10 @@ database = "tidx_38833"
 ├── port                    u16       = 8080         HTTP server port
 ├── bind                    string    = "0.0.0.0"    Bind address
 ├── trusted_cidrs           string[]  = []           Trusted CIDRs for admin ops (e.g., Tailscale)
-├── admin_token_env         string    (optional)     Env var with a shared secret; admin ops then also need `Authorization: Bearer <secret>` (unset/empty var = all admin ops denied)
-├── query_rate_limit_per_minute u32   = 0            Per-client /query limit (0 = off); client = real caller behind a trusted proxy
+├── admin_token_env         string    (optional)     Env var with a shared secret; admin ops then also need `Authorization: Bearer <secret>` (unset/empty var = all admin ops denied). The explorer UI does not send it, so its admin panel is hidden while this is set; use the API or CLI
+├── query_rate_limit_per_minute u32   = 0            Per-client /query limit (0 = off); client = real caller behind a trusted proxy. Internal callers in `trusted_cidrs` are limited too unless exempted
 ├── query_rate_limit_burst  u32       = 0            Requests allowed at once before the rate applies (0 = per_minute)
-└── query_rate_limit_exempt string[]  = []           Client CIDRs never rate-limited
+└── query_rate_limit_exempt string[]  = []           Client CIDRs (or bare IPs) never rate-limited
 
 [prometheus]                                       Prometheus metrics server
 ├── enabled                 bool      = true         Enable metrics endpoint
