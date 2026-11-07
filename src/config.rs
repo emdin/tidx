@@ -41,6 +41,28 @@ pub struct HttpConfig {
     /// Public Kaspa explorer base URL used for L1 provenance links.
     #[serde(default = "default_kaspa_explorer_base_url")]
     pub kaspa_explorer_base_url: String,
+
+    /// Per-client limit on `/query`, in requests per minute (0 = no limit).
+    /// The client is the real caller behind a trusted proxy (X-Forwarded-For).
+    #[serde(default)]
+    pub query_rate_limit_per_minute: u32,
+
+    /// Requests a client may send at once before the per-minute rate applies
+    /// (0 = same as `query_rate_limit_per_minute`).
+    #[serde(default)]
+    pub query_rate_limit_burst: u32,
+
+    /// Client CIDRs that are never rate-limited, e.g. this host's own public
+    /// address when co-located consumers reach `/query` through the proxy.
+    #[serde(default)]
+    pub query_rate_limit_exempt: Vec<String>,
+
+    /// Name of an env var holding a shared secret. When set, admin endpoints
+    /// (POST/DELETE /views, explorer verify/label/refresh) also require
+    /// `Authorization: Bearer <secret>` on top of the trusted-IP check. If the
+    /// variable is unset or empty, every admin call is denied.
+    #[serde(default)]
+    pub admin_token_env: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -51,6 +73,10 @@ impl Default for HttpConfig {
             bind: "0.0.0.0".to_string(),
             trusted_cidrs: Vec::new(),
             kaspa_explorer_base_url: default_kaspa_explorer_base_url(),
+            query_rate_limit_per_minute: 0,
+            query_rate_limit_burst: 0,
+            query_rate_limit_exempt: Vec::new(),
+            admin_token_env: None,
         }
     }
 }

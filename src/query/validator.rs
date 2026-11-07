@@ -3,8 +3,8 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
-    Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    ArrayElemTypeDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    ObjectName, Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -131,15 +131,17 @@ pub fn reject_ambiguous_lexing(sql: &str, engine: SqlEngine) -> Result<()> {
     while i < b.len() {
         match b[i] {
             q @ (b'\'' | b'"' | b'`') => {
-                if q == b'\'' && engine == SqlEngine::Postgres {
+                if engine == SqlEngine::Postgres && q != b'`' {
                     let prefixed = |at: usize, set: &[u8]| {
                         i > at && set.contains(&b[i - 1 - at]) && (i < at + 2 || !is_ident(b[i - 2 - at]))
                     };
-                    if prefixed(0, b"eE") {
+                    if q == b'\'' && prefixed(0, b"eE") {
                         return reject("An E'...' escape string");
                     }
+                    // U&"..." identifiers too: sqlparser reads `U & "..."`, so a
+                    // cast to U&"\0072egclass" passed the type check (#45 review).
                     if i >= 2 && b[i - 1] == b'&' && prefixed(1, b"uU") {
-                        return reject("A U&'...' string");
+                        return reject("A U&'...' string or U&\"...\" identifier");
                     }
                 }
                 i += 1;
@@ -230,11 +232,22 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
         }
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<String> {
-            if let Expr::Function(func) = expr {
-                let name = func.name.to_string().to_lowercase();
-                if !is_allowed_function(&name) {
-                    return ControlFlow::Break(format!("Function '{name}' is not allowed"));
+            let cast_to = match expr {
+                Expr::Function(func) => {
+                    let name = func.name.to_string().to_lowercase();
+                    if !is_allowed_function(&name) {
+                        return ControlFlow::Break(format!("Function '{name}' is not allowed"));
+                    }
+                    None
                 }
+                Expr::Cast { data_type, .. } => Some(data_type),
+                Expr::TypedString(ts) => Some(&ts.data_type),
+                _ => None,
+            };
+            if cast_to.is_some_and(is_catalog_lookup_type) {
+                return ControlFlow::Break(
+                    "Casts to reg* catalog types are not allowed".to_string(),
+                );
             }
             ControlFlow::Continue(())
         }
@@ -256,6 +269,36 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
     match stmt.visit(&mut HiddenCalls { cte_names: &ctes.0 }) {
         ControlFlow::Break(reason) => Err(anyhow!(reason)),
         ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
+/// PostgreSQL's reg* types (regclass, regprocedure, regtype, regrole, ...) look
+/// a name up in the system catalogs while casting, so `'pg_authid'::regclass`
+/// tells a caller whether any relation exists, whatever the table allowlist
+/// says. No other built-in PostgreSQL or ClickHouse type name starts with "reg".
+/// Only type names are checked (through arrays and wrappers), not field names
+/// or literal arguments such as time zones and enum labels.
+fn is_catalog_lookup_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Regclass => true,
+        DataType::Custom(name, _) => name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .is_some_and(|ident| ident.value.to_ascii_lowercase().starts_with("reg")),
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::Parenthesis(inner),
+        )
+        | DataType::Nullable(inner)
+        | DataType::LowCardinality(inner) => is_catalog_lookup_type(inner),
+        DataType::Map(key, value) => is_catalog_lookup_type(key) || is_catalog_lookup_type(value),
+        DataType::Tuple(fields) | DataType::Struct(fields, _) => {
+            fields.iter().any(|f| is_catalog_lookup_type(&f.field_type))
+        }
+        DataType::Nested(columns) => columns.iter().any(|c| is_catalog_lookup_type(&c.data_type)),
+        _ => false,
     }
 }
 
@@ -1190,6 +1233,53 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_catalog_lookup_casts() {
+        // 2026-11-07: a prober used '<name>'::regclass / ::regprocedure to test
+        // whether any table or function exists, bypassing the table allowlist.
+        for sql in [
+            "SELECT 'pg_authid'::regclass::text AS t",
+            "SELECT 'pg_read_file(text)'::regprocedure::text AS t",
+            "SELECT CAST('pg_class' AS regclass) AS t",
+            "SELECT regclass 'pg_class' AS t",
+            "SELECT 'pg_class'::pg_catalog.regclass AS t",
+            "SELECT 'pg_class'::\"regclass\" AS t",
+            "SELECT '{pg_class}'::regclass[] AS t",
+            "SELECT 'int4'::regtype AS t",
+            "SELECT 'postgres'::regrole AS t",
+            "SELECT 'public'::regnamespace AS t",
+            "SELECT 'now'::regproc AS t",
+            "SELECT '+'::regoper AS t",
+            "SELECT 'english'::regconfig AS t",
+            "SELECT num FROM blocks WHERE 'pg_authid'::regclass IS NOT NULL",
+            "SELECT 1 AS y WHERE ('pg_authid'::regclass)::text = ANY (SELECT 'x')",
+            "SELECT to_regclass('pg_authid') AS t",
+        ] {
+            assert!(validate_query(sql).is_err(), "should reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_allows_ordinary_casts() {
+        for sql in [
+            "SELECT num::text FROM blocks",
+            "SELECT '1'::numeric AS n",
+            "SELECT CAST(num AS BIGINT) FROM blocks",
+            "SELECT num::varchar(20) FROM blocks",
+            "SELECT timestamp::date FROM blocks",
+            "SELECT '{1,2}'::int[] AS a",
+            "SELECT date '2026-01-01' AS d",
+            // Quoted literals inside a type are not type names.
+            "SELECT CAST(timestamp AS DateTime64(3, 'America/Regina')) AS t FROM blocks",
+            "SELECT CAST('a' AS Enum8('regular' = 1, 'other' = 2)) AS e",
+            // Field names are not type names.
+            "SELECT CAST(num AS Tuple(region String, registered UInt8)) AS t FROM blocks",
+            "SELECT CAST(num AS Nullable(String)) AS t FROM blocks",
+        ] {
+            assert!(validate_query(sql).is_ok(), "should allow: {sql}");
+        }
+    }
+
+    #[test]
     fn test_allows_between() {
         assert!(validate_query("SELECT * FROM blocks WHERE num BETWEEN 1 AND 100").is_ok());
     }
@@ -1392,6 +1482,11 @@ mod tests {
             r"SELECT E'a\'b'",
             r"SELECT e'x'",
             r"SELECT U&'d\0061t'",
+            // Code review of #45: sqlparser reads this as a cast to type U, AND,
+            // an identifier; Postgres reads a cast to regclass.
+            r#"SELECT 'pg_authid'::U&"\0072egclass"::text AS t"#,
+            r#"SELECT 'pg_authid'::u&"\0072egclass" AS t"#,
+            r#"SELECT U&"\0070g_authid".x FROM blocks"#,
             "SELECT $$x$$",
             "SELECT $q$x$q$",
             "SELECT 1 /* a /* b */ c */",
@@ -1412,6 +1507,8 @@ mod tests {
                 "SELECT num FROM blocks /* note */ WHERE num > 1",
                 "SELECT num FROM blocks WHERE miner LIKE'a%'",
                 "SELECT num FROM blocks WHERE type = 'e'",
+                r#"SELECT 'U&"x"' AS t"#,
+                r#"SELECT num & "num" FROM blocks"#,
             ] {
                 reject_ambiguous_lexing(sql, engine).unwrap_or_else(|e| panic!("{sql}: {e}"));
             }

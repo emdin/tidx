@@ -205,7 +205,11 @@ database = "tidx_38833"
 ├── enabled                 bool      = true         Enable HTTP API server
 ├── port                    u16       = 8080         HTTP server port
 ├── bind                    string    = "0.0.0.0"    Bind address
-└── trusted_cidrs           string[]  = []           Trusted CIDRs for admin ops (e.g., Tailscale)
+├── trusted_cidrs           string[]  = []           Trusted CIDRs for admin ops (e.g., Tailscale)
+├── admin_token_env         string    (optional)     Env var with a shared secret; admin ops then also need `Authorization: Bearer <secret>` (unset/empty var = all admin ops denied). The explorer UI does not send it, so its admin panel is hidden while this is set; use the API or CLI
+├── query_rate_limit_per_minute u32   = 0            Per-client /query limit (0 = off); client = real caller behind a trusted proxy. Internal callers in `trusted_cidrs` are limited too unless exempted
+├── query_rate_limit_burst  u32       = 0            Requests allowed at once before the rate applies (0 = per_minute)
+└── query_rate_limit_exempt string[]  = []           Client CIDRs (or bare IPs) never rate-limited
 
 [prometheus]                                       Prometheus metrics server
 ├── enabled                 bool      = true         Enable metrics endpoint
@@ -407,7 +411,7 @@ GET  /metrics                                            Prometheus metrics
 
 Manage ClickHouse materialized views for pre-computed analytics. Views are stored in `analytics_{chainId}` database and auto-update on new data.
 
-**Note:** POST and DELETE require connection from a trusted IP (configured via `trusted_cidrs`).
+**Note:** POST and DELETE require connection from a trusted IP (configured via `trusted_cidrs`) and, when `admin_token_env` is set, `Authorization: Bearer <token>`. `tidx import-blockscout` reads the token from `TIDX_ADMIN_TOKEN` (or `--admin-token`).
 
 #### List Views
 

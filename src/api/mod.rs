@@ -1,5 +1,6 @@
 mod explorer;
 mod explorer_api;
+mod rate_limit;
 mod tables;
 mod views;
 
@@ -12,7 +13,7 @@ use tokio::sync::RwLock;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{ConnectInfo, Extension, Query, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware,
     response::{
@@ -33,6 +34,7 @@ use crate::config::HttpConfig;
 use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 use crate::sync::fetcher::RpcClient;
+use rate_limit::RateLimiter;
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
@@ -67,6 +69,69 @@ pub struct AppState {
     pub trusted_cidrs: Arc<Vec<(IpAddr, u8)>>,
     /// Public Kaspa explorer base URL used for L1 provenance links.
     pub kaspa_explorer_base_url: String,
+    /// Per-client limit on `/query`; `None` when not configured.
+    pub query_limiter: Option<Arc<RateLimiter>>,
+    /// Shared secret the admin endpoints require on top of the IP check.
+    pub admin_token: AdminToken,
+}
+
+/// Admin endpoints trust the effective client IP, and every container on
+/// the internal Docker network is inside `trusted_cidrs`. On 2026-11-06 a
+/// ClickHouse `url()` call reached `POST tidx:8080/views` from in there. A
+/// shared secret limits admin calls to the callers that were given it.
+#[derive(Clone)]
+pub enum AdminToken {
+    /// `admin_token_env` not configured: the IP check alone decides.
+    NotRequired,
+    Required(Arc<str>),
+    /// Configured, but the variable is unset or empty: deny every admin call.
+    Missing,
+}
+
+impl AdminToken {
+    pub fn from_config(http_config: &HttpConfig) -> Self {
+        Self::resolve(http_config, |var| std::env::var(var).ok())
+    }
+
+    fn resolve(http_config: &HttpConfig, env: impl Fn(&str) -> Option<String>) -> Self {
+        let Some(var) = &http_config.admin_token_env else {
+            return Self::NotRequired;
+        };
+        match env(var) {
+            Some(token) if !token.is_empty() => Self::Required(token.into()),
+            _ => {
+                tracing::error!(
+                    env = %var,
+                    "admin_token_env is set but the variable is empty or unset; denying all admin requests"
+                );
+                Self::Missing
+            }
+        }
+    }
+
+    fn accepts(&self, headers: &HeaderMap) -> bool {
+        match self {
+            Self::NotRequired => true,
+            Self::Missing => false,
+            Self::Required(expected) => headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .is_some_and(|(_, got)| digests_equal(got.trim(), expected)),
+        }
+    }
+}
+
+/// Compares SHA3 digests in constant time, so neither the content nor the
+/// length of the token shows up in response timing.
+fn digests_equal(a: &str, b: &str) -> bool {
+    use sha3::{Digest, Sha3_256};
+    let (a, b) = (Sha3_256::digest(a), Sha3_256::digest(b));
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 impl AppState {
@@ -136,27 +201,43 @@ impl AppState {
 
     /// Trust decision for privileged endpoints. Evaluates the EFFECTIVE client
     /// IP (see [`effective_client_ip`]) rather than the TCP peer, so a request
-    /// proxied through Caddy is judged by the real originating client.
+    /// proxied through Caddy is judged by the real originating client, and,
+    /// when configured, requires the admin token as well.
     pub fn is_trusted_request(&self, peer: &SocketAddr, headers: &HeaderMap) -> bool {
+        self.is_trusted_cidr(self.client_ip(peer.ip(), headers))
+            && self.admin_token.accepts(headers)
+    }
+
+    fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
         let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        self.is_trusted_cidr(self.effective_client_ip(peer.ip(), xff))
+        self.effective_client_ip(peer, xff)
     }
 }
 
 /// Parse CIDR strings into (network, prefix_len) tuples
+/// A bare address is a single host (/32 or /128). Unparseable entries are
+/// dropped with a warning.
 pub fn parse_cidrs(cidrs: &[String]) -> Vec<(IpAddr, u8)> {
     cidrs
         .iter()
         .filter_map(|cidr| {
-            let parts: Vec<&str> = cidr.split('/').collect();
-            if parts.len() != 2 {
-                return None;
+            let parsed = parse_cidr(cidr);
+            if parsed.is_none() {
+                tracing::warn!(entry = %cidr, "ignoring unparseable CIDR");
             }
-            let ip: IpAddr = parts[0].parse().ok()?;
-            let prefix: u8 = parts[1].parse().ok()?;
-            Some((ip, prefix))
+            parsed
         })
         .collect()
+}
+
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (ip, prefix) = match cidr.split_once('/') {
+        Some((ip, prefix)) => (ip.parse::<IpAddr>().ok()?, Some(prefix.parse::<u8>().ok()?)),
+        None => (cidr.parse::<IpAddr>().ok()?, None),
+    };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = prefix.unwrap_or(max);
+    (prefix <= max).then_some((ip, prefix))
 }
 
 /// Check if an IP is within a CIDR range
@@ -218,6 +299,8 @@ pub fn router_with_options(
     let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
 
     let state = AppState {
+        query_limiter: query_limiter(http_config),
+        admin_token: AdminToken::from_config(http_config),
         pools: Arc::new(RwLock::new(pools)),
         write_pools: Arc::new(RwLock::new(write_pools)),
         rpc_clients: Arc::new(RwLock::new(rpc_clients)),
@@ -240,12 +323,14 @@ pub fn router_shared(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
     clickhouse_engines: SharedClickHouseEngines,
-    trusted_cidrs: Vec<String>,
-    kaspa_explorer_base_url: String,
+    http_config: &HttpConfig,
 ) -> Router<()> {
-    let trusted_cidrs = Arc::new(parse_cidrs(&trusted_cidrs));
+    let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
+    let kaspa_explorer_base_url = http_config.kaspa_explorer_base_url.clone();
 
     let state = AppState {
+        query_limiter: query_limiter(http_config),
+        admin_token: AdminToken::from_config(http_config),
         pools,
         write_pools,
         rpc_clients,
@@ -258,6 +343,16 @@ pub fn router_shared(
     };
 
     build_router(state)
+}
+
+fn query_limiter(http_config: &HttpConfig) -> Option<Arc<RateLimiter>> {
+    (http_config.query_rate_limit_per_minute > 0).then(|| {
+        Arc::new(RateLimiter::new(
+            http_config.query_rate_limit_per_minute,
+            http_config.query_rate_limit_burst,
+            parse_cidrs(&http_config.query_rate_limit_exempt),
+        ))
+    })
 }
 
 fn build_router(state: AppState) -> Router<()> {
@@ -668,9 +763,14 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
 ) -> Response {
+    if let Err(limited) = check_query_rate(&state, peer, &headers) {
+        return limited.into_response();
+    }
     let signatures = extract_signatures(uri.query());
     dispatch_query(state, params, signatures).await
 }
@@ -683,15 +783,39 @@ async fn handle_query(
 /// transport alternative, not a second code path.
 async fn handle_query_post(
     State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     uri: axum::http::Uri,
     Json(params): Json<QueryParams>,
 ) -> Response {
+    if let Err(limited) = check_query_rate(&state, peer, &headers) {
+        return limited.into_response();
+    }
     // Signatures may arrive in the JSON body (`signature`) and/or as `?signature=`
     // URL params; merge both so a POST body signature is honored (previously it
     // was silently dropped and `FROM <EventName>` failed as "table not allowed").
     let mut signatures = extract_signatures(uri.query());
     signatures.extend_from_slice(&params.signature);
     dispatch_query(state, params, signatures).await
+}
+
+/// Applies the per-client `/query` limit to the effective client (the real
+/// caller behind a trusted proxy). Without a peer address (only in tests that
+/// skip ConnectInfo) there is nothing to key on, so the request passes.
+fn check_query_rate(
+    state: &AppState,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let (Some(limiter), Some(Extension(ConnectInfo(peer)))) = (&state.query_limiter, peer) else {
+        return Ok(());
+    };
+    limiter
+        .check(
+            state.client_ip(peer.ip(), headers),
+            std::time::Instant::now(),
+        )
+        .map_err(|retry| ApiError::TooManyRequests(retry.as_secs_f64().ceil().max(1.0) as u64))
 }
 
 async fn dispatch_query(state: AppState, params: QueryParams, signatures: Vec<String>) -> Response {
@@ -1001,6 +1125,8 @@ pub enum ApiError {
     Internal(String),
     Forbidden(String),
     NotFound(String),
+    /// Seconds until the client may retry.
+    TooManyRequests(u64),
 }
 
 impl std::fmt::Display for ApiError {
@@ -1012,6 +1138,9 @@ impl std::fmt::Display for ApiError {
             ApiError::Internal(msg) => write!(f, "{msg}"),
             ApiError::Forbidden(msg) => write!(f, "{msg}"),
             ApiError::NotFound(msg) => write!(f, "{msg}"),
+            ApiError::TooManyRequests(retry_after) => {
+                write!(f, "Rate limit exceeded; retry in {retry_after}s")
+            }
         }
     }
 }
@@ -1025,6 +1154,18 @@ impl IntoResponse for ApiError {
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::TooManyRequests(retry_after) => {
+                let body = serde_json::json!({
+                    "ok": false,
+                    "error": self.to_string()
+                });
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(body),
+                )
+                    .into_response();
+            }
         };
 
         let body = serde_json::json!({
@@ -1051,6 +1192,107 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(trusted_cidrs),
             kaspa_explorer_base_url: "https://kaspa.stream".to_string(),
+            query_limiter: None,
+            admin_token: AdminToken::NotRequired,
+        }
+    }
+
+    fn with_token(token: AdminToken) -> AppState {
+        AppState {
+            admin_token: token,
+            ..proxy_state()
+        }
+    }
+
+    fn bearer(token: &str, forwarded_for: Option<&str>) -> HeaderMap {
+        let mut h = forwarded_for.map(xff).unwrap_or_default();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    const IMPORTER: &str = "172.18.0.9:5000";
+
+    #[test]
+    fn required_token_rejects_internal_caller_without_it() {
+        // 2026-11-06: ClickHouse url() reached POST tidx:8080/views from inside
+        // the Docker network, where every container counts as trusted.
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        assert!(!state.is_trusted_request(&IMPORTER.parse().unwrap(), &HeaderMap::new()));
+    }
+
+    #[test]
+    fn required_token_accepts_internal_caller_with_it() {
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        assert!(state.is_trusted_request(&IMPORTER.parse().unwrap(), &bearer("s3cret", None)));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        let peer: SocketAddr = IMPORTER.parse().unwrap();
+        for value in ["bearer s3cret", "BEARER s3cret", "Bearer   s3cret"] {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", value.parse().unwrap());
+            assert!(state.is_trusted_request(&peer, &h), "{value}");
+        }
+    }
+
+    #[test]
+    fn wrong_or_malformed_token_is_rejected() {
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        let peer: SocketAddr = IMPORTER.parse().unwrap();
+        assert!(!state.is_trusted_request(&peer, &bearer("s3cre", None)));
+        assert!(!state.is_trusted_request(&peer, &bearer("s3cret2", None)));
+        assert!(!state.is_trusted_request(&peer, &bearer("", None)));
+        let mut raw = HeaderMap::new();
+        raw.insert("authorization", "s3cret".parse().unwrap());
+        assert!(!state.is_trusted_request(&peer, &raw));
+    }
+
+    #[test]
+    fn token_does_not_replace_the_ip_check() {
+        // A leaked token used from the internet (through Caddy) still fails.
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        let proxy: SocketAddr = "172.18.0.4:40000".parse().unwrap();
+        assert!(!state.is_trusted_request(&proxy, &bearer("s3cret", Some("203.0.113.7"))));
+    }
+
+    #[test]
+    fn configured_but_unset_token_denies_every_admin_call() {
+        let state = with_token(AdminToken::Missing);
+        let peer: SocketAddr = IMPORTER.parse().unwrap();
+        assert!(!state.is_trusted_request(&peer, &HeaderMap::new()));
+        assert!(!state.is_trusted_request(&peer, &bearer("", None)));
+        assert!(!state.is_trusted_request(&peer, &bearer("anything", None)));
+    }
+
+    #[test]
+    fn admin_token_resolves_from_the_configured_env_var() {
+        let env = |var: &str| match var {
+            "SET" => Some("s3cret".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let cfg = |var: Option<&str>| HttpConfig {
+            admin_token_env: var.map(str::to_string),
+            ..HttpConfig::default()
+        };
+        assert!(matches!(
+            AdminToken::resolve(&cfg(None), env),
+            AdminToken::NotRequired
+        ));
+        assert!(matches!(
+            AdminToken::resolve(&cfg(Some("SET")), env),
+            AdminToken::Required(t) if &*t == "s3cret"
+        ));
+        for var in ["EMPTY", "UNSET"] {
+            assert!(
+                matches!(
+                    AdminToken::resolve(&cfg(Some(var)), env),
+                    AdminToken::Missing
+                ),
+                "{var}"
+            );
         }
     }
 
@@ -1137,11 +1379,26 @@ mod tests {
     fn test_parse_cidrs_invalid() {
         let cidrs = vec![
             "invalid".to_string(),
-            "100.64.0.0".to_string(),     // Missing prefix
             "100.64.0.0/abc".to_string(), // Invalid prefix
+            "10.0.0.0/33".to_string(),    // Prefix out of range
+            "::1/129".to_string(),
         ];
         let parsed = parse_cidrs(&cidrs);
         assert_eq!(parsed.len(), 0);
+    }
+
+    #[test]
+    fn bare_ip_parses_as_a_single_host() {
+        // Review of #45: `query_rate_limit_exempt = ["159.195.144.236"]` was
+        // silently dropped, so the exemption never applied.
+        let parsed = parse_cidrs(&["159.195.144.236".to_string(), "2001:db8::5".to_string()]);
+        assert_eq!(
+            parsed,
+            vec![
+                ("159.195.144.236".parse().unwrap(), 32),
+                ("2001:db8::5".parse().unwrap(), 128)
+            ]
+        );
     }
 
     #[test]
