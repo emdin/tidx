@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
+    DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
     Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
@@ -230,11 +230,20 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
         }
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<String> {
-            if let Expr::Function(func) = expr {
-                let name = func.name.to_string().to_lowercase();
-                if !is_allowed_function(&name) {
-                    return ControlFlow::Break(format!("Function '{name}' is not allowed"));
+            let cast_to = match expr {
+                Expr::Function(func) => {
+                    let name = func.name.to_string().to_lowercase();
+                    if !is_allowed_function(&name) {
+                        return ControlFlow::Break(format!("Function '{name}' is not allowed"));
+                    }
+                    None
                 }
+                Expr::Cast { data_type, .. } => Some(data_type),
+                Expr::TypedString(ts) => Some(&ts.data_type),
+                _ => None,
+            };
+            if cast_to.is_some_and(is_catalog_lookup_type) {
+                return ControlFlow::Break("Casts to reg* catalog types are not allowed".to_string());
             }
             ControlFlow::Continue(())
         }
@@ -257,6 +266,18 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
         ControlFlow::Break(reason) => Err(anyhow!(reason)),
         ControlFlow::Continue(()) => Ok(()),
     }
+}
+
+/// PostgreSQL's reg* types (regclass, regprocedure, regtype, regrole, ...) look
+/// a name up in the system catalogs while casting, so `'pg_authid'::regclass`
+/// tells a caller whether any relation exists, whatever the table allowlist
+/// says. No other built-in PostgreSQL or ClickHouse type name starts with "reg".
+fn is_catalog_lookup_type(data_type: &DataType) -> bool {
+    data_type
+        .to_string()
+        .to_lowercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word.starts_with("reg"))
 }
 
 fn extract_cte_names(query: &Query) -> HashSet<String> {
@@ -1187,6 +1208,47 @@ mod tests {
     #[test]
     fn test_allows_cast_expression() {
         assert!(validate_query("SELECT CAST(num AS TEXT) FROM blocks").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_catalog_lookup_casts() {
+        // 2026-11-07: a prober used '<name>'::regclass / ::regprocedure to test
+        // whether any table or function exists, bypassing the table allowlist.
+        for sql in [
+            "SELECT 'pg_authid'::regclass::text AS t",
+            "SELECT 'pg_read_file(text)'::regprocedure::text AS t",
+            "SELECT CAST('pg_class' AS regclass) AS t",
+            "SELECT regclass 'pg_class' AS t",
+            "SELECT 'pg_class'::pg_catalog.regclass AS t",
+            "SELECT 'pg_class'::\"regclass\" AS t",
+            "SELECT '{pg_class}'::regclass[] AS t",
+            "SELECT 'int4'::regtype AS t",
+            "SELECT 'postgres'::regrole AS t",
+            "SELECT 'public'::regnamespace AS t",
+            "SELECT 'now'::regproc AS t",
+            "SELECT '+'::regoper AS t",
+            "SELECT 'english'::regconfig AS t",
+            "SELECT num FROM blocks WHERE 'pg_authid'::regclass IS NOT NULL",
+            "SELECT 1 AS y WHERE ('pg_authid'::regclass)::text = ANY (SELECT 'x')",
+            "SELECT to_regclass('pg_authid') AS t",
+        ] {
+            assert!(validate_query(sql).is_err(), "should reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_allows_ordinary_casts() {
+        for sql in [
+            "SELECT num::text FROM blocks",
+            "SELECT '1'::numeric AS n",
+            "SELECT CAST(num AS BIGINT) FROM blocks",
+            "SELECT num::varchar(20) FROM blocks",
+            "SELECT timestamp::date FROM blocks",
+            "SELECT '{1,2}'::int[] AS a",
+            "SELECT date '2026-01-01' AS d",
+        ] {
+            assert!(validate_query(sql).is_ok(), "should allow: {sql}");
+        }
     }
 
     #[test]
