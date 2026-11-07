@@ -1,5 +1,6 @@
 mod explorer;
 mod explorer_api;
+mod rate_limit;
 mod tables;
 mod views;
 
@@ -12,7 +13,7 @@ use tokio::sync::RwLock;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{ConnectInfo, Extension, Query, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware,
     response::{
@@ -33,6 +34,7 @@ use crate::config::HttpConfig;
 use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 use crate::sync::fetcher::RpcClient;
+use rate_limit::RateLimiter;
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
@@ -67,6 +69,8 @@ pub struct AppState {
     pub trusted_cidrs: Arc<Vec<(IpAddr, u8)>>,
     /// Public Kaspa explorer base URL used for L1 provenance links.
     pub kaspa_explorer_base_url: String,
+    /// Per-client limit on `/query`; `None` when not configured.
+    pub query_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl AppState {
@@ -218,6 +222,7 @@ pub fn router_with_options(
     let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
 
     let state = AppState {
+        query_limiter: query_limiter(http_config),
         pools: Arc::new(RwLock::new(pools)),
         write_pools: Arc::new(RwLock::new(write_pools)),
         rpc_clients: Arc::new(RwLock::new(rpc_clients)),
@@ -240,12 +245,13 @@ pub fn router_shared(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
     clickhouse_engines: SharedClickHouseEngines,
-    trusted_cidrs: Vec<String>,
-    kaspa_explorer_base_url: String,
+    http_config: &HttpConfig,
 ) -> Router<()> {
-    let trusted_cidrs = Arc::new(parse_cidrs(&trusted_cidrs));
+    let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
+    let kaspa_explorer_base_url = http_config.kaspa_explorer_base_url.clone();
 
     let state = AppState {
+        query_limiter: query_limiter(http_config),
         pools,
         write_pools,
         rpc_clients,
@@ -258,6 +264,16 @@ pub fn router_shared(
     };
 
     build_router(state)
+}
+
+fn query_limiter(http_config: &HttpConfig) -> Option<Arc<RateLimiter>> {
+    (http_config.query_rate_limit_per_minute > 0).then(|| {
+        Arc::new(RateLimiter::new(
+            http_config.query_rate_limit_per_minute,
+            http_config.query_rate_limit_burst,
+            parse_cidrs(&http_config.query_rate_limit_exempt),
+        ))
+    })
 }
 
 fn build_router(state: AppState) -> Router<()> {
@@ -668,9 +684,14 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
 ) -> Response {
+    if let Err(limited) = check_query_rate(&state, peer, &headers) {
+        return limited.into_response();
+    }
     let signatures = extract_signatures(uri.query());
     dispatch_query(state, params, signatures).await
 }
@@ -683,15 +704,38 @@ async fn handle_query(
 /// transport alternative, not a second code path.
 async fn handle_query_post(
     State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     uri: axum::http::Uri,
     Json(params): Json<QueryParams>,
 ) -> Response {
+    if let Err(limited) = check_query_rate(&state, peer, &headers) {
+        return limited.into_response();
+    }
     // Signatures may arrive in the JSON body (`signature`) and/or as `?signature=`
     // URL params; merge both so a POST body signature is honored (previously it
     // was silently dropped and `FROM <EventName>` failed as "table not allowed").
     let mut signatures = extract_signatures(uri.query());
     signatures.extend_from_slice(&params.signature);
     dispatch_query(state, params, signatures).await
+}
+
+/// Applies the per-client `/query` limit to the effective client (the real
+/// caller behind a trusted proxy). Without a peer address (only in tests that
+/// skip ConnectInfo) there is nothing to key on, so the request passes.
+fn check_query_rate(
+    state: &AppState,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let (Some(limiter), Some(Extension(ConnectInfo(peer)))) = (&state.query_limiter, peer) else {
+        return Ok(());
+    };
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client = state.effective_client_ip(peer.ip(), xff);
+    limiter
+        .check(client, std::time::Instant::now())
+        .map_err(|retry| ApiError::TooManyRequests(retry.as_secs_f64().ceil().max(1.0) as u64))
 }
 
 async fn dispatch_query(state: AppState, params: QueryParams, signatures: Vec<String>) -> Response {
@@ -1001,6 +1045,8 @@ pub enum ApiError {
     Internal(String),
     Forbidden(String),
     NotFound(String),
+    /// Seconds until the client may retry.
+    TooManyRequests(u64),
 }
 
 impl std::fmt::Display for ApiError {
@@ -1012,6 +1058,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Internal(msg) => write!(f, "{msg}"),
             ApiError::Forbidden(msg) => write!(f, "{msg}"),
             ApiError::NotFound(msg) => write!(f, "{msg}"),
+            ApiError::TooManyRequests(retry_after) => write!(f, "Rate limit exceeded; retry in {retry_after}s"),
         }
     }
 }
@@ -1025,6 +1072,18 @@ impl IntoResponse for ApiError {
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::TooManyRequests(retry_after) => {
+                let body = serde_json::json!({
+                    "ok": false,
+                    "error": format!("Rate limit exceeded; retry in {retry_after}s")
+                });
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(body),
+                )
+                    .into_response();
+            }
         };
 
         let body = serde_json::json!({
@@ -1051,6 +1110,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(trusted_cidrs),
             kaspa_explorer_base_url: "https://kaspa.stream".to_string(),
+            query_limiter: None,
         }
     }
 
