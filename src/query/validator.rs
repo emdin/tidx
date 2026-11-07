@@ -274,10 +274,18 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
 /// a name up in the system catalogs while casting, so `'pg_authid'::regclass`
 /// tells a caller whether any relation exists, whatever the table allowlist
 /// says. No other built-in PostgreSQL or ClickHouse type name starts with "reg".
+/// Single-quoted literals inside the type (time zones, enum labels) are skipped.
 fn is_catalog_lookup_type(data_type: &DataType) -> bool {
-    data_type
-        .to_string()
-        .to_lowercase()
+    let mut words = String::new();
+    let mut in_literal = false;
+    for c in data_type.to_string().chars() {
+        if c == '\'' {
+            in_literal = !in_literal;
+        } else if !in_literal {
+            words.push(c.to_ascii_lowercase());
+        }
+    }
+    words
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .any(|word| word.starts_with("reg"))
 }
@@ -1248,6 +1256,9 @@ mod tests {
             "SELECT timestamp::date FROM blocks",
             "SELECT '{1,2}'::int[] AS a",
             "SELECT date '2026-01-01' AS d",
+            // Quoted literals inside a type are not type names.
+            "SELECT CAST(timestamp AS DateTime64(3, 'America/Regina')) AS t FROM blocks",
+            "SELECT CAST('a' AS Enum8('regular' = 1, 'other' = 2)) AS e",
         ] {
             assert!(validate_query(sql).is_ok(), "should allow: {sql}");
         }
