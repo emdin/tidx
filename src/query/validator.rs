@@ -3,8 +3,8 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
-    Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query,
+    SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -243,7 +243,9 @@ fn reject_hidden_calls(stmt: &Statement) -> Result<()> {
                 _ => None,
             };
             if cast_to.is_some_and(is_catalog_lookup_type) {
-                return ControlFlow::Break("Casts to reg* catalog types are not allowed".to_string());
+                return ControlFlow::Break(
+                    "Casts to reg* catalog types are not allowed".to_string(),
+                );
             }
             ControlFlow::Continue(())
         }

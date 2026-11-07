@@ -71,6 +71,55 @@ pub struct AppState {
     pub kaspa_explorer_base_url: String,
     /// Per-client limit on `/query`; `None` when not configured.
     pub query_limiter: Option<Arc<RateLimiter>>,
+    /// Shared secret the admin endpoints require on top of the IP check.
+    pub admin_token: AdminToken,
+}
+
+/// Admin endpoints trust the effective client IP, and every container on
+/// the internal Docker network is inside `trusted_cidrs`. On 2026-11-06 a
+/// ClickHouse `url()` call reached `POST tidx:8080/views` from in there. A
+/// shared secret limits admin calls to the callers that were given it.
+#[derive(Clone)]
+pub enum AdminToken {
+    /// `admin_token_env` not configured: the IP check alone decides.
+    NotRequired,
+    Required(Arc<str>),
+    /// Configured, but the variable is unset or empty: deny every admin call.
+    Missing,
+}
+
+impl AdminToken {
+    pub fn from_config(http_config: &HttpConfig) -> Self {
+        let Some(var) = &http_config.admin_token_env else {
+            return Self::NotRequired;
+        };
+        match std::env::var(var) {
+            Ok(token) if !token.is_empty() => Self::Required(token.into()),
+            _ => {
+                tracing::error!(
+                    env = %var,
+                    "admin_token_env is set but the variable is empty or unset; denying all admin requests"
+                );
+                Self::Missing
+            }
+        }
+    }
+
+    fn accepts(&self, headers: &HeaderMap) -> bool {
+        match self {
+            Self::NotRequired => true,
+            Self::Missing => false,
+            Self::Required(expected) => headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())),
+        }
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 impl AppState {
@@ -140,10 +189,12 @@ impl AppState {
 
     /// Trust decision for privileged endpoints. Evaluates the EFFECTIVE client
     /// IP (see [`effective_client_ip`]) rather than the TCP peer, so a request
-    /// proxied through Caddy is judged by the real originating client.
+    /// proxied through Caddy is judged by the real originating client, and,
+    /// when configured, requires the admin token as well.
     pub fn is_trusted_request(&self, peer: &SocketAddr, headers: &HeaderMap) -> bool {
         let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
         self.is_trusted_cidr(self.effective_client_ip(peer.ip(), xff))
+            && self.admin_token.accepts(headers)
     }
 }
 
@@ -223,6 +274,7 @@ pub fn router_with_options(
 
     let state = AppState {
         query_limiter: query_limiter(http_config),
+        admin_token: AdminToken::from_config(http_config),
         pools: Arc::new(RwLock::new(pools)),
         write_pools: Arc::new(RwLock::new(write_pools)),
         rpc_clients: Arc::new(RwLock::new(rpc_clients)),
@@ -252,6 +304,7 @@ pub fn router_shared(
 
     let state = AppState {
         query_limiter: query_limiter(http_config),
+        admin_token: AdminToken::from_config(http_config),
         pools,
         write_pools,
         rpc_clients,
@@ -1058,7 +1111,9 @@ impl std::fmt::Display for ApiError {
             ApiError::Internal(msg) => write!(f, "{msg}"),
             ApiError::Forbidden(msg) => write!(f, "{msg}"),
             ApiError::NotFound(msg) => write!(f, "{msg}"),
-            ApiError::TooManyRequests(retry_after) => write!(f, "Rate limit exceeded; retry in {retry_after}s"),
+            ApiError::TooManyRequests(retry_after) => {
+                write!(f, "Rate limit exceeded; retry in {retry_after}s")
+            }
         }
     }
 }
@@ -1111,6 +1166,96 @@ mod tests {
             trusted_cidrs: Arc::new(trusted_cidrs),
             kaspa_explorer_base_url: "https://kaspa.stream".to_string(),
             query_limiter: None,
+            admin_token: AdminToken::NotRequired,
+        }
+    }
+
+    fn with_token(token: AdminToken) -> AppState {
+        AppState {
+            admin_token: token,
+            ..proxy_state()
+        }
+    }
+
+    fn bearer(token: &str, forwarded_for: Option<&str>) -> HeaderMap {
+        let mut h = forwarded_for.map(xff).unwrap_or_default();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    const IMPORTER: &str = "172.18.0.9:5000";
+
+    #[test]
+    fn required_token_rejects_internal_caller_without_it() {
+        // 2026-11-06: ClickHouse url() reached POST tidx:8080/views from inside
+        // the Docker network, where every container counts as trusted.
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        assert!(!state.is_trusted_request(&IMPORTER.parse().unwrap(), &HeaderMap::new()));
+    }
+
+    #[test]
+    fn required_token_accepts_internal_caller_with_it() {
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        assert!(state.is_trusted_request(&IMPORTER.parse().unwrap(), &bearer("s3cret", None)));
+    }
+
+    #[test]
+    fn wrong_or_malformed_token_is_rejected() {
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        let peer: SocketAddr = IMPORTER.parse().unwrap();
+        assert!(!state.is_trusted_request(&peer, &bearer("s3cre", None)));
+        assert!(!state.is_trusted_request(&peer, &bearer("s3cret2", None)));
+        assert!(!state.is_trusted_request(&peer, &bearer("", None)));
+        let mut raw = HeaderMap::new();
+        raw.insert("authorization", "s3cret".parse().unwrap());
+        assert!(!state.is_trusted_request(&peer, &raw));
+    }
+
+    #[test]
+    fn token_does_not_replace_the_ip_check() {
+        // A leaked token used from the internet (through Caddy) still fails.
+        let state = with_token(AdminToken::Required("s3cret".into()));
+        let proxy: SocketAddr = "172.18.0.4:40000".parse().unwrap();
+        assert!(!state.is_trusted_request(&proxy, &bearer("s3cret", Some("203.0.113.7"))));
+    }
+
+    #[test]
+    fn configured_but_unset_token_denies_every_admin_call() {
+        let state = with_token(AdminToken::Missing);
+        let peer: SocketAddr = IMPORTER.parse().unwrap();
+        assert!(!state.is_trusted_request(&peer, &HeaderMap::new()));
+        assert!(!state.is_trusted_request(&peer, &bearer("", None)));
+        assert!(!state.is_trusted_request(&peer, &bearer("anything", None)));
+    }
+
+    #[test]
+    fn admin_token_resolves_from_the_configured_env_var() {
+        let none = HttpConfig::default();
+        assert!(matches!(
+            AdminToken::from_config(&none),
+            AdminToken::NotRequired
+        ));
+
+        // SAFETY: test-unique variable names; nothing else reads them.
+        unsafe { std::env::set_var("TIDX_TEST_ADMIN_TOKEN_SET", "s3cret") };
+        let set = HttpConfig {
+            admin_token_env: Some("TIDX_TEST_ADMIN_TOKEN_SET".to_string()),
+            ..HttpConfig::default()
+        };
+        assert!(
+            matches!(AdminToken::from_config(&set), AdminToken::Required(t) if &*t == "s3cret")
+        );
+
+        unsafe { std::env::set_var("TIDX_TEST_ADMIN_TOKEN_EMPTY", "") };
+        for var in ["TIDX_TEST_ADMIN_TOKEN_EMPTY", "TIDX_TEST_ADMIN_TOKEN_UNSET"] {
+            let cfg = HttpConfig {
+                admin_token_env: Some(var.to_string()),
+                ..HttpConfig::default()
+            };
+            assert!(
+                matches!(AdminToken::from_config(&cfg), AdminToken::Missing),
+                "{var}"
+            );
         }
     }
 

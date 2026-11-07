@@ -56,6 +56,13 @@ pub struct HttpConfig {
     /// address when co-located consumers reach `/query` through the proxy.
     #[serde(default)]
     pub query_rate_limit_exempt: Vec<String>,
+
+    /// Name of an env var holding a shared secret. When set, admin endpoints
+    /// (POST/DELETE /views, explorer verify/label/refresh) also require
+    /// `Authorization: Bearer <secret>` on top of the trusted-IP check. If the
+    /// variable is unset or empty, every admin call is denied.
+    #[serde(default)]
+    pub admin_token_env: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -69,6 +76,7 @@ impl Default for HttpConfig {
             query_rate_limit_per_minute: 0,
             query_rate_limit_burst: 0,
             query_rate_limit_exempt: Vec::new(),
+            admin_token_env: None,
         }
     }
 }

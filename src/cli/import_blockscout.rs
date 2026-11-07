@@ -33,6 +33,10 @@ pub struct Args {
     /// Re-import contracts even if local source code already exists.
     #[arg(long)]
     pub overwrite: bool,
+
+    /// Admin token for the local verify endpoint, when tidx sets `admin_token_env`.
+    #[arg(long, env = "TIDX_ADMIN_TOKEN", hide_env_values = true)]
+    pub admin_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,20 +350,35 @@ async fn import_one(client: &reqwest::Client, args: &Args, address: &str) -> Res
         metadata: imported.metadata,
     };
 
+    post_verify(client, args, address, &request).await?;
+
+    info!(address = %address, "Imported verified contract from Blockscout");
+    Ok(ImportOutcome::Imported)
+}
+
+async fn post_verify(
+    client: &reqwest::Client,
+    args: &Args,
+    address: &str,
+    request: &VerifyContractRequest,
+) -> Result<()> {
     let url = format!(
         "{}/explore/api/contract/{}/verify?chainId={}",
         args.local_url.trim_end_matches('/'),
         address,
         args.chain_id
     );
-    let response = client.post(url).json(&request).send().await?;
-    if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Local verify endpoint rejected import: {}", body);
+    let mut post = client.post(url).json(request);
+    if let Some(token) = &args.admin_token {
+        post = post.bearer_auth(token);
     }
-
-    info!(address = %address, "Imported verified contract from Blockscout");
-    Ok(ImportOutcome::Imported)
+    let response = post.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Local verify endpoint rejected import ({status}): {body}");
+    }
+    Ok(())
 }
 
 async fn local_import_state(
@@ -701,7 +720,120 @@ mod tests {
             max_contracts: None,
             address: None,
             overwrite: false,
+            admin_token: None,
         }
+    }
+
+    fn sample_request() -> VerifyContractRequest {
+        VerifyContractRequest {
+            contract_name: "Ping".to_string(),
+            abi: json!([]),
+            runtime_bytecode: None,
+            source_code: None,
+            language: None,
+            compiler_version: None,
+            optimization_enabled: None,
+            optimization_runs: None,
+            license: None,
+            constructor_args: None,
+            metadata: None,
+        }
+    }
+
+    /// One-shot HTTP server: answers `status` and returns the raw request head.
+    async fn capture_one(status: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            let text = String::from_utf8_lossy(&buf).to_string();
+            text[..text.find("\r\n\r\n").unwrap()].to_ascii_lowercase()
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn verify_post_carries_the_admin_token() {
+        let (url, server) = capture_one("200 OK").await;
+        let args = Args {
+            local_url: url,
+            admin_token: Some("s3cret".to_string()),
+            ..test_args()
+        };
+        post_verify(
+            &reqwest::Client::new(),
+            &args,
+            "0x05b0d9e0685ec1fe33f8cca58a7767ad12b997e5",
+            &sample_request(),
+        )
+        .await
+        .unwrap();
+        let head = server.await.unwrap();
+        assert!(head.starts_with("post /explore/api/contract/0x05b0d9e0685ec1fe33f8cca58a7767ad12b997e5/verify?chainid=38833"), "{head}");
+        assert!(head.contains("\r\nauthorization: bearer s3cret"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn verify_post_without_a_token_sends_no_authorization() {
+        let (url, server) = capture_one("200 OK").await;
+        let args = Args {
+            local_url: url,
+            ..test_args()
+        };
+        post_verify(
+            &reqwest::Client::new(),
+            &args,
+            "0x05b0d9e0685ec1fe33f8cca58a7767ad12b997e5",
+            &sample_request(),
+        )
+        .await
+        .unwrap();
+        assert!(!server.await.unwrap().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn verify_post_reports_a_rejection() {
+        let (url, server) = capture_one("403 Forbidden").await;
+        let args = Args {
+            local_url: url,
+            admin_token: Some("wrong".to_string()),
+            ..test_args()
+        };
+        let err = post_verify(
+            &reqwest::Client::new(),
+            &args,
+            "0x05b0d9e0685ec1fe33f8cca58a7767ad12b997e5",
+            &sample_request(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+        server.await.unwrap();
     }
 
     #[test]
