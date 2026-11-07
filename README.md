@@ -187,7 +187,7 @@ port = 9090
 name = "igra"
 chain_id = 38833
 rpc_url = "https://rpc.igralabs.com:8545"
-pg_url = "postgres://tidx@localhost:5432/tidx_igra"
+pg_url = "postgres://tidx_app@localhost:5432/tidx_igra"   # not the superuser; see below
 pg_password_env = "TIDX_PG_PASSWORD"  # Password from environment variable
 batch_size = 100
 
@@ -197,6 +197,17 @@ enabled = true
 url = "http://clickhouse:8123"
 database = "tidx_38833"
 ```
+
+### Database role
+
+Run the engine as an ordinary role, not the Postgres superuser. With a superuser, any gap in the `/query` validator becomes file access and code execution on the database host. `db/app_role.sql` creates `tidx_app`, which owns the schema and has no other privileges, and `tidx_query`, the role public `/query` runs as. Run it once as the superuser, then set the password and point `pg_url` at `tidx_app`:
+
+```
+psql -U <superuser> -d tidx_igra -f db/app_role.sql
+psql -U <superuser> -d tidx_igra -c "ALTER ROLE tidx_app PASSWORD '...'"
+```
+
+The script is idempotent. On a database that already has data, stop the engine first, because changing owners briefly locks each table. `tidx up` logs a warning at startup while it is connected as a superuser.
 
 ### Reference
 

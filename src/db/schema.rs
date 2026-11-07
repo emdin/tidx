@@ -3,7 +3,26 @@ use tracing::{info, warn};
 
 use super::Pool;
 
+/// Whether the pool's role is a superuser. The engine should connect as the
+/// ordinary owner role from `db/app_role.sql`: as a superuser, any /query
+/// validator gap is file access and code execution (2026-11-06).
+pub async fn connected_as_superuser(pool: &Pool) -> Result<bool> {
+    let conn = pool.get().await?;
+    let row = conn
+        .query_one(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+            &[],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
+    if connected_as_superuser(pool).await? {
+        warn!(
+            "Connected to Postgres as a superuser; run db/app_role.sql and point pg_url at tidx_app"
+        );
+    }
     let conn = pool.get().await?;
 
     // Best-effort cleanup of other connections before running migrations.
