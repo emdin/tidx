@@ -29,7 +29,7 @@ fn quantity(field: &str, s: &str) -> Result<u64> {
         .with_context(|| format!("bad {field} {s:?}"))
 }
 
-fn parse_header(v: Value) -> Result<Option<Header>> {
+pub(crate) fn parse_header(v: Value) -> Result<Option<Header>> {
     if v.is_null() {
         return Ok(None);
     }

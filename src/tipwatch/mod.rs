@@ -9,6 +9,7 @@
 pub mod rpc;
 pub mod store;
 pub mod watcher;
+pub mod ws;
 
 pub use rpc::{Header, TipRpc};
 pub use watcher::{StepOutcome, WatchOptions, Watcher};

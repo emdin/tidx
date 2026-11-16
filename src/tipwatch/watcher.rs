@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use super::rpc::{Header, TipRpc};
 use super::store::{self, NewReorg, Op, Seen};
+use super::ws::HeadStream;
 use crate::db::Pool;
 
 #[derive(Clone, Copy, Debug)]
@@ -217,11 +218,16 @@ impl Watcher {
         self.chain.tip().map(|s| s.header)
     }
 
-    /// One poll: fetch the provider's head, reconcile it with what was seen,
-    /// persist the result. Each step commits in one transaction and memory only
-    /// changes after it does, so a failed step is simply retried.
+    /// One poll: fetch the provider's head and apply it.
     pub async fn step(&mut self) -> Result<StepOutcome> {
         let head = self.rpc.head().await?;
+        self.apply(head).await
+    }
+
+    /// Reconcile a head (polled or pushed) with what was seen and persist the
+    /// result. Each call commits in one transaction and memory only changes
+    /// after it does, so a failure leaves nothing half done.
+    pub async fn apply(&mut self, head: Header) -> Result<StepOutcome> {
         let now = Utc::now();
         let seen = |header: Header| Seen {
             header,
@@ -574,55 +580,141 @@ impl Watcher {
         Ok((seen, orphans))
     }
 
-    /// Steps forever, backing off on errors. RPC and database failures are
-    /// logged and retried; they never end the loop.
+    /// Runs forever. With a WebSocket endpoint it follows pushed heads, and
+    /// polls only to catch up after subscribing and while the subscription is
+    /// down; without one it polls within the provider's request budget. RPC and
+    /// database failures are logged and retried; they never end the loop.
     pub async fn run(mut self) -> Result<()> {
-        const MAX_BACKOFF: Duration = Duration::from_secs(30);
-        const EVERY: Duration = Duration::from_secs(600);
-        let mut backoff = Duration::from_secs(1);
-        let mut last_housekeeping = Instant::now();
-        let (mut steps, mut reorgs, mut max_depth, mut errors) = (0u64, 0u64, 0u32, 0u64);
-
+        const MAX_RETRY: Duration = Duration::from_secs(300);
+        let mut stats = Stats::new();
+        let Some(url) = self.ws_url.clone() else {
+            loop {
+                self.poll_once(&mut stats).await;
+                self.housekeeping(&mut stats).await;
+            }
+        };
+        let mut retry = self.opts.stall_after;
         loop {
-            match self.step().await {
-                Ok(out) => {
-                    steps += 1;
-                    backoff = Duration::from_secs(1);
-                    match out {
-                        StepOutcome::Reorg { depth, .. }
-                        | StepOutcome::Jump {
-                            reorg: Some((_, depth)),
-                            ..
-                        } => {
-                            reorgs += 1;
-                            max_depth = max_depth.max(depth);
+            match HeadStream::connect(&url).await {
+                Ok(mut heads) => {
+                    info!(provider = %self.provider, "subscribed to new heads");
+                    let subscribed_at = Instant::now();
+                    self.poll_once(&mut stats).await;
+                    let mut last_head = Instant::now();
+                    loop {
+                        let left = self.opts.stall_after.saturating_sub(last_head.elapsed());
+                        match tokio::time::timeout(left, heads.next()).await {
+                            Ok(Ok(Some(head))) => {
+                                last_head = Instant::now();
+                                stats.pushed += 1;
+                                let out = self.apply(head).await;
+                                self.tally(&mut stats, out);
+                            }
+                            Ok(Ok(None)) => {}
+                            Ok(Err(e)) => {
+                                warn!(provider = %self.provider, error = %format!("{e:#}"), "new-heads subscription ended");
+                                break;
+                            }
+                            Err(_) => {
+                                warn!(provider = %self.provider, stall_after = ?self.opts.stall_after, "no head pushed; resubscribing");
+                                break;
+                            }
                         }
-                        _ => {}
+                        self.housekeeping(&mut stats).await;
+                    }
+                    if subscribed_at.elapsed() >= Duration::from_secs(60) {
+                        retry = self.opts.stall_after;
                     }
                 }
                 Err(e) => {
-                    errors += 1;
-                    warn!(provider = %self.provider, error = %format!("{e:#}"), retry_in = ?backoff, "tip watch step failed");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    warn!(provider = %self.provider, error = %format!("{e:#}"), retry_in = ?retry, "subscribing to new heads failed; polling meanwhile");
                 }
             }
-            if last_housekeeping.elapsed() >= EVERY {
-                match self.prune().await {
-                    Ok((seen, orphans)) => {
-                        debug!(provider = %self.provider, seen, orphans, "tip watch pruned")
-                    }
-                    Err(e) => {
-                        warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch prune failed")
-                    }
-                }
-                info!(
-                    provider = %self.provider, tip = self.tip().map(|h| h.number), steps, reorgs, max_depth, errors,
-                    "tip watch summary (last 10 min)"
-                );
-                (steps, reorgs, max_depth, errors) = (0, 0, 0, 0);
-                last_housekeeping = Instant::now();
+            let until = Instant::now() + retry;
+            while Instant::now() < until {
+                self.poll_once(&mut stats).await;
+                self.housekeeping(&mut stats).await;
             }
+            retry = (retry * 2).min(MAX_RETRY);
+        }
+    }
+
+    async fn poll_once(&mut self, stats: &mut Stats) {
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+        let out = self.step().await;
+        let failed = out.is_err();
+        self.tally(stats, out);
+        if failed {
+            tokio::time::sleep(stats.backoff).await;
+            stats.backoff = (stats.backoff * 2).min(MAX_BACKOFF);
+        } else {
+            stats.backoff = Duration::from_secs(1);
+        }
+    }
+
+    fn tally(&self, stats: &mut Stats, out: Result<StepOutcome>) {
+        match out {
+            Ok(StepOutcome::Reorg { depth, .. })
+            | Ok(StepOutcome::Jump {
+                reorg: Some((_, depth)),
+                ..
+            }) => {
+                stats.steps += 1;
+                stats.reorgs += 1;
+                stats.max_depth = stats.max_depth.max(depth);
+            }
+            Ok(_) => stats.steps += 1,
+            Err(e) => {
+                stats.errors += 1;
+                warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch step failed");
+            }
+        }
+    }
+
+    async fn housekeeping(&mut self, stats: &mut Stats) {
+        if stats.since.elapsed() < Duration::from_secs(600) {
+            return;
+        }
+        match self.prune().await {
+            Ok((seen, orphans)) => {
+                debug!(provider = %self.provider, seen, orphans, "tip watch pruned")
+            }
+            Err(e) => {
+                warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch prune failed")
+            }
+        }
+        info!(
+            provider = %self.provider, tip = self.tip().map(|h| h.number), steps = stats.steps,
+            pushed = stats.pushed, reorgs = stats.reorgs, max_depth = stats.max_depth, errors = stats.errors,
+            "tip watch summary (last 10 min)"
+        );
+        *stats = Stats {
+            backoff: stats.backoff,
+            ..Stats::new()
+        };
+    }
+}
+
+struct Stats {
+    steps: u64,
+    pushed: u64,
+    reorgs: u64,
+    max_depth: u32,
+    errors: u64,
+    since: Instant,
+    backoff: Duration,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            steps: 0,
+            pushed: 0,
+            reorgs: 0,
+            max_depth: 0,
+            errors: 0,
+            since: Instant::now(),
+            backoff: Duration::from_secs(1),
         }
     }
 }

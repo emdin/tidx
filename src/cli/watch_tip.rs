@@ -53,6 +53,16 @@ pub struct Args {
     /// events are kept forever. 0 keeps the copies forever too.
     #[arg(long, default_value_t = 90)]
     pub orphan_retention_days: u32,
+
+    /// WebSocket endpoint for a provider, as NAME=URL (ws:// or wss://). The
+    /// watcher then follows pushed heads (eth_subscribe newHeads), which shows
+    /// tip versions too short-lived for any poll; polling stays the fallback.
+    #[arg(long = "ws", value_name = "NAME=URL")]
+    pub ws: Vec<String>,
+
+    /// With --ws: resubscribe when no head was pushed for this many seconds.
+    #[arg(long, default_value_t = 10)]
+    pub stall_after_secs: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -60,6 +70,7 @@ struct ProviderPlan {
     name: String,
     url: String,
     rps: f64,
+    ws: Option<String>,
 }
 
 fn split_pair<'a>(what: &str, s: &'a str) -> Result<(&'a str, &'a str)> {
@@ -88,6 +99,17 @@ fn plan_providers(args: &Args) -> Result<Vec<ProviderPlan>> {
         }
         rps.insert(name.to_string(), n);
     }
+    let mut ws = std::collections::HashMap::new();
+    for w in &args.ws {
+        let (name, url) = split_pair("--ws", w)?;
+        let parsed = url::Url::parse(url).with_context(|| format!("--ws {name}: bad URL"))?;
+        if !matches!(parsed.scheme(), "ws" | "wss") {
+            bail!("--ws {name}: only ws(s) URLs are supported");
+        }
+        if ws.insert(name.to_string(), url.to_string()).is_some() {
+            bail!("--ws {name} given twice");
+        }
+    }
     let mut names = HashSet::new();
     let mut plans = Vec::new();
     for p in &args.providers {
@@ -103,10 +125,14 @@ fn plan_providers(args: &Args) -> Result<Vec<ProviderPlan>> {
             name: name.to_string(),
             url: url.to_string(),
             rps: rps.remove(name).unwrap_or(args.default_rps),
+            ws: ws.remove(name),
         });
     }
     if let Some(unknown) = rps.keys().next() {
         bail!("--rps {unknown}: no such --provider");
+    }
+    if let Some(unknown) = ws.keys().next() {
+        bail!("--ws {unknown}: no such --provider");
     }
     Ok(plans)
 }
@@ -137,6 +163,7 @@ pub async fn run(args: Args) -> Result<()> {
         max_walk: args.max_walk,
         orphan_retention_days: (args.orphan_retention_days > 0)
             .then_some(args.orphan_retention_days),
+        stall_after: std::time::Duration::from_secs(args.stall_after_secs.max(1)),
         ..WatchOptions::default()
     };
     let pg_url = resolve_pg_url(&args.pg_url, args.pg_password_env.as_deref(), |v| {
@@ -169,8 +196,11 @@ pub async fn run(args: Args) -> Result<()> {
             {
                 bail!("provider {} is on chain {id}, expected {want}", p.name);
             }
-            let watcher = Watcher::start(&p.name, rpc, pool, opts).await?;
-            info!(provider = %p.name, url = %p.url, rps = p.rps, chain_id = id, "tip watch started");
+            let mut watcher = Watcher::start(&p.name, rpc, pool, opts).await?;
+            if let Some(ws) = &p.ws {
+                watcher = watcher.with_ws(ws);
+            }
+            info!(provider = %p.name, url = %p.url, ws = ?p.ws, rps = p.rps, chain_id = id, "tip watch started");
             watcher.run().await
         });
     }
@@ -208,6 +238,8 @@ mod tests {
             memory_blocks: 100,
             max_walk: 10,
             orphan_retention_days: 90,
+            ws: vec![],
+            stall_after_secs: 10,
         }
     }
 
@@ -227,12 +259,14 @@ mod tests {
                 ProviderPlan {
                     name: "own".into(),
                     url: "https://igra-mainnet.example".into(),
-                    rps: 4.0
+                    rps: 4.0,
+                    ws: None,
                 },
                 ProviderPlan {
                     name: "official".into(),
                     url: "https://rpc.example:8545".into(),
-                    rps: 2.0
+                    rps: 2.0,
+                    ws: None,
                 },
             ]
         );
@@ -271,6 +305,36 @@ mod tests {
                 "{providers:?} {rps:?}: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn websocket_endpoints_attach_to_their_provider() {
+        let mut a = args(
+            &[
+                "own=https://igra-mainnet.example",
+                "official=https://rpc.example",
+            ],
+            &[],
+        );
+        a.ws = vec!["own=wss://igra-mainnet.example".into()];
+        let plans = plan_providers(&a).unwrap();
+        assert_eq!(plans[0].ws.as_deref(), Some("wss://igra-mainnet.example"));
+        assert_eq!(plans[1].ws, None);
+
+        for (ws, expect) in [
+            ("other=wss://x.example", "no such --provider"),
+            ("own=https://x.example", "ws(s)"),
+            ("own=not a url", "bad URL"),
+            ("wss://no-name.example", "NAME=VALUE"),
+        ] {
+            let mut a = args(&["own=https://igra-mainnet.example"], &[]);
+            a.ws = vec![ws.into()];
+            let err = plan_providers(&a).expect_err(expect);
+            assert!(format!("{err:#}").contains(expect), "{ws}: {err:#}");
+        }
+        let mut a = args(&["own=https://igra-mainnet.example"], &[]);
+        a.ws = vec!["own=wss://a.example".into(), "own=wss://b.example".into()];
+        assert!(format!("{:#}", plan_providers(&a).unwrap_err()).contains("twice"));
     }
 
     #[test]
