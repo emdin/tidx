@@ -5,58 +5,88 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::rpc::{Header, parse_header};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// The WebSocket endpoint is on another chain than the HTTP one. A
+/// configuration error: retrying does not help.
+#[derive(Debug, thiserror::Error)]
+#[error("WebSocket endpoint is on chain {got}, the HTTP endpoint on chain {want}")]
+pub struct WrongChain {
+    pub got: u64,
+    pub want: u64,
+}
 
 /// An `eth_subscribe newHeads` subscription: every head the node switches to,
 /// including versions that are replaced before any poll could see them.
 pub struct HeadStream {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: Ws,
     id: String,
+    unusable: u64,
+}
+
+/// Sends a JSON-RPC request and waits for its answer, skipping anything else.
+async fn request(ws: &mut Ws, id: u64, method: &str, params: Value) -> Result<Value> {
+    ws.send(Message::text(
+        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
+    ))
+    .await
+    .with_context(|| format!("sending {method}"))?;
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("closed before answering {method}"))??;
+        let Message::Text(text) = msg else { continue };
+        let Ok(mut v) = serde_json::from_str::<Value>(text.as_str()) else {
+            continue;
+        };
+        if v.get("id") != Some(&json!(id)) {
+            continue;
+        }
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+            bail!("{method}: RPC error {err}");
+        }
+        return Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null));
+    }
 }
 
 impl HeadStream {
-    pub async fn connect(url: &str) -> Result<Self> {
-        let (mut ws, _) =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(url))
+    /// Connects, checks the endpoint is on `chain_id`, and subscribes. The
+    /// whole handshake must finish within `timeout`.
+    pub async fn connect(url: &str, chain_id: u64, timeout: Duration) -> Result<Self> {
+        tokio::time::timeout(timeout, async {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url)
                 .await
-                .context("connecting timed out")?
                 .context("connecting")?;
-        ws.send(Message::text(
-            json!({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["newHeads"]})
-                .to_string(),
-        ))
-        .await
-        .context("sending eth_subscribe")?;
-        let id = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            loop {
-                let msg = ws
-                    .next()
-                    .await
-                    .ok_or_else(|| anyhow!("closed before answering eth_subscribe"))??;
-                let Message::Text(text) = msg else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(text.as_str()) else {
-                    continue;
-                };
-                if v.get("id") != Some(&json!(1)) {
-                    continue;
+            let got = request(&mut ws, 1, "eth_chainId", json!([])).await?;
+            let got = got
+                .as_str()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .ok_or_else(|| anyhow!("eth_chainId returned {got}"))?;
+            if got != chain_id {
+                return Err(WrongChain {
+                    got,
+                    want: chain_id,
                 }
-                if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-                    bail!("eth_subscribe: RPC error {err}");
-                }
-                return v
-                    .get("result")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .ok_or_else(|| anyhow!("eth_subscribe returned no subscription id"));
+                .into());
             }
+            let id = request(&mut ws, 2, "eth_subscribe", json!(["newHeads"])).await?;
+            let id = id
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("eth_subscribe returned no subscription id"))?;
+            Ok(Self {
+                ws,
+                id,
+                unusable: 0,
+            })
         })
         .await
-        .context("waiting for the eth_subscribe answer timed out")??;
-        Ok(Self { ws, id })
+        .map_err(|_| anyhow!("subscribing took longer than {timeout:?}"))?
     }
 
     /// The next pushed head. `Ok(None)` for anything else: pings, other
@@ -74,7 +104,7 @@ impl HeadStream {
             Message::Close(frame) => bail!("closed by the node: {frame:?}"),
             _ => return Ok(None),
         };
-        let Ok(v) = serde_json::from_str::<Value>(text.as_str()) else {
+        let Ok(mut v) = serde_json::from_str::<Value>(text.as_str()) else {
             debug!("ignoring a message that is not JSON");
             return Ok(None);
         };
@@ -83,10 +113,26 @@ impl HeadStream {
         {
             return Ok(None);
         }
-        match parse_header(v["params"]["result"].clone()) {
+        let result = v
+            .pointer_mut("/params/result")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
+        match parse_header(result) {
             Ok(Some(h)) => Ok(Some(h)),
-            Ok(None) | Err(_) => {
-                debug!("ignoring a new-heads notification without a usable header");
+            other => {
+                // A node whose header shape differs would otherwise look like
+                // a silent subscription.
+                self.unusable += 1;
+                if self.unusable == 1 || self.unusable % 100 == 0 {
+                    let why = match other {
+                        Err(e) => format!("{e:#}"),
+                        _ => "no header".to_string(),
+                    };
+                    warn!(
+                        count = self.unusable,
+                        why, "new-heads notification without a usable header"
+                    );
+                }
                 Ok(None)
             }
         }

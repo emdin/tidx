@@ -1128,6 +1128,10 @@ enum WsMode {
     DropAfterSubscribe,
     Silent,
     Refuse,
+    /// Reads eth_subscribe and never answers it.
+    NoAnswer,
+    /// Answers eth_chainId with another chain.
+    WrongChain,
 }
 
 struct WsServer {
@@ -1153,14 +1157,38 @@ impl WsServer {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
                         return;
                     };
-                    let Some(Ok(Message::Text(_subscribe))) = ws.next().await else {
-                        return;
-                    };
                     let mode = *m.lock().unwrap();
+                    // Answer eth_chainId; stop at eth_subscribe.
+                    let sub_id = loop {
+                        let Some(Ok(Message::Text(text))) = ws.next().await else {
+                            return;
+                        };
+                        let req: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
+                        match req["method"].as_str() {
+                            Some("eth_chainId") => {
+                                let chain = if mode == WsMode::WrongChain {
+                                    "0x1"
+                                } else {
+                                    "0x97b1"
+                                };
+                                let reply =
+                                    json!({"jsonrpc": "2.0", "id": req["id"], "result": chain});
+                                if ws.send(Message::text(reply.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Some("eth_subscribe") => break req["id"].clone(),
+                            _ => {}
+                        }
+                    };
+                    if mode == WsMode::NoAnswer {
+                        while ws.next().await.is_some() {}
+                        return;
+                    }
                     if mode == WsMode::Refuse {
                         let _ = ws
                             .send(Message::text(
-                                json!({"jsonrpc": "2.0", "id": 1,
+                                json!({"jsonrpc": "2.0", "id": sub_id,
                                 "error": {"code": -32601, "message": "subscriptions disabled"}})
                                 .to_string(),
                             ))
@@ -1170,7 +1198,7 @@ impl WsServer {
                     let mut rx = tx.subscribe();
                     let _ = ws
                         .send(Message::text(
-                            json!({"jsonrpc": "2.0", "id": 1, "result": "0xsub"}).to_string(),
+                            json!({"jsonrpc": "2.0", "id": sub_id, "result": "0xsub"}).to_string(),
                         ))
                         .await;
                     subs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1252,7 +1280,7 @@ async fn run_with_ws(
         stall_after,
         ..opts(1000, 16)
     };
-    let w = watcher(f, provider, o).await.with_ws(&ws.url);
+    let w = watcher(f, provider, o).await.with_ws(&ws.url, 38833);
     tokio::spawn(w.run())
 }
 
@@ -1406,4 +1434,98 @@ async fn malformed_pushes_are_ignored() {
     task.abort();
     assert!(reorgs(&f.db.pool, p).await.is_empty());
     assert_eq!(ws.subscriptions(), 1, "junk did not cost the subscription");
+}
+
+#[tokio::test]
+#[serial]
+async fn pushed_head_whose_parent_fetch_fails_is_retried_not_lost() {
+    // The version only exists between two pushes; dropping it on a transient
+    // HTTP error loses the reorg that replaces it.
+    let p = "t-push-retry";
+    let f = fixture(p, 6).await;
+    f.chain.lock().unwrap().lag = Some(5);
+    let ws = WsServer::start(WsMode::Normal).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_secs(30)).await;
+    wait_for("the subscription", || async { ws.subscriptions() == 1 }).await;
+    wait_for("the catch-up poll", || async {
+        seen_tip(&f.db.pool, p).await == 5
+    })
+    .await;
+
+    let (x, y) = {
+        let mut c = f.chain.lock().unwrap();
+        c.extend(2); // 6, 7: the watcher must fetch 6 by hash to apply 7
+        let x = c.canon[7];
+        c.reorg(1, 1);
+        let y = c.canon[7];
+        c.faults.push_back(Fault::Http500); // that fetch fails once
+        (x, y)
+    };
+    ws.push(&x);
+    wait_for("block 7", || async { seen_tip(&f.db.pool, p).await == 7 }).await;
+    ws.push(&y);
+    wait_for("the reorg of 7", || async {
+        reorgs(&f.db.pool, p).await.len() == 1
+    })
+    .await;
+    task.abort();
+    let rows = reorgs(&f.db.pool, p).await;
+    assert_eq!(orphans(&f.db.pool, rows[0].id).await, vec![(7, x.hash)]);
+}
+
+#[tokio::test]
+#[serial]
+async fn quiet_chain_resubscribes_promptly_instead_of_backing_off() {
+    // No blocks for a while (sequencer pause): each quiet subscription times
+    // out, but a working endpoint must not push the watcher into minutes of
+    // polling-only, where short-lived versions are missed.
+    let p = "t-push-quiet";
+    let f = fixture(p, 5).await;
+    let ws = WsServer::start(WsMode::Normal).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_millis(300)).await;
+    wait_for("the first subscription", || async {
+        ws.subscriptions() >= 1
+    })
+    .await;
+    let start = ws.subscriptions();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let resubscribed = ws.subscriptions() - start;
+    task.abort();
+    assert!(
+        resubscribed >= 5,
+        "only {resubscribed} resubscriptions in 3 s of quiet with a 300 ms stall timeout"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn unanswered_subscribe_times_out_and_polling_continues() {
+    let p = "t-push-noanswer";
+    let f = fixture(p, 5).await;
+    let ws = WsServer::start(WsMode::NoAnswer).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_millis(300)).await;
+    f.chain.lock().unwrap().extend(2);
+    wait_for("polling to reach block 6", || async {
+        seen_tip(&f.db.pool, p).await == 6
+    })
+    .await;
+    assert!(!task.is_finished());
+    task.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn websocket_endpoint_on_another_chain_is_refused() {
+    let p = "t-push-wrongchain";
+    let f = fixture(p, 5).await;
+    let ws = WsServer::start(WsMode::WrongChain).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_millis(300)).await;
+    let err = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("a wrong chain must stop the watcher")
+        .unwrap()
+        .expect_err("a wrong chain is an error");
+    assert!(format!("{err:#}").contains("chain"), "{err:#}");
+    assert_eq!(ws.subscriptions(), 0);
+    assert!(reorgs(&f.db.pool, p).await.is_empty());
 }

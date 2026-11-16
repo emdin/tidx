@@ -60,8 +60,9 @@ pub struct Args {
     #[arg(long = "ws", value_name = "NAME=URL")]
     pub ws: Vec<String>,
 
-    /// With --ws: resubscribe when no head was pushed for this many seconds.
-    #[arg(long, default_value_t = 10)]
+    /// With --ws: resubscribe when no head was pushed for this many seconds;
+    /// also the subscribe timeout and the first retry delay.
+    #[arg(long, default_value_t = WatchOptions::default().stall_after.as_secs())]
     pub stall_after_secs: u64,
 }
 
@@ -164,7 +165,6 @@ pub async fn run(args: Args) -> Result<()> {
         orphan_retention_days: (args.orphan_retention_days > 0)
             .then_some(args.orphan_retention_days),
         stall_after: std::time::Duration::from_secs(args.stall_after_secs.max(1)),
-        ..WatchOptions::default()
     };
     let pg_url = resolve_pg_url(&args.pg_url, args.pg_password_env.as_deref(), |v| {
         std::env::var(v)
@@ -198,7 +198,7 @@ pub async fn run(args: Args) -> Result<()> {
             }
             let mut watcher = Watcher::start(&p.name, rpc, pool, opts).await?;
             if let Some(ws) = &p.ws {
-                watcher = watcher.with_ws(ws);
+                watcher = watcher.with_ws(ws, id);
             }
             info!(provider = %p.name, url = %p.url, ws = ?p.ws, rps = p.rps, chain_id = id, "tip watch started");
             watcher.run().await

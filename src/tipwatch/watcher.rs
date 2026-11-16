@@ -6,7 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use super::rpc::{Header, TipRpc};
 use super::store::{self, NewReorg, Op, Seen};
-use super::ws::HeadStream;
+use super::ws::{HeadStream, WrongChain};
 use crate::db::Pool;
 
 #[derive(Clone, Copy, Debug)]
@@ -174,6 +174,8 @@ pub struct Watcher {
     opts: WatchOptions,
     chain: Chain,
     ws_url: Option<String>,
+    /// The chain the WebSocket endpoint must be on (the HTTP endpoint's).
+    ws_chain_id: u64,
 }
 
 impl Watcher {
@@ -204,13 +206,15 @@ impl Watcher {
             opts,
             chain,
             ws_url: None,
+            ws_chain_id: 0,
         })
     }
 
     /// Follow pushed heads from this WebSocket endpoint (`eth_subscribe
     /// newHeads`) instead of polling; polling remains the fallback.
-    pub fn with_ws(mut self, url: &str) -> Self {
+    pub fn with_ws(mut self, url: &str, chain_id: u64) -> Self {
         self.ws_url = Some(url.to_string());
+        self.ws_chain_id = chain_id;
         self
     }
 
@@ -581,11 +585,13 @@ impl Watcher {
     }
 
     /// Runs forever. With a WebSocket endpoint it follows pushed heads, and
-    /// polls only to catch up after subscribing and while the subscription is
-    /// down; without one it polls within the provider's request budget. RPC and
-    /// database failures are logged and retried; they never end the loop.
+    /// polls only to catch up around (re)subscribing and while no subscription
+    /// works; without one it polls within the provider's request budget. RPC and
+    /// database failures are logged and retried; they never end the loop. Only
+    /// a WebSocket endpoint on another chain than the HTTP one ends it.
     pub async fn run(mut self) -> Result<()> {
         const MAX_RETRY: Duration = Duration::from_secs(300);
+        const FAILED_PUSHES_BEFORE_POLLING: u32 = 3;
         let mut stats = Stats::new();
         let Some(url) = self.ws_url.clone() else {
             loop {
@@ -593,49 +599,93 @@ impl Watcher {
                 self.housekeeping(&mut stats).await;
             }
         };
-        let mut retry = self.opts.stall_after;
+        let stall_after = self.opts.stall_after;
+        let mut retry = stall_after;
         loop {
-            match HeadStream::connect(&url).await {
-                Ok(mut heads) => {
-                    info!(provider = %self.provider, "subscribed to new heads");
-                    let subscribed_at = Instant::now();
-                    self.poll_once(&mut stats).await;
-                    let mut last_head = Instant::now();
-                    loop {
-                        let left = self.opts.stall_after.saturating_sub(last_head.elapsed());
-                        match tokio::time::timeout(left, heads.next()).await {
-                            Ok(Ok(Some(head))) => {
-                                last_head = Instant::now();
-                                stats.pushed += 1;
-                                let out = self.apply(head).await;
-                                self.tally(&mut stats, out);
-                            }
-                            Ok(Ok(None)) => {}
-                            Ok(Err(e)) => {
-                                warn!(provider = %self.provider, error = %format!("{e:#}"), "new-heads subscription ended");
-                                break;
-                            }
-                            Err(_) => {
-                                warn!(provider = %self.provider, stall_after = ?self.opts.stall_after, "no head pushed; resubscribing");
-                                break;
-                            }
-                        }
-                        self.housekeeping(&mut stats).await;
-                    }
-                    if subscribed_at.elapsed() >= Duration::from_secs(60) {
-                        retry = self.opts.stall_after;
-                    }
-                }
+            let mut heads = match HeadStream::connect(&url, self.ws_chain_id, stall_after).await {
+                Ok(heads) => heads,
+                Err(e) if e.is::<WrongChain>() => return Err(e),
                 Err(e) => {
                     warn!(provider = %self.provider, error = %format!("{e:#}"), retry_in = ?retry, "subscribing to new heads failed; polling meanwhile");
+                    self.poll_for(retry, &mut stats).await;
+                    retry = (retry * 2).min(MAX_RETRY);
+                    continue;
                 }
-            }
-            let until = Instant::now() + retry;
-            while Instant::now() < until {
+            };
+            info!(provider = %self.provider, "subscribed to new heads");
+            let subscribed_at = Instant::now();
+            self.poll_once(&mut stats).await;
+            // Silence is measured from the end of our own work, so a slow walk
+            // or prune never looks like a silent subscription.
+            let mut quiet_since = Instant::now();
+            let mut failed_pushes = 0;
+            let ended_by_failure = loop {
+                let left = stall_after.saturating_sub(quiet_since.elapsed());
+                match tokio::time::timeout(left, heads.next()).await {
+                    Ok(Ok(Some(head))) => {
+                        stats.pushed += 1;
+                        failed_pushes = if self.apply_pushed(head, &mut stats).await {
+                            0
+                        } else {
+                            failed_pushes + 1
+                        };
+                        if failed_pushes >= FAILED_PUSHES_BEFORE_POLLING {
+                            warn!(provider = %self.provider, failed_pushes, "pushed heads keep failing; polling with backoff");
+                            break true;
+                        }
+                        quiet_since = Instant::now();
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        warn!(provider = %self.provider, error = %format!("{e:#}"), "new-heads subscription ended");
+                        break subscribed_at.elapsed() < stall_after;
+                    }
+                    Err(_) => {
+                        // A quiet chain, not a broken endpoint: resubscribe now.
+                        info!(provider = %self.provider, stall_after = ?stall_after, "no head pushed; resubscribing");
+                        break false;
+                    }
+                }
+                if self.housekeeping(&mut stats).await {
+                    quiet_since = Instant::now();
+                }
+            };
+            if ended_by_failure {
+                self.poll_for(retry, &mut stats).await;
+                retry = (retry * 2).min(MAX_RETRY);
+            } else {
+                retry = stall_after;
                 self.poll_once(&mut stats).await;
-                self.housekeeping(&mut stats).await;
             }
-            retry = (retry * 2).min(MAX_RETRY);
+        }
+    }
+
+    /// Applies a pushed head, retrying twice: the version may be gone by the
+    /// next push, so a transient RPC or database error must not drop it.
+    async fn apply_pushed(&mut self, head: Header, stats: &mut Stats) -> bool {
+        let mut delay = Duration::from_millis(250);
+        for attempt in 1..=3 {
+            match self.apply(head).await {
+                Ok(out) => {
+                    self.tally(stats, Ok(out));
+                    return true;
+                }
+                Err(e) if attempt < 3 => {
+                    debug!(provider = %self.provider, attempt, error = %format!("{e:#}"), "retrying a pushed head");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(e) => self.tally(stats, Err(e)),
+            }
+        }
+        false
+    }
+
+    async fn poll_for(&mut self, window: Duration, stats: &mut Stats) {
+        let until = Instant::now() + window;
+        while Instant::now() < until {
+            self.poll_once(stats).await;
+            self.housekeeping(stats).await;
         }
     }
 
@@ -671,9 +721,10 @@ impl Watcher {
         }
     }
 
-    async fn housekeeping(&mut self, stats: &mut Stats) {
+    /// Every 10 minutes: prune and log a summary. Returns whether it ran.
+    async fn housekeeping(&mut self, stats: &mut Stats) -> bool {
         if stats.since.elapsed() < Duration::from_secs(600) {
-            return;
+            return false;
         }
         match self.prune().await {
             Ok((seen, orphans)) => {
@@ -692,6 +743,7 @@ impl Watcher {
             backoff: stats.backoff,
             ..Stats::new()
         };
+        true
     }
 }
 
