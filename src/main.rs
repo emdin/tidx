@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
         Commands::EnrichL1Senders(args) => cli::enrich_l1_senders::run(args).await,
         Commands::EnrichL1Fees(args) => cli::enrich_l1_fees::run(args).await,
         Commands::ImportBlockscout(args) => cli::import_blockscout::run(args).await,
+        Commands::WatchTip(args) => cli::watch_tip::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
     }
 }
