@@ -29,7 +29,7 @@ const INSUFFICIENT_PRIVILEGE: &str = "42501";
 // Scripted chain behind a JSON-RPC endpoint
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Blk {
     number: u64,
     hash: B256,
@@ -45,6 +45,8 @@ enum Fault {
     RpcError,
     NullResult,
     WrongBlock,
+    /// Answer the next request with this block, whatever was asked.
+    Serve(Blk),
 }
 
 #[derive(Default)]
@@ -143,6 +145,10 @@ async fn rpc_handler(
         }
         Fault::WrongBlock => {
             let b = c.canon[1];
+            return Json(json!({"jsonrpc": "2.0", "id": 1, "result": json_block(&b)}))
+                .into_response();
+        }
+        Fault::Serve(b) => {
             return Json(json!({"jsonrpc": "2.0", "id": 1, "result": json_block(&b)}))
                 .into_response();
         }
@@ -606,6 +612,89 @@ async fn rpc_failures_return_errors_and_leave_state_untouched() {
         StepOutcome::Extended { blocks: 3, tip: 7 }
     );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn reorg_deeper_than_max_walk_is_found_by_number_without_a_gap() {
+    let p = "t-deep-walk";
+    let f = fixture(p, 3).await;
+    let mut w = watcher(&f, p, opts(1000, 2)).await;
+    w.step().await.unwrap();
+    grow(&f, &mut w, 7).await; // tip 9
+
+    f.chain.lock().unwrap().reorg(3, 4); // 7..=9 replaced, head 10
+    let out = w.step().await.unwrap();
+    let rows = reorgs(&f.db.pool, p).await;
+    assert_eq!(
+        out,
+        StepOutcome::Reorg {
+            id: rows[0].id,
+            depth: 3,
+            fork_point: 6
+        }
+    );
+    assert!(
+        !rows[0].after_gap,
+        "the head links to the compared chain: nothing was skipped"
+    );
+    assert!(gaps(&f.db.pool, p).await.is_empty());
+    let s = seen(&f.db.pool, p).await;
+    assert_eq!(s.last().unwrap().0, 10);
+    assert_eq!(s, canon_for(&f.chain, &s));
+}
+
+#[tokio::test]
+#[serial]
+async fn chain_changing_during_a_by_number_comparison_is_retried_not_recorded() {
+    let p = "t-mid-change";
+    let f = fixture(p, 3).await;
+    let mut w = watcher(&f, p, opts(1000, 2)).await;
+    w.step().await.unwrap();
+    grow(&f, &mut w, 7).await; // tip 9
+
+    let other = {
+        let mut c = f.chain.lock().unwrap();
+        c.reorg(3, 4);
+        let other_branch = Chain::with_branch(9_999).mk(9, B256::repeat_byte(7));
+        // head, one parent by hash, then the block at height 9 comes from
+        // yet another branch that the head does not build on.
+        c.faults
+            .extend([Fault::Pass, Fault::Pass, Fault::Serve(other_branch)]);
+        other_branch
+    };
+    let err = w
+        .step()
+        .await
+        .expect_err("inconsistent answers must not be recorded");
+    assert!(
+        format!("{err:#}").contains("changed while being compared"),
+        "{err:#}"
+    );
+    assert!(reorgs(&f.db.pool, p).await.is_empty());
+    assert!(
+        gaps(&f.db.pool, p).await.is_empty(),
+        "no backwards gap range"
+    );
+    assert!(
+        seen(&f.db.pool, p)
+            .await
+            .iter()
+            .all(|(_, h)| *h != other.hash)
+    );
+
+    let out = w.step().await.unwrap();
+    assert!(
+        matches!(
+            out,
+            StepOutcome::Reorg {
+                depth: 3,
+                fork_point: 6,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

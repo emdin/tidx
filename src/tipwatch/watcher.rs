@@ -55,6 +55,20 @@ pub enum StepOutcome {
     },
 }
 
+/// Igra's tip switches between candidate blocks every few seconds (1–2 block
+/// reorgs, often flipping back), so only deeper ones are worth a log line by
+/// default; all of them are in tipwatch.reorgs. 20 is close to the engine's
+/// 30-block head delay.
+fn log_reorg(provider: &str, id: i64, r: &NewReorg<'_>, msg: &str) {
+    let depth = r.orphaned.len();
+    let (fork_point, old_tip, new_tip) = (r.fork_point, r.old_tip, r.new_tip);
+    match depth {
+        20.. => warn!(provider, id, depth, fork_point, old_tip, new_tip, "{msg}"),
+        3.. => info!(provider, id, depth, fork_point, old_tip, new_tip, "{msg}"),
+        _ => debug!(provider, id, depth, fork_point, old_tip, new_tip, "{msg}"),
+    }
+}
+
 /// The provider's chain as last seen: contiguous and hash-linked.
 struct Chain {
     blocks: BTreeMap<u64, Seen>,
@@ -163,7 +177,8 @@ impl Watcher {
     }
 
     /// One poll: fetch the provider's head, reconcile it with what was seen,
-    /// persist the result. Nothing is written or changed when it fails.
+    /// persist the result. Memory only changes after the matching database
+    /// write commits, so a failed step is simply retried on the next poll.
     pub async fn step(&mut self) -> Result<StepOutcome> {
         let head = self.rpc.head().await?;
         let now = Utc::now();
@@ -253,10 +268,7 @@ impl Watcher {
             after_gap: false,
         };
         let id = store::save_reorg(&self.pool, &self.provider, &r).await?;
-        info!(
-            provider = %self.provider, id, depth = orphaned.len(), fork_point = fork,
-            old_tip = tip.header.number, new_tip = head.number, "tip reorg"
-        );
+        log_reorg(&self.provider, id, &r, "tip reorg");
         self.chain.replace_above(fork, &added);
         Ok(StepOutcome::Reorg {
             id,
@@ -334,6 +346,12 @@ impl Watcher {
             .map(|s| s.header.hash);
         let connects =
             head.number == top || (head.number == top + 1 && Some(head.parent_hash) == top_hash);
+        if !connects && head.number <= top + 1 {
+            bail!(
+                "provider's block {top} does not link to its head {}: its chain changed while being compared",
+                head.number
+            );
+        }
         let mut reorg = None;
         if !added.is_empty() {
             let orphaned = self.chain.above(fork);
@@ -346,10 +364,7 @@ impl Watcher {
                 after_gap: !connects,
             };
             let id = store::save_reorg(&self.pool, &self.provider, &r).await?;
-            info!(
-                provider = %self.provider, id, depth = orphaned.len(), fork_point = fork,
-                old_tip = tip.header.number, new_tip = top, "tip reorg (found by block number)"
-            );
+            log_reorg(&self.provider, id, &r, "tip reorg (found by block number)");
             self.chain.replace_above(fork, &added);
             reorg = Some((id, orphaned.len() as u32));
         }
