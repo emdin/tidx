@@ -20,6 +20,10 @@ pub struct WatchOptions {
     /// Days to keep the copies of replaced blocks (`tipwatch.orphans`); the
     /// reorg events themselves are kept forever. `None` keeps everything.
     pub orphan_retention_days: Option<u32>,
+    /// With a new-heads subscription: resubscribe when nothing was pushed for
+    /// this long (Igra makes about a block a second). Also the first delay
+    /// before retrying a failed subscription, while polling covers the gap.
+    pub stall_after: Duration,
 }
 
 impl Default for WatchOptions {
@@ -28,6 +32,7 @@ impl Default for WatchOptions {
             memory_blocks: 20_000,
             max_walk: 256,
             orphan_retention_days: Some(90),
+            stall_after: Duration::from_secs(10),
         }
     }
 }
@@ -167,6 +172,7 @@ pub struct Watcher {
     pool: Pool,
     opts: WatchOptions,
     chain: Chain,
+    ws_url: Option<String>,
 }
 
 impl Watcher {
@@ -196,7 +202,15 @@ impl Watcher {
             pool,
             opts,
             chain,
+            ws_url: None,
         })
+    }
+
+    /// Follow pushed heads from this WebSocket endpoint (`eth_subscribe
+    /// newHeads`) instead of polling; polling remains the fallback.
+    pub fn with_ws(mut self, url: &str) -> Self {
+        self.ws_url = Some(url.to_string());
+        self
     }
 
     pub fn tip(&self) -> Option<Header> {

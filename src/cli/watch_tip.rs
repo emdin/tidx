@@ -137,6 +137,7 @@ pub async fn run(args: Args) -> Result<()> {
         max_walk: args.max_walk,
         orphan_retention_days: (args.orphan_retention_days > 0)
             .then_some(args.orphan_retention_days),
+        ..WatchOptions::default()
     };
     let pg_url = resolve_pg_url(&args.pg_url, args.pg_password_env.as_deref(), |v| {
         std::env::var(v)

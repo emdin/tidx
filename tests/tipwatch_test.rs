@@ -252,6 +252,7 @@ fn opts(memory_blocks: usize, max_walk: usize) -> WatchOptions {
         memory_blocks,
         max_walk,
         orphan_retention_days: None,
+        stall_after: Duration::from_millis(300),
     }
 }
 
@@ -1111,4 +1112,298 @@ async fn watcher_role_cannot_touch_the_indexed_tables() {
         .await
         .unwrap();
     store::ensure_schema(&f.pool).await.expect("idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// Pushed heads (eth_subscribe newHeads)
+// ---------------------------------------------------------------------------
+//
+// Polling misses tip versions that live shorter than one poll: on 2026-11-16 the
+// own node pushed 23 versions in 2 minutes that were later dropped, and the
+// 4-requests/s poller recorded 14 of them.
+
+#[derive(Clone, Copy, PartialEq)]
+enum WsMode {
+    Normal,
+    DropAfterSubscribe,
+    Silent,
+    Refuse,
+}
+
+struct WsServer {
+    url: String,
+    pushes: tokio::sync::broadcast::Sender<String>,
+    subscriptions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WsServer {
+    async fn start(mode: WsMode) -> Self {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (pushes, _) = tokio::sync::broadcast::channel::<String>(1024);
+        let subscriptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mode = Arc::new(Mutex::new(mode));
+        let (tx, subs, m) = (pushes.clone(), subscriptions.clone(), mode.clone());
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (tx, subs, m) = (tx.clone(), subs.clone(), m.clone());
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    let Some(Ok(Message::Text(_subscribe))) = ws.next().await else {
+                        return;
+                    };
+                    let mode = *m.lock().unwrap();
+                    if mode == WsMode::Refuse {
+                        let _ = ws
+                            .send(Message::text(
+                                json!({"jsonrpc": "2.0", "id": 1,
+                                "error": {"code": -32601, "message": "subscriptions disabled"}})
+                                .to_string(),
+                            ))
+                            .await;
+                        return;
+                    }
+                    let mut rx = tx.subscribe();
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc": "2.0", "id": 1, "result": "0xsub"}).to_string(),
+                        ))
+                        .await;
+                    subs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match mode {
+                        WsMode::DropAfterSubscribe => {
+                            *m.lock().unwrap() = WsMode::Normal;
+                        }
+                        WsMode::Silent => {
+                            *m.lock().unwrap() = WsMode::Normal;
+                            while ws.next().await.is_some() {}
+                        }
+                        _ => {
+                            while let Ok(text) = rx.recv().await {
+                                if ws.send(Message::text(text)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            url,
+            pushes,
+            subscriptions,
+        }
+    }
+
+    fn push(&self, b: &Blk) {
+        self.push_raw(
+            json!({"jsonrpc": "2.0", "method": "eth_subscription",
+                   "params": {"subscription": "0xsub", "result": json_block(b)}})
+            .to_string(),
+        );
+    }
+
+    fn push_raw(&self, text: String) {
+        let _ = self.pushes.send(text);
+    }
+
+    fn subscriptions(&self) -> usize {
+        self.subscriptions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn wait_for<F, Fut>(what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !cond().await {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn seen_tip(pool: &Pool, provider: &str) -> i64 {
+    let c = pool.get().await.unwrap();
+    c.query_one(
+        "SELECT coalesce(max(num), -1) FROM tipwatch.seen WHERE provider = $1",
+        &[&provider],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+/// `stall_after` short: quiet subscriptions get replaced quickly. Long: the
+/// subscription count stays stable while nothing is pushed.
+async fn run_with_ws(
+    f: &Fixture,
+    provider: &str,
+    ws: &WsServer,
+    stall_after: Duration,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let o = WatchOptions {
+        stall_after,
+        ..opts(1000, 16)
+    };
+    let w = watcher(f, provider, o).await.with_ws(&ws.url);
+    tokio::spawn(w.run())
+}
+
+#[tokio::test]
+#[serial]
+async fn pushed_versions_that_polling_never_sees_are_recorded() {
+    let p = "t-push";
+    let f = fixture(p, 5).await;
+    // HTTP keeps answering with block 4, so only the push stream shows the tip.
+    f.chain.lock().unwrap().lag = Some(4);
+    let ws = WsServer::start(WsMode::Normal).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_secs(30)).await;
+    wait_for("the subscription", || async { ws.subscriptions() == 1 }).await;
+    wait_for("the catch-up poll", || async {
+        seen_tip(&f.db.pool, p).await == 4
+    })
+    .await;
+
+    let (b5, b5x, b5y) = {
+        let mut c = f.chain.lock().unwrap();
+        c.extend(1);
+        let b5 = c.canon[5];
+        c.reorg(1, 1);
+        let b5x = c.canon[5];
+        c.reorg(1, 1);
+        (b5, b5x, c.canon[5])
+    };
+    for b in [b5, b5x, b5y] {
+        ws.push(&b);
+    }
+    wait_for("two reorgs", || async {
+        reorgs(&f.db.pool, p).await.len() == 2
+    })
+    .await;
+    task.abort();
+
+    let rows = reorgs(&f.db.pool, p).await;
+    assert_eq!(orphans(&f.db.pool, rows[0].id).await, vec![(5, b5.hash)]);
+    assert_eq!(orphans(&f.db.pool, rows[1].id).await, vec![(5, b5x.hash)]);
+    assert_eq!(seen(&f.db.pool, p).await.last().unwrap(), &(5, b5y.hash));
+}
+
+#[tokio::test]
+#[serial]
+async fn dropped_subscription_falls_back_to_polling_and_resubscribes() {
+    let p = "t-push-drop";
+    let f = fixture(p, 5).await;
+    let ws = WsServer::start(WsMode::DropAfterSubscribe).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_millis(300)).await;
+    wait_for("the first subscription", || async {
+        ws.subscriptions() >= 1
+    })
+    .await;
+
+    f.chain.lock().unwrap().extend(3); // only visible by polling while unsubscribed
+    wait_for("polling to reach block 7", || async {
+        seen_tip(&f.db.pool, p).await == 7
+    })
+    .await;
+    wait_for("a second subscription", || async {
+        ws.subscriptions() >= 2
+    })
+    .await;
+
+    let b8 = {
+        let mut c = f.chain.lock().unwrap();
+        c.extend(1);
+        c.canon[8]
+    };
+    ws.push(&b8);
+    wait_for("block 8", || async { seen_tip(&f.db.pool, p).await == 8 }).await;
+    task.abort();
+    let s = seen(&f.db.pool, p).await;
+    assert_eq!(s, canon_for(&f.chain, &s));
+    assert!(gaps(&f.db.pool, p).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn silent_subscription_is_replaced_and_polling_covers_the_gap() {
+    let p = "t-push-silent";
+    let f = fixture(p, 5).await;
+    let ws = WsServer::start(WsMode::Silent).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_millis(300)).await;
+    wait_for("the first subscription", || async {
+        ws.subscriptions() >= 1
+    })
+    .await;
+
+    f.chain.lock().unwrap().extend(2);
+    wait_for("polling to reach block 6", || async {
+        seen_tip(&f.db.pool, p).await == 6
+    })
+    .await;
+    wait_for("a fresh subscription", || async { ws.subscriptions() >= 2 }).await;
+    task.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn refused_subscription_falls_back_to_polling() {
+    let p = "t-push-refused";
+    let f = fixture(p, 5).await;
+    let ws = WsServer::start(WsMode::Refuse).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_millis(300)).await;
+
+    f.chain.lock().unwrap().extend(2);
+    wait_for("polling to reach block 6", || async {
+        seen_tip(&f.db.pool, p).await == 6
+    })
+    .await;
+    assert_eq!(ws.subscriptions(), 0);
+    assert!(!task.is_finished(), "the watcher keeps running");
+    task.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn malformed_pushes_are_ignored() {
+    let p = "t-push-garbage";
+    let f = fixture(p, 5).await;
+    f.chain.lock().unwrap().lag = Some(4);
+    let ws = WsServer::start(WsMode::Normal).await;
+    let task = run_with_ws(&f, p, &ws, Duration::from_secs(30)).await;
+    wait_for("the subscription", || async { ws.subscriptions() == 1 }).await;
+    wait_for("the catch-up poll", || async {
+        seen_tip(&f.db.pool, p).await == 4
+    })
+    .await;
+
+    let b5 = {
+        let mut c = f.chain.lock().unwrap();
+        c.extend(1);
+        c.canon[5]
+    };
+    for junk in [
+        "{not json".to_string(),
+        json!({"jsonrpc": "2.0", "method": "eth_subscription",
+               "params": {"subscription": "0xother", "result": json_block(&b5)}})
+        .to_string(),
+        json!({"jsonrpc": "2.0", "method": "eth_subscription",
+               "params": {"subscription": "0xsub", "result": {"number": "0x5"}}})
+        .to_string(),
+        json!({"jsonrpc": "2.0", "method": "something_else", "params": {}}).to_string(),
+    ] {
+        ws.push_raw(junk);
+    }
+    ws.push(&b5);
+    wait_for("block 5", || async { seen_tip(&f.db.pool, p).await == 5 }).await;
+    assert!(!task.is_finished());
+    task.abort();
+    assert!(reorgs(&f.db.pool, p).await.is_empty());
+    assert_eq!(ws.subscriptions(), 1, "junk did not cost the subscription");
 }
