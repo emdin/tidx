@@ -17,6 +17,9 @@ pub struct WatchOptions {
     /// handled by a by-number binary search and the unfetched heights become a
     /// gap.
     pub max_walk: usize,
+    /// Days to keep the copies of replaced blocks (`tipwatch.orphans`); the
+    /// reorg events themselves are kept forever. `None` keeps everything.
+    pub orphan_retention_days: Option<u32>,
 }
 
 impl Default for WatchOptions {
@@ -24,6 +27,7 @@ impl Default for WatchOptions {
         Self {
             memory_blocks: 20_000,
             max_walk: 256,
+            orphan_retention_days: Some(90),
         }
     }
 }
@@ -536,19 +540,24 @@ impl Watcher {
         })
     }
 
-    /// Drops `tipwatch.seen` rows older than the memory window.
-    pub async fn prune(&self) -> Result<u64> {
-        let Some(tip) = self.chain.tip() else {
-            return Ok(0);
+    /// Drops `tipwatch.seen` rows older than the memory window and, with a
+    /// retention set, orphan copies older than it. Returns (seen, orphans)
+    /// rows deleted.
+    pub async fn prune(&self) -> Result<(u64, u64)> {
+        let upto = self.chain.tip().and_then(|tip| {
+            tip.header
+                .number
+                .checked_sub(self.opts.memory_blocks as u64)
+        });
+        let seen = match upto {
+            Some(upto) => store::prune_seen(&self.pool, &self.provider, upto).await?,
+            None => 0,
         };
-        let Some(upto) = tip
-            .header
-            .number
-            .checked_sub(self.opts.memory_blocks as u64)
-        else {
-            return Ok(0);
+        let orphans = match self.opts.orphan_retention_days {
+            Some(days) => store::prune_orphans(&self.pool, &self.provider, days).await?,
+            None => 0,
         };
-        store::prune_seen(&self.pool, &self.provider, upto).await
+        Ok((seen, orphans))
     }
 
     /// Steps forever, backing off on errors. RPC and database failures are
@@ -586,7 +595,9 @@ impl Watcher {
             }
             if last_housekeeping.elapsed() >= EVERY {
                 match self.prune().await {
-                    Ok(n) => debug!(provider = %self.provider, pruned = n, "tip watch pruned seen"),
+                    Ok((seen, orphans)) => {
+                        debug!(provider = %self.provider, seen, orphans, "tip watch pruned")
+                    }
                     Err(e) => {
                         warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch prune failed")
                     }

@@ -245,6 +245,20 @@ pub async fn prune_seen(pool: &Pool, provider: &str, upto: u64) -> Result<u64> {
         .await?)
 }
 
+/// Deletes the copies of blocks replaced by the provider's reorgs detected more
+/// than `days` ago. The reorg rows stay.
+pub async fn prune_orphans(pool: &Pool, provider: &str, days: u32) -> Result<u64> {
+    let conn = pool.get().await?;
+    Ok(conn
+        .execute(
+            "DELETE FROM tipwatch.orphans o USING tipwatch.reorgs r
+             WHERE o.reorg_id = r.id AND r.provider = $1
+               AND r.detected_at < now() - make_interval(days => $2)",
+            &[&provider, &(days as i32)],
+        )
+        .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

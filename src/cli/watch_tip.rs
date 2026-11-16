@@ -48,6 +48,11 @@ pub struct Args {
     /// by-number comparison and recording the skipped heights as a gap.
     #[arg(long, default_value_t = WatchOptions::default().max_walk)]
     pub max_walk: usize,
+
+    /// Days to keep the copies of replaced blocks (tipwatch.orphans). Reorg
+    /// events are kept forever. 0 keeps the copies forever too.
+    #[arg(long, default_value_t = 90)]
+    pub orphan_retention_days: u32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -130,6 +135,8 @@ pub async fn run(args: Args) -> Result<()> {
     let opts = WatchOptions {
         memory_blocks: args.memory_blocks,
         max_walk: args.max_walk,
+        orphan_retention_days: (args.orphan_retention_days > 0)
+            .then_some(args.orphan_retention_days),
     };
     let pg_url = resolve_pg_url(&args.pg_url, args.pg_password_env.as_deref(), |v| {
         std::env::var(v)
@@ -199,6 +206,7 @@ mod tests {
             chain_id: None,
             memory_blocks: 100,
             max_walk: 10,
+            orphan_retention_days: 90,
         }
     }
 

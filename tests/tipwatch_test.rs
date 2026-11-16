@@ -251,6 +251,7 @@ fn opts(memory_blocks: usize, max_walk: usize) -> WatchOptions {
     WatchOptions {
         memory_blocks,
         max_walk,
+        orphan_retention_days: None,
     }
 }
 
@@ -1018,6 +1019,54 @@ async fn requests_are_paced_to_max_rps() {
     assert!(
         TipRpc::new(&f.url, 0.0).is_err(),
         "a zero rate would never send"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn prune_drops_old_orphan_copies_but_keeps_every_reorg_event() {
+    let p = "t-retention";
+    let f = fixture(p, 3).await;
+    let mut w = watcher(&f, p, opts(1000, 16)).await;
+    w.step().await.unwrap();
+    grow(&f, &mut w, 3).await;
+    for _ in 0..2 {
+        f.chain.lock().unwrap().reorg(1, 1);
+        assert!(matches!(w.step().await.unwrap(), StepOutcome::Reorg { .. }));
+    }
+    let rows = reorgs(&f.db.pool, p).await;
+    let su = f.db.pool.get().await.unwrap();
+    su.execute(
+        "UPDATE tipwatch.reorgs SET detected_at = now() - interval '91 days' WHERE id = $1",
+        &[&rows[0].id],
+    )
+    .await
+    .unwrap();
+
+    // Without a retention nothing is dropped.
+    w.prune().await.unwrap();
+    assert_eq!(orphans(&f.db.pool, rows[0].id).await.len(), 1);
+    drop(w);
+
+    let o = WatchOptions {
+        orphan_retention_days: Some(90),
+        ..opts(1000, 16)
+    };
+    let w = watcher(&f, p, o).await;
+    w.prune().await.unwrap();
+    assert!(
+        orphans(&f.db.pool, rows[0].id).await.is_empty(),
+        "older than 90 days: copies dropped"
+    );
+    assert_eq!(
+        orphans(&f.db.pool, rows[1].id).await.len(),
+        1,
+        "recent copies kept"
+    );
+    assert_eq!(
+        reorgs(&f.db.pool, p).await,
+        rows,
+        "reorg events are kept forever"
     );
 }
 
