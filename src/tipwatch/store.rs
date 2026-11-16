@@ -1,6 +1,7 @@
 use alloy::primitives::B256;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use tokio_postgres::Transaction;
 
 use super::rpc::Header;
 use crate::db::Pool;
@@ -24,6 +25,19 @@ pub struct Seen {
     pub seen_at: DateTime<Utc>,
 }
 
+/// SCHEMA_SQL without its comment lines. With log_statement=ddl the whole batch
+/// is logged as one statement, and the host's security audit only recognises
+/// idempotent schema DDL that starts with `CREATE ... IF NOT EXISTS`.
+fn schema_sql_to_run() -> String {
+    SCHEMA_SQL
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 /// Creates the tables if any is missing. Runs no DDL when they all exist, so a
 /// restart does not show up as DDL in the Postgres log.
 pub async fn ensure_schema(pool: &Pool) -> Result<()> {
@@ -36,7 +50,7 @@ pub async fn ensure_schema(pool: &Pool) -> Result<()> {
         .await?
         .get(0);
     if present < TABLES.len() as i64 {
-        conn.batch_execute(SCHEMA_SQL)
+        conn.batch_execute(&schema_sql_to_run())
             .await
             .context("creating tipwatch tables (has db/tipwatch_role.sql been run?)")?;
     }
@@ -73,11 +87,65 @@ pub async fn load_recent(pool: &Pool, provider: &str, limit: usize) -> Result<Ve
     Ok(rows.iter().rev().map(row_to_seen).collect())
 }
 
-async fn upsert_seen(
-    tx: &tokio_postgres::Transaction<'_>,
-    provider: &str,
-    blocks: &[Seen],
-) -> Result<()> {
+pub struct NewReorg<'a> {
+    pub fork_point: u64,
+    pub old_tip: u64,
+    pub new_tip: u64,
+    pub orphaned: &'a [Seen],
+    /// New-branch blocks above the fork that were fetched (all of them unless
+    /// the reorg was deeper than --max-walk).
+    pub added: &'a [Seen],
+    pub after_gap: bool,
+}
+
+/// One step's changes, written in a single transaction.
+pub enum Op<'a> {
+    Extend(&'a [Seen]),
+    Reorg(NewReorg<'a>),
+    /// Heights `from..=to` were not observed one by one; `seen` restarts from
+    /// `head`, so it always matches the watcher's memory.
+    Gap {
+        from: u64,
+        to: u64,
+        reason: &'a str,
+        head: Seen,
+    },
+}
+
+/// Applies the ops in order in one transaction and returns the new reorg ids.
+pub async fn commit(pool: &Pool, provider: &str, ops: &[Op<'_>]) -> Result<Vec<i64>> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let mut ids = Vec::new();
+    for op in ops {
+        match op {
+            Op::Extend(blocks) => upsert_seen(&tx, provider, blocks).await?,
+            Op::Reorg(r) => ids.push(insert_reorg(&tx, provider, r).await?),
+            Op::Gap {
+                from,
+                to,
+                reason,
+                head,
+            } => {
+                tx.execute(
+                    "INSERT INTO tipwatch.gaps (provider, from_num, to_num, reason) VALUES ($1, $2, $3, $4)",
+                    &[&provider, &(*from as i64), &(*to as i64), reason],
+                )
+                .await?;
+                tx.execute(
+                    "DELETE FROM tipwatch.seen WHERE provider = $1",
+                    &[&provider],
+                )
+                .await?;
+                upsert_seen(&tx, provider, std::slice::from_ref(head)).await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(ids)
+}
+
+async fn upsert_seen(tx: &Transaction<'_>, provider: &str, blocks: &[Seen]) -> Result<()> {
     let stmt = tx
         .prepare(
             "INSERT INTO tipwatch.seen (provider, num, hash, parent_hash, block_ts, seen_at)
@@ -105,29 +173,10 @@ async fn upsert_seen(
     Ok(())
 }
 
-pub async fn save_extension(pool: &Pool, provider: &str, added: &[Seen]) -> Result<()> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-    upsert_seen(&tx, provider, added).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-pub struct NewReorg<'a> {
-    pub fork_point: u64,
-    pub old_tip: u64,
-    pub new_tip: u64,
-    pub orphaned: &'a [Seen],
-    pub added: &'a [Seen],
-    pub after_gap: bool,
-}
-
 /// Records the reorg and its orphans, marks earlier reorgs whose orphans came
-/// back, and replaces the provider's seen chain above the fork point. One
-/// transaction, so a crash never leaves `seen` half switched.
-pub async fn save_reorg(pool: &Pool, provider: &str, r: &NewReorg<'_>) -> Result<i64> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
+/// back, and replaces the provider's seen chain above the fork point.
+async fn insert_reorg(tx: &Transaction<'_>, provider: &str, r: &NewReorg<'_>) -> Result<i64> {
+    let depth = i32::try_from(r.orphaned.len()).context("reorg depth overflows i32")?;
     let id: i64 = tx
         .query_one(
             "INSERT INTO tipwatch.reorgs (provider, fork_point, old_tip, new_tip, depth, after_gap)
@@ -137,7 +186,7 @@ pub async fn save_reorg(pool: &Pool, provider: &str, r: &NewReorg<'_>) -> Result
                 &(r.fork_point as i64),
                 &(r.old_tip as i64),
                 &(r.new_tip as i64),
-                &(r.orphaned.len() as i32),
+                &depth,
                 &r.after_gap,
             ],
         )
@@ -181,29 +230,8 @@ pub async fn save_reorg(pool: &Pool, provider: &str, r: &NewReorg<'_>) -> Result
         &[&provider, &(r.fork_point as i64)],
     )
     .await?;
-    upsert_seen(&tx, provider, r.added).await?;
-    tx.commit().await?;
+    upsert_seen(tx, provider, r.added).await?;
     Ok(id)
-}
-
-pub async fn save_gap(
-    pool: &Pool,
-    provider: &str,
-    from: u64,
-    to: u64,
-    reason: &str,
-    head: &Seen,
-) -> Result<()> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-    tx.execute(
-        "INSERT INTO tipwatch.gaps (provider, from_num, to_num, reason) VALUES ($1, $2, $3, $4)",
-        &[&provider, &(from as i64), &(to as i64), &reason],
-    )
-    .await?;
-    upsert_seen(&tx, provider, std::slice::from_ref(head)).await?;
-    tx.commit().await?;
-    Ok(())
 }
 
 /// Deletes the provider's seen rows at or below `upto`.
@@ -215,4 +243,25 @@ pub async fn prune_seen(pool: &Pool, provider: &str, upto: u64) -> Result<u64> {
             &[&provider, &(upto as i64)],
         )
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_ddl_is_sent_without_comments() {
+        let sql = schema_sql_to_run();
+        assert!(
+            sql.starts_with("CREATE TABLE IF NOT EXISTS tipwatch.seen"),
+            "{sql}"
+        );
+        assert!(!sql.contains("--"));
+        for table in TABLES {
+            assert!(
+                sql.contains(&format!("CREATE TABLE IF NOT EXISTS {table} ")),
+                "{table}"
+            );
+        }
+    }
 }

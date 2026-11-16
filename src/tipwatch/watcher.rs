@@ -5,15 +5,17 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use super::rpc::{Header, TipRpc};
-use super::store::{self, NewReorg, Seen};
+use super::store::{self, NewReorg, Op, Seen};
 use crate::db::Pool;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WatchOptions {
     /// Heights of each provider's chain kept in memory and in `tipwatch.seen`.
     pub memory_blocks: usize,
-    /// Most parents fetched by hash in one step. A tip further ahead than this
-    /// is checked by block number instead and the skipped heights become a gap.
+    /// Most blocks fetched one by one in a step (parents by hash, or a new
+    /// branch by number). A head further ahead, or a deeper new branch, is
+    /// handled by a by-number binary search and the unfetched heights become a
+    /// gap.
     pub max_walk: usize,
 }
 
@@ -40,9 +42,10 @@ pub enum StepOutcome {
         depth: u32,
         fork_point: u64,
     },
-    /// The tip moved further than `max_walk`. The old tip was compared with the
-    /// provider's block at the same height (`reorg` if it changed) and the
-    /// heights in between were recorded as a gap.
+    /// Some heights were not fetched one by one (the head was more than
+    /// `max_walk` ahead, or the new branch was longer than that). The remembered
+    /// chain was compared with the provider's blocks by number (`reorg` if part
+    /// of it was replaced) and the unfetched heights were recorded as a gap.
     Jump {
         reorg: Option<(i64, u32)>,
         gap_from: u64,
@@ -59,13 +62,28 @@ pub enum StepOutcome {
 /// reorgs, often flipping back), so only deeper ones are worth a log line by
 /// default; all of them are in tipwatch.reorgs. 20 is close to the engine's
 /// 30-block head delay.
-fn log_reorg(provider: &str, id: i64, r: &NewReorg<'_>, msg: &str) {
-    let depth = r.orphaned.len();
-    let (fork_point, old_tip, new_tip) = (r.fork_point, r.old_tip, r.new_tip);
+fn log_reorg(
+    provider: &str,
+    id: i64,
+    depth: usize,
+    fork_point: u64,
+    old_tip: u64,
+    new_tip: u64,
+    how: &str,
+) {
     match depth {
-        20.. => warn!(provider, id, depth, fork_point, old_tip, new_tip, "{msg}"),
-        3.. => info!(provider, id, depth, fork_point, old_tip, new_tip, "{msg}"),
-        _ => debug!(provider, id, depth, fork_point, old_tip, new_tip, "{msg}"),
+        20.. => warn!(
+            provider,
+            id, depth, fork_point, old_tip, new_tip, how, "tip reorg"
+        ),
+        3.. => info!(
+            provider,
+            id, depth, fork_point, old_tip, new_tip, how, "tip reorg"
+        ),
+        _ => debug!(
+            provider,
+            id, depth, fork_point, old_tip, new_tip, how, "tip reorg"
+        ),
     }
 }
 
@@ -77,7 +95,7 @@ struct Chain {
 
 impl Chain {
     /// Keeps the hash-linked run that ends at the highest loaded height; rows
-    /// below a gap belong to an earlier stretch the watcher can't vouch for.
+    /// below a break belong to an earlier stretch the watcher can't vouch for.
     fn from_loaded(rows: Vec<Seen>, memory: usize) -> Self {
         let mut run: Vec<Seen> = Vec::new();
         for s in rows.into_iter().rev() {
@@ -109,6 +127,11 @@ impl Chain {
 
     fn get(&self, n: u64) -> Option<&Seen> {
         self.blocks.get(&n)
+    }
+
+    /// The remembered header at `n`; callers only ask for heights in memory.
+    fn known(&self, n: u64) -> Header {
+        self.blocks[&n].header
     }
 
     fn above(&self, n: u64) -> Vec<Seen> {
@@ -177,18 +200,18 @@ impl Watcher {
     }
 
     /// One poll: fetch the provider's head, reconcile it with what was seen,
-    /// persist the result. Memory only changes after the matching database
-    /// write commits, so a failed step is simply retried on the next poll.
+    /// persist the result. Each step commits in one transaction and memory only
+    /// changes after it does, so a failed step is simply retried.
     pub async fn step(&mut self) -> Result<StepOutcome> {
         let head = self.rpc.head().await?;
         let now = Utc::now();
+        let seen = |header: Header| Seen {
+            header,
+            seen_at: now,
+        };
         let Some(tip) = self.chain.tip() else {
-            let first = Seen {
-                header: head,
-                seen_at: now,
-            };
-            store::save_extension(&self.pool, &self.provider, &[first]).await?;
-            self.chain.reset(first);
+            store::commit(&self.pool, &self.provider, &[Op::Extend(&[seen(head)])]).await?;
+            self.chain.reset(seen(head));
             return Ok(StepOutcome::Extended {
                 blocks: 1,
                 tip: head.number,
@@ -201,25 +224,35 @@ impl Watcher {
         {
             return Ok(StepOutcome::Unchanged);
         }
-        if head.number < self.chain.min().unwrap_or(0) {
-            warn!(provider = %self.provider, head = head.number, tip = tip.header.number, "provider head is far behind; ignoring it");
+        let min = self.chain.min().unwrap_or(tip.header.number);
+        if head.number < min {
+            debug!(provider = %self.provider, head = head.number, min, "provider answered below memory; ignoring it");
             return Ok(StepOutcome::Unchanged);
+        }
+        if head.number > tip.header.number + self.opts.max_walk as u64 {
+            return self.compare_by_number(head, tip, now).await;
         }
 
         // Walk back by parent hash to a block this provider reported before.
         let mut branch = vec![head];
         let mut cur = head;
         let fork = loop {
-            let n = cur
-                .number
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("walked to genesis without a common block"))?;
-            match self.chain.get(n) {
-                Some(known) if known.header.hash == cur.parent_hash => break n,
-                None if n < self.chain.min().unwrap_or(0) => {
-                    return self.compare_by_number(head, tip, now).await;
+            if cur.number == min {
+                // `cur` replaces the lowest remembered block. If they share a
+                // parent the fork is just below memory (with a one-block memory,
+                // right after start or a gap, every flip lands here).
+                if min > 0 && self.chain.known(min).parent_hash == cur.parent_hash {
+                    break min - 1;
                 }
-                _ => {}
+                return self.compare_by_number(head, tip, now).await;
+            }
+            let n = cur.number - 1;
+            if self
+                .chain
+                .get(n)
+                .is_some_and(|k| k.header.hash == cur.parent_hash)
+            {
+                break n;
             }
             if branch.len() >= self.opts.max_walk {
                 return self.compare_by_number(head, tip, now).await;
@@ -242,86 +275,113 @@ impl Watcher {
             cur = parent;
         };
 
-        let added: Vec<Seen> = branch
-            .into_iter()
-            .rev()
-            .map(|header| Seen {
-                header,
-                seen_at: now,
-            })
-            .collect();
+        let added: Vec<Seen> = branch.into_iter().rev().map(seen).collect();
         let orphaned = self.chain.above(fork);
         if orphaned.is_empty() {
-            store::save_extension(&self.pool, &self.provider, &added).await?;
+            store::commit(&self.pool, &self.provider, &[Op::Extend(&added)]).await?;
             self.chain.replace_above(fork, &added);
             return Ok(StepOutcome::Extended {
                 blocks: added.len(),
                 tip: head.number,
             });
         }
-        let r = NewReorg {
-            fork_point: fork,
-            old_tip: tip.header.number,
-            new_tip: head.number,
-            orphaned: &orphaned,
-            added: &added,
-            after_gap: false,
-        };
-        let id = store::save_reorg(&self.pool, &self.provider, &r).await?;
-        log_reorg(&self.provider, id, &r, "tip reorg");
+        let depth = orphaned.len();
+        let ids = store::commit(
+            &self.pool,
+            &self.provider,
+            &[Op::Reorg(NewReorg {
+                fork_point: fork,
+                old_tip: tip.header.number,
+                new_tip: head.number,
+                orphaned: &orphaned,
+                added: &added,
+                after_gap: false,
+            })],
+        )
+        .await?;
+        log_reorg(
+            &self.provider,
+            ids[0],
+            depth,
+            fork,
+            tip.header.number,
+            head.number,
+            "parent hashes",
+        );
         self.chain.replace_above(fork, &added);
         Ok(StepOutcome::Reorg {
-            id,
-            depth: orphaned.len() as u32,
+            id: ids[0],
+            depth: depth as u32,
             fork_point: fork,
         })
     }
 
-    /// The head is too far from anything remembered to walk to by hash: compare
-    /// the remembered chain with the provider's blocks at the same heights,
-    /// from the top down, then continue from the head.
+    async fn canonical(&self, n: u64, head: u64) -> Result<Header> {
+        self.rpc
+            .by_number(n)
+            .await?
+            .ok_or_else(|| anyhow!("provider has no block {n} although its head is {head}"))
+    }
+
+    /// The head can't be reached by parent hashes within `max_walk`. Find the
+    /// highest remembered height the provider still has (binary search: about
+    /// log2(memory) requests), fetch the new branch above it by number if it is
+    /// short enough, check that everything hash-links, and continue from the head.
     async fn compare_by_number(
         &mut self,
         head: Header,
         tip: Seen,
         now: DateTime<Utc>,
     ) -> Result<StepOutcome> {
-        let top = tip.header.number.min(head.number);
-        let mut canon: Vec<Header> = Vec::new();
-        let mut n = top;
-        let fork = loop {
-            let Some(known) = self.chain.get(n).copied() else {
-                break None;
-            };
-            let b = self.rpc.by_number(n).await?.ok_or_else(|| {
-                anyhow!(
-                    "provider has no block {n} although its head is {}",
-                    head.number
-                )
-            })?;
-            if b.hash == known.header.hash {
-                break Some(n);
-            }
-            canon.push(b);
-            match n.checked_sub(1) {
-                Some(below) => n = below,
-                None => break None,
-            }
-        };
-        let head_seen = Seen {
-            header: head,
+        let seen = |header: Header| Seen {
+            header,
             seen_at: now,
         };
+        let changed = |what: String| -> anyhow::Error {
+            anyhow!("{what}: the provider's chain changed while being compared")
+        };
+        let min = self.chain.min().unwrap_or(tip.header.number);
+        let top = tip.header.number.min(head.number);
+
+        let top_b = self.canonical(top, head.number).await?;
+        let fork = if top_b.hash == self.chain.known(top).hash {
+            Some(top)
+        } else {
+            let min_b = if min == top {
+                top_b
+            } else {
+                self.canonical(min, head.number).await?
+            };
+            if min_b.hash == self.chain.known(min).hash {
+                let (mut lo, mut hi) = (min, top); // lo still matches, hi does not
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo) / 2;
+                    if self.canonical(mid, head.number).await?.hash == self.chain.known(mid).hash {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                Some(lo)
+            } else if min > 0 && min_b.parent_hash == self.chain.known(min).parent_hash {
+                Some(min - 1)
+            } else {
+                None
+            }
+        };
+        let head_seen = seen(head);
 
         let Some(fork) = fork else {
-            let (from, to) = (self.chain.min().unwrap_or(0), head.number.saturating_sub(1));
-            store::save_gap(
+            let (from, to) = (min, tip.header.number.max(head.number.saturating_sub(1)));
+            store::commit(
                 &self.pool,
                 &self.provider,
-                from,
-                to,
-                "diverged beyond memory: no common block with the provider",
-                &head_seen,
+                &[Op::Gap {
+                    from,
+                    to,
+                    reason: "diverged beyond memory: no common block with the provider",
+                    head: head_seen,
+                }],
             )
             .await?;
             error!(provider = %self.provider, from, to, head = head.number, "tip watch diverged beyond memory");
@@ -332,75 +392,145 @@ impl Watcher {
             });
         };
 
-        canon.reverse();
-        let added: Vec<Seen> = canon
-            .into_iter()
-            .map(|header| Seen {
-                header,
-                seen_at: now,
-            })
-            .collect();
-        let top_hash = added
-            .last()
-            .or_else(|| self.chain.get(top))
-            .map(|s| s.header.hash);
-        let connects =
-            head.number == top || (head.number == top + 1 && Some(head.parent_hash) == top_hash);
-        if !connects && head.number <= top + 1 {
-            bail!(
-                "provider's block {top} does not link to its head {}: its chain changed while being compared",
-                head.number
-            );
-        }
-        let mut reorg = None;
-        if !added.is_empty() {
-            let orphaned = self.chain.above(fork);
-            let r = NewReorg {
-                fork_point: fork,
-                old_tip: tip.header.number,
-                new_tip: top,
-                orphaned: &orphaned,
-                added: &added,
-                after_gap: !connects,
-            };
-            let id = store::save_reorg(&self.pool, &self.provider, &r).await?;
-            log_reorg(&self.provider, id, &r, "tip reorg (found by block number)");
-            self.chain.replace_above(fork, &added);
-            reorg = Some((id, orphaned.len() as u32));
-        }
-
-        if connects {
-            if head.number > top {
-                store::save_extension(&self.pool, &self.provider, &[head_seen]).await?;
-                self.chain.replace_above(top, &[head_seen]);
+        if fork == top {
+            // Nothing remembered was replaced: the head is simply far ahead.
+            if head.number <= top + 1 {
+                return Err(changed(format!(
+                    "block {top} is unchanged but the head {} does not follow it",
+                    head.number
+                )));
             }
-            return Ok(match reorg {
-                Some((id, depth)) => StepOutcome::Reorg {
-                    id,
-                    depth,
-                    fork_point: fork,
-                },
-                None => StepOutcome::Extended {
-                    blocks: usize::from(head.number > top),
-                    tip: head.number,
-                },
+            let (from, to) = (top + 1, head.number - 1);
+            store::commit(
+                &self.pool,
+                &self.provider,
+                &[Op::Gap {
+                    from,
+                    to,
+                    reason: "tip jumped past --max-walk",
+                    head: head_seen,
+                }],
+            )
+            .await?;
+            warn!(provider = %self.provider, from, to, "tip watch skipped heights");
+            self.chain.reset(head_seen);
+            return Ok(StepOutcome::Jump {
+                reorg: None,
+                gap_from: from,
+                gap_to: to,
             });
         }
 
-        let (from, to) = (top + 1, head.number - 1);
-        store::save_gap(
+        // A reorg at `fork`: every remembered block above it was replaced. Fetch
+        // the new branch by number (all of it, or only its first block when it
+        // is longer than max_walk) and check each block links to the one below.
+        let orphaned = self.chain.above(fork);
+        let depth = orphaned.len();
+        let fork_hash = if fork >= min {
+            self.chain.known(fork).hash
+        } else {
+            self.chain.known(min).parent_hash
+        };
+        let last = if (top - fork) as usize <= self.opts.max_walk {
+            top
+        } else {
+            fork + 1
+        };
+        let mut added = Vec::new();
+        let mut parent = fork_hash;
+        for n in fork + 1..=last {
+            let b = self.canonical(n, head.number).await?;
+            if b.parent_hash != parent {
+                return Err(changed(format!(
+                    "block {n} does not link to block {}",
+                    n - 1
+                )));
+            }
+            parent = b.hash;
+            added.push(seen(b));
+        }
+        let connects = match head.number {
+            h if h < last => return Err(changed(format!("head {h} is below block {last}"))),
+            h if h == last => {
+                if head.hash != parent {
+                    return Err(changed(format!("block {last} is not the head")));
+                }
+                true
+            }
+            h if h == last + 1 => {
+                if head.parent_hash != parent {
+                    return Err(changed(format!(
+                        "the head {h} does not link to block {last}"
+                    )));
+                }
+                true
+            }
+            _ => false,
+        };
+
+        let reorg = NewReorg {
+            fork_point: fork,
+            old_tip: tip.header.number,
+            new_tip: head.number,
+            orphaned: &orphaned,
+            added: &added,
+            after_gap: !connects,
+        };
+        if connects {
+            let extend = [head_seen];
+            let mut ops = vec![Op::Reorg(reorg)];
+            if head.number == last + 1 {
+                ops.push(Op::Extend(&extend));
+            }
+            let ids = store::commit(&self.pool, &self.provider, &ops).await?;
+            log_reorg(
+                &self.provider,
+                ids[0],
+                depth,
+                fork,
+                tip.header.number,
+                head.number,
+                "block numbers",
+            );
+            self.chain.replace_above(fork, &added);
+            if head.number == last + 1 {
+                self.chain.replace_above(last, &extend);
+            }
+            return Ok(StepOutcome::Reorg {
+                id: ids[0],
+                depth: depth as u32,
+                fork_point: fork,
+            });
+        }
+
+        let (from, to) = (last + 1, head.number - 1);
+        let ids = store::commit(
             &self.pool,
             &self.provider,
-            from,
-            to,
-            "tip jumped past --max-walk",
-            &head_seen,
+            &[
+                Op::Reorg(reorg),
+                Op::Gap {
+                    from,
+                    to,
+                    reason: "tip jumped past --max-walk",
+                    head: head_seen,
+                },
+            ],
         )
         .await?;
+        log_reorg(
+            &self.provider,
+            ids[0],
+            depth,
+            fork,
+            tip.header.number,
+            head.number,
+            "block numbers, after a gap",
+        );
         warn!(provider = %self.provider, from, to, "tip watch skipped heights");
         self.chain.reset(head_seen);
         Ok(StepOutcome::Jump {
-            reorg,
+            reorg: Some((ids[0], depth as u32)),
             gap_from: from,
             gap_to: to,
         })

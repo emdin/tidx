@@ -616,66 +616,119 @@ async fn rpc_failures_return_errors_and_leave_state_untouched() {
 
 #[tokio::test]
 #[serial]
-async fn reorg_deeper_than_max_walk_is_found_by_number_without_a_gap() {
-    let p = "t-deep-walk";
-    let f = fixture(p, 3).await;
-    let mut w = watcher(&f, p, opts(1000, 2)).await;
-    w.step().await.unwrap();
-    grow(&f, &mut w, 7).await; // tip 9
+async fn one_block_flip_right_after_start_is_a_reorg_not_a_divergence() {
+    // Right after start (or after a gap) only the head is remembered, and Igra
+    // flips its tip block every few seconds.
+    let p = "t-flip-1";
+    let f = fixture(p, 5).await;
+    let mut w = watcher(&f, p, opts(1000, 16)).await;
+    w.step().await.unwrap(); // memory: block 4 only
+    let old = f.chain.lock().unwrap().canon[4];
 
-    f.chain.lock().unwrap().reorg(3, 4); // 7..=9 replaced, head 10
+    f.chain.lock().unwrap().reorg(1, 1);
     let out = w.step().await.unwrap();
     let rows = reorgs(&f.db.pool, p).await;
     assert_eq!(
         out,
         StepOutcome::Reorg {
             id: rows[0].id,
-            depth: 3,
-            fork_point: 6
+            depth: 1,
+            fork_point: 3
         }
     );
-    assert!(
-        !rows[0].after_gap,
-        "the head links to the compared chain: nothing was skipped"
-    );
+    assert_eq!(orphans(&f.db.pool, rows[0].id).await, vec![(4, old.hash)]);
     assert!(gaps(&f.db.pool, p).await.is_empty());
-    let s = seen(&f.db.pool, p).await;
-    assert_eq!(s.last().unwrap().0, 10);
-    assert_eq!(s, canon_for(&f.chain, &s));
+
+    // The same with a head that also moved on.
+    f.chain.lock().unwrap().reorg(1, 3);
+    assert!(matches!(
+        w.step().await.unwrap(),
+        StepOutcome::Reorg {
+            depth: 1,
+            fork_point: 3,
+            ..
+        }
+    ));
+    assert!(gaps(&f.db.pool, p).await.is_empty());
 }
 
 #[tokio::test]
 #[serial]
-async fn chain_changing_during_a_by_number_comparison_is_retried_not_recorded() {
-    let p = "t-mid-change";
+async fn reorg_deeper_than_max_walk_is_measured_by_a_number_search() {
+    let p = "t-deep-walk";
     let f = fixture(p, 3).await;
     let mut w = watcher(&f, p, opts(1000, 2)).await;
     w.step().await.unwrap();
     grow(&f, &mut w, 7).await; // tip 9
 
+    let old: Vec<Blk> = f.chain.lock().unwrap().canon[7..=9].to_vec();
+    f.chain.lock().unwrap().reorg(3, 4); // 7..=9 replaced, head 10
+    let out = w.step().await.unwrap();
+    let rows = reorgs(&f.db.pool, p).await;
+    // Exact fork and depth from memory; the new branch is longer than
+    // max_walk, so only its first block (7) is fetched and 8..=9 are a gap.
+    assert_eq!(
+        out,
+        StepOutcome::Jump {
+            reorg: Some((rows[0].id, 3)),
+            gap_from: 8,
+            gap_to: 9
+        }
+    );
+    assert_eq!(
+        (
+            rows[0].fork_point,
+            rows[0].old_tip,
+            rows[0].new_tip,
+            rows[0].depth,
+            rows[0].after_gap
+        ),
+        (6, 9, 10, 3, true)
+    );
+    assert_eq!(
+        orphans(&f.db.pool, rows[0].id).await,
+        old.iter()
+            .map(|b| (b.number as i64, b.hash))
+            .collect::<Vec<_>>()
+    );
+
+    f.chain.lock().unwrap().extend(1);
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 1, tip: 11 }
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn by_number_blocks_that_do_not_link_are_retried_not_recorded() {
+    let p = "t-mid-change";
+    let f = fixture(p, 3).await;
+    let mut w = watcher(&f, p, opts(1000, 16)).await;
+    w.step().await.unwrap();
+    grow(&f, &mut w, 7).await; // tip 9, memory 2..=9
+
     let other = {
         let mut c = f.chain.lock().unwrap();
-        c.reorg(3, 4);
-        let other_branch = Chain::with_branch(9_999).mk(9, B256::repeat_byte(7));
-        // head, one parent by hash, then the block at height 9 comes from
-        // yet another branch that the head does not build on.
-        c.faults
-            .extend([Fault::Pass, Fault::Pass, Fault::Serve(other_branch)]);
-        other_branch
+        c.reorg(3, 3); // 7..=9 replaced
+        c.extend(40); // head 49: compared by number straight away
+        let other = Chain::with_branch(9_999).mk(8, B256::repeat_byte(7));
+        // head; probes at 9, 2, 5, 7, 6 find the fork at 6; then the new
+        // branch is fetched: 7 is fine, 8 comes from yet another branch.
+        c.faults.extend([Fault::Pass; 7]);
+        c.faults.push_back(Fault::Serve(other));
+        other
     };
     let err = w
         .step()
         .await
-        .expect_err("inconsistent answers must not be recorded");
+        .expect_err("unlinked blocks must not be recorded");
     assert!(
         format!("{err:#}").contains("changed while being compared"),
         "{err:#}"
     );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
-    assert!(
-        gaps(&f.db.pool, p).await.is_empty(),
-        "no backwards gap range"
-    );
+    assert!(gaps(&f.db.pool, p).await.is_empty());
     assert!(
         seen(&f.db.pool, p)
             .await
@@ -687,10 +740,10 @@ async fn chain_changing_during_a_by_number_comparison_is_retried_not_recorded() 
     assert!(
         matches!(
             out,
-            StepOutcome::Reorg {
-                depth: 3,
-                fork_point: 6,
-                ..
+            StepOutcome::Jump {
+                reorg: Some((_, 3)),
+                gap_from: 10,
+                gap_to: 48
             }
         ),
         "{out:?}"
@@ -767,7 +820,7 @@ async fn long_stop_compares_by_number_and_records_the_gap() {
             rows[0].depth,
             rows[0].after_gap
         ),
-        (6, 9, 9, 3, true)
+        (6, 9, 49, 3, true)
     );
     let g = gaps(&f.db.pool, p).await;
     assert_eq!(g.len(), 1);
@@ -804,6 +857,44 @@ async fn long_stop_without_a_reorg_records_only_the_gap() {
     );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
     assert_eq!(gaps(&f.db.pool, p).await.len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn divergence_to_a_lower_head_leaves_no_stale_rows_for_a_restart() {
+    let p = "t-diverge-low";
+    let f = fixture(p, 3).await;
+    let mut w = watcher(&f, p, opts(8, 4)).await;
+    w.step().await.unwrap();
+    grow(&f, &mut w, 10).await; // tip 12, memory 5..=12
+
+    f.chain.lock().unwrap().reorg(10, 8); // fork at 2, below memory; head 10 < old tip
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Diverged {
+            gap_from: 5,
+            gap_to: 12
+        }
+    );
+    let s = seen(&f.db.pool, p).await;
+    assert_eq!(
+        s.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![10],
+        "only the head is remembered"
+    );
+    drop(w);
+
+    let mut w = watcher(&f, p, opts(8, 4)).await;
+    assert_eq!(
+        w.tip().unwrap().number,
+        10,
+        "a restart resumes from the live head, not the dead branch"
+    );
+    f.chain.lock().unwrap().extend(1);
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 1, tip: 11 }
+    );
 }
 
 #[tokio::test]

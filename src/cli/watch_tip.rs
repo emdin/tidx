@@ -6,7 +6,7 @@ use clap::Args as ClapArgs;
 use std::collections::HashSet;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tidx::db;
 use tidx::tipwatch::{TipRpc, WatchOptions, Watcher, store};
@@ -137,21 +137,34 @@ pub async fn run(args: Args) -> Result<()> {
     let pool = db::create_pool_with_size(&pg_url, 2 + plans.len()).await?;
     store::ensure_schema(&pool).await?;
 
+    // Each provider starts on its own: one that is down at boot is retried and
+    // does not keep the others from being watched. A wrong chain id is fatal.
     let mut tasks = JoinSet::new();
     for p in plans {
         let rpc = TipRpc::new(&p.url, p.rps)?;
-        let id = rpc
-            .chain_id()
-            .await
-            .with_context(|| format!("provider {}: eth_chainId", p.name))?;
-        if let Some(want) = args.chain_id
-            && id != want
-        {
-            bail!("provider {} is on chain {id}, expected {want}", p.name);
-        }
-        let watcher = Watcher::start(&p.name, rpc, pool.clone(), opts).await?;
-        info!(provider = %p.name, url = %p.url, rps = p.rps, chain_id = id, "tip watch started");
-        tasks.spawn(watcher.run());
+        let pool = pool.clone();
+        let want = args.chain_id;
+        tasks.spawn(async move {
+            let mut backoff = std::time::Duration::from_secs(1);
+            let id = loop {
+                match rpc.chain_id().await {
+                    Ok(id) => break id,
+                    Err(e) => {
+                        warn!(provider = %p.name, error = %format!("{e:#}"), retry_in = ?backoff, "eth_chainId failed");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
+            };
+            if let Some(want) = want
+                && id != want
+            {
+                bail!("provider {} is on chain {id}, expected {want}", p.name);
+            }
+            let watcher = Watcher::start(&p.name, rpc, pool, opts).await?;
+            info!(provider = %p.name, url = %p.url, rps = p.rps, chain_id = id, "tip watch started");
+            watcher.run().await
+        });
     }
 
     let mut term = signal(SignalKind::terminate())?;
