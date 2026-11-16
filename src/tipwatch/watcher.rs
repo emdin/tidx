@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use super::rpc::{Header, TipRpc};
 use super::store::{self, NewReorg, Op, Seen};
+use super::ws::{HeadStream, WrongChain};
 use crate::db::Pool;
 
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +21,10 @@ pub struct WatchOptions {
     /// Days to keep the copies of replaced blocks (`tipwatch.orphans`); the
     /// reorg events themselves are kept forever. `None` keeps everything.
     pub orphan_retention_days: Option<u32>,
+    /// With a new-heads subscription: resubscribe when nothing was pushed for
+    /// this long (Igra makes about a block a second). Also the first delay
+    /// before retrying a failed subscription, while polling covers the gap.
+    pub stall_after: Duration,
 }
 
 impl Default for WatchOptions {
@@ -28,6 +33,7 @@ impl Default for WatchOptions {
             memory_blocks: 20_000,
             max_walk: 256,
             orphan_retention_days: Some(90),
+            stall_after: Duration::from_secs(10),
         }
     }
 }
@@ -167,6 +173,9 @@ pub struct Watcher {
     pool: Pool,
     opts: WatchOptions,
     chain: Chain,
+    ws_url: Option<String>,
+    /// The chain the WebSocket endpoint must be on (the HTTP endpoint's).
+    ws_chain_id: u64,
 }
 
 impl Watcher {
@@ -196,18 +205,33 @@ impl Watcher {
             pool,
             opts,
             chain,
+            ws_url: None,
+            ws_chain_id: 0,
         })
+    }
+
+    /// Follow pushed heads from this WebSocket endpoint (`eth_subscribe
+    /// newHeads`) instead of polling; polling remains the fallback.
+    pub fn with_ws(mut self, url: &str, chain_id: u64) -> Self {
+        self.ws_url = Some(url.to_string());
+        self.ws_chain_id = chain_id;
+        self
     }
 
     pub fn tip(&self) -> Option<Header> {
         self.chain.tip().map(|s| s.header)
     }
 
-    /// One poll: fetch the provider's head, reconcile it with what was seen,
-    /// persist the result. Each step commits in one transaction and memory only
-    /// changes after it does, so a failed step is simply retried.
+    /// One poll: fetch the provider's head and apply it.
     pub async fn step(&mut self) -> Result<StepOutcome> {
         let head = self.rpc.head().await?;
+        self.apply(head).await
+    }
+
+    /// Reconcile a head (polled or pushed) with what was seen and persist the
+    /// result. Each call commits in one transaction and memory only changes
+    /// after it does, so a failure leaves nothing half done.
+    pub async fn apply(&mut self, head: Header) -> Result<StepOutcome> {
         let now = Utc::now();
         let seen = |header: Header| Seen {
             header,
@@ -560,55 +584,189 @@ impl Watcher {
         Ok((seen, orphans))
     }
 
-    /// Steps forever, backing off on errors. RPC and database failures are
-    /// logged and retried; they never end the loop.
+    /// Runs forever. With a WebSocket endpoint it follows pushed heads, and
+    /// polls only to catch up around (re)subscribing and while no subscription
+    /// works; without one it polls within the provider's request budget. RPC and
+    /// database failures are logged and retried; they never end the loop. Only
+    /// a WebSocket endpoint on another chain than the HTTP one ends it.
     pub async fn run(mut self) -> Result<()> {
-        const MAX_BACKOFF: Duration = Duration::from_secs(30);
-        const EVERY: Duration = Duration::from_secs(600);
-        let mut backoff = Duration::from_secs(1);
-        let mut last_housekeeping = Instant::now();
-        let (mut steps, mut reorgs, mut max_depth, mut errors) = (0u64, 0u64, 0u32, 0u64);
-
+        const MAX_RETRY: Duration = Duration::from_secs(300);
+        const FAILED_PUSHES_BEFORE_POLLING: u32 = 3;
+        let mut stats = Stats::new();
+        let Some(url) = self.ws_url.clone() else {
+            loop {
+                self.poll_once(&mut stats).await;
+                self.housekeeping(&mut stats).await;
+            }
+        };
+        let stall_after = self.opts.stall_after;
+        let mut retry = stall_after;
         loop {
-            match self.step().await {
-                Ok(out) => {
-                    steps += 1;
-                    backoff = Duration::from_secs(1);
-                    match out {
-                        StepOutcome::Reorg { depth, .. }
-                        | StepOutcome::Jump {
-                            reorg: Some((_, depth)),
-                            ..
-                        } => {
-                            reorgs += 1;
-                            max_depth = max_depth.max(depth);
-                        }
-                        _ => {}
-                    }
-                }
+            let mut heads = match HeadStream::connect(&url, self.ws_chain_id, stall_after).await {
+                Ok(heads) => heads,
+                Err(e) if e.is::<WrongChain>() => return Err(e),
                 Err(e) => {
-                    errors += 1;
-                    warn!(provider = %self.provider, error = %format!("{e:#}"), retry_in = ?backoff, "tip watch step failed");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    warn!(provider = %self.provider, error = %format!("{e:#}"), retry_in = ?retry, "subscribing to new heads failed; polling meanwhile");
+                    self.poll_for(retry, &mut stats).await;
+                    retry = (retry * 2).min(MAX_RETRY);
+                    continue;
                 }
-            }
-            if last_housekeeping.elapsed() >= EVERY {
-                match self.prune().await {
-                    Ok((seen, orphans)) => {
-                        debug!(provider = %self.provider, seen, orphans, "tip watch pruned")
+            };
+            info!(provider = %self.provider, "subscribed to new heads");
+            let subscribed_at = Instant::now();
+            self.poll_once(&mut stats).await;
+            // Silence is measured from the end of our own work, so a slow walk
+            // or prune never looks like a silent subscription.
+            let mut quiet_since = Instant::now();
+            let mut failed_pushes = 0;
+            let ended_by_failure = loop {
+                let left = stall_after.saturating_sub(quiet_since.elapsed());
+                match tokio::time::timeout(left, heads.next()).await {
+                    Ok(Ok(Some(head))) => {
+                        stats.pushed += 1;
+                        failed_pushes = if self.apply_pushed(head, &mut stats).await {
+                            0
+                        } else {
+                            failed_pushes + 1
+                        };
+                        if failed_pushes >= FAILED_PUSHES_BEFORE_POLLING {
+                            warn!(provider = %self.provider, failed_pushes, "pushed heads keep failing; polling with backoff");
+                            break true;
+                        }
+                        quiet_since = Instant::now();
                     }
-                    Err(e) => {
-                        warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch prune failed")
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        warn!(provider = %self.provider, error = %format!("{e:#}"), "new-heads subscription ended");
+                        break subscribed_at.elapsed() < stall_after;
+                    }
+                    Err(_) => {
+                        // A quiet chain, not a broken endpoint: resubscribe now.
+                        info!(provider = %self.provider, stall_after = ?stall_after, "no head pushed; resubscribing");
+                        break false;
                     }
                 }
-                info!(
-                    provider = %self.provider, tip = self.tip().map(|h| h.number), steps, reorgs, max_depth, errors,
-                    "tip watch summary (last 10 min)"
-                );
-                (steps, reorgs, max_depth, errors) = (0, 0, 0, 0);
-                last_housekeeping = Instant::now();
+                if self.housekeeping(&mut stats).await {
+                    quiet_since = Instant::now();
+                }
+            };
+            if ended_by_failure {
+                self.poll_for(retry, &mut stats).await;
+                retry = (retry * 2).min(MAX_RETRY);
+            } else {
+                retry = stall_after;
+                self.poll_once(&mut stats).await;
             }
+        }
+    }
+
+    /// Applies a pushed head, retrying twice: the version may be gone by the
+    /// next push, so a transient RPC or database error must not drop it.
+    async fn apply_pushed(&mut self, head: Header, stats: &mut Stats) -> bool {
+        let mut delay = Duration::from_millis(250);
+        for attempt in 1..=3 {
+            match self.apply(head).await {
+                Ok(out) => {
+                    self.tally(stats, Ok(out));
+                    return true;
+                }
+                Err(e) if attempt < 3 => {
+                    debug!(provider = %self.provider, attempt, error = %format!("{e:#}"), "retrying a pushed head");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(e) => self.tally(stats, Err(e)),
+            }
+        }
+        false
+    }
+
+    async fn poll_for(&mut self, window: Duration, stats: &mut Stats) {
+        let until = Instant::now() + window;
+        while Instant::now() < until {
+            self.poll_once(stats).await;
+            self.housekeeping(stats).await;
+        }
+    }
+
+    async fn poll_once(&mut self, stats: &mut Stats) {
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+        let out = self.step().await;
+        let failed = out.is_err();
+        self.tally(stats, out);
+        if failed {
+            tokio::time::sleep(stats.backoff).await;
+            stats.backoff = (stats.backoff * 2).min(MAX_BACKOFF);
+        } else {
+            stats.backoff = Duration::from_secs(1);
+        }
+    }
+
+    fn tally(&self, stats: &mut Stats, out: Result<StepOutcome>) {
+        match out {
+            Ok(StepOutcome::Reorg { depth, .. })
+            | Ok(StepOutcome::Jump {
+                reorg: Some((_, depth)),
+                ..
+            }) => {
+                stats.steps += 1;
+                stats.reorgs += 1;
+                stats.max_depth = stats.max_depth.max(depth);
+            }
+            Ok(_) => stats.steps += 1,
+            Err(e) => {
+                stats.errors += 1;
+                warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch step failed");
+            }
+        }
+    }
+
+    /// Every 10 minutes: prune and log a summary. Returns whether it ran.
+    async fn housekeeping(&mut self, stats: &mut Stats) -> bool {
+        if stats.since.elapsed() < Duration::from_secs(600) {
+            return false;
+        }
+        match self.prune().await {
+            Ok((seen, orphans)) => {
+                debug!(provider = %self.provider, seen, orphans, "tip watch pruned")
+            }
+            Err(e) => {
+                warn!(provider = %self.provider, error = %format!("{e:#}"), "tip watch prune failed")
+            }
+        }
+        info!(
+            provider = %self.provider, tip = self.tip().map(|h| h.number), steps = stats.steps,
+            pushed = stats.pushed, reorgs = stats.reorgs, max_depth = stats.max_depth, errors = stats.errors,
+            "tip watch summary (last 10 min)"
+        );
+        *stats = Stats {
+            backoff: stats.backoff,
+            ..Stats::new()
+        };
+        true
+    }
+}
+
+struct Stats {
+    steps: u64,
+    pushed: u64,
+    reorgs: u64,
+    max_depth: u32,
+    errors: u64,
+    since: Instant,
+    backoff: Duration,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            steps: 0,
+            pushed: 0,
+            reorgs: 0,
+            max_depth: 0,
+            errors: 0,
+            since: Instant::now(),
+            backoff: Duration::from_secs(1),
         }
     }
 }
