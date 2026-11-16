@@ -122,21 +122,29 @@ fn json_block(b: &Blk) -> Value {
     })
 }
 
-async fn rpc_handler(State(chain): State<Shared>, Json(req): Json<Value>) -> axum::response::Response {
+async fn rpc_handler(
+    State(chain): State<Shared>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
     let mut c = chain.lock().unwrap();
     match c.faults.pop_front().unwrap_or(Fault::Pass) {
         Fault::Pass => {}
-        Fault::Http500 => return (StatusCode::INTERNAL_SERVER_ERROR, "upstream down").into_response(),
+        Fault::Http500 => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "upstream down").into_response();
+        }
         Fault::Malformed => return (StatusCode::OK, "{not json").into_response(),
         Fault::RpcError => {
             return Json(json!({"jsonrpc": "2.0", "id": 1,
                 "error": {"code": -32001, "message": "block unavailable"}}))
             .into_response();
         }
-        Fault::NullResult => return Json(json!({"jsonrpc": "2.0", "id": 1, "result": null})).into_response(),
+        Fault::NullResult => {
+            return Json(json!({"jsonrpc": "2.0", "id": 1, "result": null})).into_response();
+        }
         Fault::WrongBlock => {
             let b = c.canon[1];
-            return Json(json!({"jsonrpc": "2.0", "id": 1, "result": json_block(&b)})).into_response();
+            return Json(json!({"jsonrpc": "2.0", "id": 1, "result": json_block(&b)}))
+                .into_response();
         }
     }
     let params = &req["params"];
@@ -146,7 +154,10 @@ async fn rpc_handler(State(chain): State<Shared>, Json(req): Json<Value>) -> axu
             "latest" => json_block(&c.head()),
             hex => {
                 let n = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap();
-                c.canon.get(n as usize).map(json_block).unwrap_or(Value::Null)
+                c.canon
+                    .get(n as usize)
+                    .map(json_block)
+                    .unwrap_or(Value::Null)
             }
         },
         "eth_getBlockByHash" => {
@@ -163,7 +174,9 @@ async fn rpc_handler(State(chain): State<Shared>, Json(req): Json<Value>) -> axu
 }
 
 async fn serve(chain: Shared) -> String {
-    let app = Router::new().route("/", post(rpc_handler)).with_state(chain);
+    let app = Router::new()
+        .route("/", post(rpc_handler))
+        .with_state(chain);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -192,12 +205,20 @@ struct Fixture {
 async fn fixture(provider: &str, initial_blocks: u64) -> Fixture {
     let db = TestDb::empty().await;
     let su = db.pool.get().await.unwrap();
-    su.batch_execute(store::ROLE_SQL).await.expect("tipwatch_role.sql runs as the superuser");
-    su.batch_execute(&format!("ALTER ROLE tidx_tipwatch PASSWORD '{ROLE_PASSWORD}'"))
+    su.batch_execute(store::ROLE_SQL)
         .await
-        .unwrap();
-    let pool = create_pool(&role_url()).await.expect("tidx_tipwatch can log in");
-    store::ensure_schema(&pool).await.expect("tidx_tipwatch creates its own tables");
+        .expect("tipwatch_role.sql runs as the superuser");
+    su.batch_execute(&format!(
+        "ALTER ROLE tidx_tipwatch PASSWORD '{ROLE_PASSWORD}'"
+    ))
+    .await
+    .unwrap();
+    let pool = create_pool(&role_url())
+        .await
+        .expect("tidx_tipwatch can log in");
+    store::ensure_schema(&pool)
+        .await
+        .expect("tidx_tipwatch creates its own tables");
     for sql in [
         "DELETE FROM tipwatch.orphans WHERE provider = $1",
         "UPDATE tipwatch.reorgs SET reverted_by = NULL WHERE provider = $1",
@@ -212,7 +233,12 @@ async fn fixture(provider: &str, initial_blocks: u64) -> Fixture {
     let chain = Arc::new(Mutex::new(Chain::default()));
     chain.lock().unwrap().extend(initial_blocks);
     let url = serve(chain.clone()).await;
-    Fixture { db, pool, chain, url }
+    Fixture {
+        db,
+        pool,
+        chain,
+        url,
+    }
 }
 
 fn opts(memory_blocks: usize, max_walk: usize) -> WatchOptions {
@@ -224,7 +250,9 @@ fn opts(memory_blocks: usize, max_walk: usize) -> WatchOptions {
 
 async fn watcher(f: &Fixture, provider: &str, o: WatchOptions) -> Watcher {
     let rpc = TipRpc::new(&f.url, 1000.0).unwrap();
-    Watcher::start(provider, rpc, f.pool.clone(), o).await.unwrap()
+    Watcher::start(provider, rpc, f.pool.clone(), o)
+        .await
+        .unwrap()
 }
 
 #[derive(Debug, PartialEq)]
@@ -262,22 +290,28 @@ async fn reorgs(pool: &Pool, provider: &str) -> Vec<ReorgRow> {
 
 async fn orphans(pool: &Pool, reorg_id: i64) -> Vec<(i64, B256)> {
     let c = pool.get().await.unwrap();
-    c.query("SELECT num, hash FROM tipwatch.orphans WHERE reorg_id = $1 ORDER BY num", &[&reorg_id])
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| (r.get(0), B256::from_slice(r.get::<_, &[u8]>(1))))
-        .collect()
+    c.query(
+        "SELECT num, hash FROM tipwatch.orphans WHERE reorg_id = $1 ORDER BY num",
+        &[&reorg_id],
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| (r.get(0), B256::from_slice(r.get::<_, &[u8]>(1))))
+    .collect()
 }
 
 async fn seen(pool: &Pool, provider: &str) -> Vec<(i64, B256)> {
     let c = pool.get().await.unwrap();
-    c.query("SELECT num, hash FROM tipwatch.seen WHERE provider = $1 ORDER BY num", &[&provider])
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| (r.get(0), B256::from_slice(r.get::<_, &[u8]>(1))))
-        .collect()
+    c.query(
+        "SELECT num, hash FROM tipwatch.seen WHERE provider = $1 ORDER BY num",
+        &[&provider],
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| (r.get(0), B256::from_slice(r.get::<_, &[u8]>(1))))
+    .collect()
 }
 
 async fn gaps(pool: &Pool, provider: &str) -> Vec<(i64, i64, String)> {
@@ -296,14 +330,19 @@ async fn gaps(pool: &Pool, provider: &str) -> Vec<(i64, i64, String)> {
 /// The provider's canonical hashes for the heights the watcher has stored.
 fn canon_for(chain: &Shared, rows: &[(i64, B256)]) -> Vec<(i64, B256)> {
     let c = chain.lock().unwrap();
-    rows.iter().map(|(n, _)| (*n, c.canon[*n as usize].hash)).collect()
+    rows.iter()
+        .map(|(n, _)| (*n, c.canon[*n as usize].hash))
+        .collect()
 }
 
 /// Steps once per block so the watcher remembers `n` more heights.
 async fn grow(f: &Fixture, w: &mut Watcher, n: u64) {
     for _ in 0..n {
         f.chain.lock().unwrap().extend(1);
-        assert!(matches!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 1, .. }));
+        assert!(matches!(
+            w.step().await.unwrap(),
+            StepOutcome::Extended { blocks: 1, .. }
+        ));
     }
 }
 
@@ -318,15 +357,24 @@ async fn extends_one_block_at_a_time_without_recording_a_reorg() {
     let f = fixture(p, 10).await;
     let mut w = watcher(&f, p, opts(1000, 16)).await;
 
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 1, tip: 9 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 1, tip: 9 }
+    );
     for tip in 10..15 {
         f.chain.lock().unwrap().extend(1);
-        assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 1, tip });
+        assert_eq!(
+            w.step().await.unwrap(),
+            StepOutcome::Extended { blocks: 1, tip }
+        );
     }
     assert_eq!(w.step().await.unwrap(), StepOutcome::Unchanged);
 
     let rows = seen(&f.db.pool, p).await;
-    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), (9..=14).collect::<Vec<_>>());
+    assert_eq!(
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        (9..=14).collect::<Vec<_>>()
+    );
     assert_eq!(rows, canon_for(&f.chain, &rows));
     assert!(reorgs(&f.db.pool, p).await.is_empty());
     assert_eq!(w.tip().unwrap().number, 14);
@@ -341,10 +389,16 @@ async fn fills_skipped_heights_by_walking_parent_hashes() {
     w.step().await.unwrap();
 
     f.chain.lock().unwrap().extend(6);
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 6, tip: 10 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 6, tip: 10 }
+    );
 
     let rows = seen(&f.db.pool, p).await;
-    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), (4..=10).collect::<Vec<_>>());
+    assert_eq!(
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        (4..=10).collect::<Vec<_>>()
+    );
     assert_eq!(rows, canon_for(&f.chain, &rows));
     assert!(reorgs(&f.db.pool, p).await.is_empty());
 }
@@ -362,7 +416,10 @@ async fn lagging_backend_answer_is_not_a_reorg() {
     assert_eq!(w.step().await.unwrap(), StepOutcome::Unchanged);
     f.chain.lock().unwrap().lag = None;
     f.chain.lock().unwrap().extend(1);
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 1, tip: 9 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 1, tip: 9 }
+    );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
 }
 
@@ -384,12 +441,30 @@ async fn records_a_one_block_reorg_with_its_orphan() {
     let out = w.step().await.unwrap();
     let rows = reorgs(&f.db.pool, p).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(out, StepOutcome::Reorg { id: rows[0].id, depth: 1, fork_point: 4 });
+    assert_eq!(
+        out,
+        StepOutcome::Reorg {
+            id: rows[0].id,
+            depth: 1,
+            fork_point: 4
+        }
+    );
     assert_eq!(
         rows[0],
-        ReorgRow { id: rows[0].id, fork_point: 4, old_tip: 5, new_tip: 5, depth: 1, after_gap: false, reverted_by: None }
+        ReorgRow {
+            id: rows[0].id,
+            fork_point: 4,
+            old_tip: 5,
+            new_tip: 5,
+            depth: 1,
+            after_gap: false,
+            reverted_by: None
+        }
     );
-    assert_eq!(orphans(&f.db.pool, rows[0].id).await, vec![(5, old_top.hash)]);
+    assert_eq!(
+        orphans(&f.db.pool, rows[0].id).await,
+        vec![(5, old_top.hash)]
+    );
 
     let s = seen(&f.db.pool, p).await;
     assert_eq!(s, canon_for(&f.chain, &s), "seen follows the new branch");
@@ -403,13 +478,29 @@ async fn records_a_reorg_deeper_than_the_engine_head_delay() {
     let mut w = watcher(&f, p, opts(1000, 64)).await;
     w.step().await.unwrap();
     f.chain.lock().unwrap().extend(50);
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 50, tip: 50 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended {
+            blocks: 50,
+            tip: 50
+        }
+    );
 
     f.chain.lock().unwrap().reorg(40, 42);
     let out = w.step().await.unwrap();
     let rows = reorgs(&f.db.pool, p).await;
-    assert_eq!(out, StepOutcome::Reorg { id: rows[0].id, depth: 40, fork_point: 10 });
-    assert_eq!((rows[0].old_tip, rows[0].new_tip, rows[0].depth), (50, 52, 40));
+    assert_eq!(
+        out,
+        StepOutcome::Reorg {
+            id: rows[0].id,
+            depth: 40,
+            fork_point: 10
+        }
+    );
+    assert_eq!(
+        (rows[0].old_tip, rows[0].new_tip, rows[0].depth),
+        (50, 52, 40)
+    );
     assert_eq!(orphans(&f.db.pool, rows[0].id).await.len(), 40);
     let s = seen(&f.db.pool, p).await;
     assert_eq!(s.last().unwrap().0, 52);
@@ -428,10 +519,21 @@ async fn reorg_to_a_shorter_branch_counts_every_replaced_block() {
     f.chain.lock().unwrap().reorg(5, 3);
     let out = w.step().await.unwrap();
     let rows = reorgs(&f.db.pool, p).await;
-    assert_eq!(out, StepOutcome::Reorg { id: rows[0].id, depth: 5, fork_point: 7 });
+    assert_eq!(
+        out,
+        StepOutcome::Reorg {
+            id: rows[0].id,
+            depth: 5,
+            fork_point: 7
+        }
+    );
     assert_eq!((rows[0].old_tip, rows[0].new_tip), (12, 10));
     let s = seen(&f.db.pool, p).await;
-    assert_eq!(s.last().unwrap().0, 10, "heights above the new tip are gone from seen");
+    assert_eq!(
+        s.last().unwrap().0,
+        10,
+        "heights above the new tip are gone from seen"
+    );
     assert_eq!(s, canon_for(&f.chain, &s));
 }
 
@@ -483,12 +585,26 @@ async fn rpc_failures_return_errors_and_leave_state_untouched() {
 
     // A parent fetched by hash that is some other block.
     f.chain.lock().unwrap().extend(3);
-    f.chain.lock().unwrap().faults.extend([Fault::Pass, Fault::WrongBlock]);
-    let err = w.step().await.expect_err("mismatched parent must be rejected");
+    f.chain
+        .lock()
+        .unwrap()
+        .faults
+        .extend([Fault::Pass, Fault::WrongBlock]);
+    let err = w
+        .step()
+        .await
+        .expect_err("mismatched parent must be rejected");
     assert!(format!("{err:#}").contains("asked for"), "{err:#}");
 
-    assert_eq!(seen(&f.db.pool, p).await, before, "failed steps write nothing");
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 3, tip: 7 });
+    assert_eq!(
+        seen(&f.db.pool, p).await,
+        before,
+        "failed steps write nothing"
+    );
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 3, tip: 7 }
+    );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
 }
 
@@ -513,8 +629,18 @@ async fn restart_finds_a_reorg_that_happened_while_stopped() {
 
     let out = w.step().await.unwrap();
     let rows = reorgs(&f.db.pool, p).await;
-    assert_eq!(out, StepOutcome::Reorg { id: rows[0].id, depth: 2, fork_point: 5 });
-    assert!(!rows[0].after_gap, "found by parent hashes, every height observed");
+    assert_eq!(
+        out,
+        StepOutcome::Reorg {
+            id: rows[0].id,
+            depth: 2,
+            fork_point: 5
+        }
+    );
+    assert!(
+        !rows[0].after_gap,
+        "found by parent hashes, every height observed"
+    );
     assert!(gaps(&f.db.pool, p).await.is_empty());
     let s = seen(&f.db.pool, p).await;
     assert_eq!(s, canon_for(&f.chain, &s));
@@ -536,9 +662,22 @@ async fn long_stop_compares_by_number_and_records_the_gap() {
     let out = w.step().await.unwrap();
     let rows = reorgs(&f.db.pool, p).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(out, StepOutcome::Jump { reorg: Some((rows[0].id, 3)), gap_from: 10, gap_to: 48 });
     assert_eq!(
-        (rows[0].fork_point, rows[0].old_tip, rows[0].new_tip, rows[0].depth, rows[0].after_gap),
+        out,
+        StepOutcome::Jump {
+            reorg: Some((rows[0].id, 3)),
+            gap_from: 10,
+            gap_to: 48
+        }
+    );
+    assert_eq!(
+        (
+            rows[0].fork_point,
+            rows[0].old_tip,
+            rows[0].new_tip,
+            rows[0].depth,
+            rows[0].after_gap
+        ),
         (6, 9, 9, 3, true)
     );
     let g = gaps(&f.db.pool, p).await;
@@ -546,7 +685,10 @@ async fn long_stop_compares_by_number_and_records_the_gap() {
     assert_eq!((g[0].0, g[0].1), (10, 48));
 
     f.chain.lock().unwrap().extend(1);
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 1, tip: 50 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 1, tip: 50 }
+    );
     let s = seen(&f.db.pool, p).await;
     assert_eq!(s, canon_for(&f.chain, &s));
 }
@@ -563,7 +705,14 @@ async fn long_stop_without_a_reorg_records_only_the_gap() {
 
     f.chain.lock().unwrap().extend(40); // tip 45
     let mut w = watcher(&f, p, opts(1000, 16)).await;
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Jump { reorg: None, gap_from: 6, gap_to: 44 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Jump {
+            reorg: None,
+            gap_from: 6,
+            gap_to: 44
+        }
+    );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
     assert_eq!(gaps(&f.db.pool, p).await.len(), 1);
 }
@@ -579,13 +728,22 @@ async fn divergence_deeper_than_memory_is_a_gap_not_a_guess() {
 
     f.chain.lock().unwrap().reorg(10, 12); // fork at 2, below memory; tip 14
     let out = w.step().await.unwrap();
-    assert_eq!(out, StepOutcome::Diverged { gap_from: 5, gap_to: 13 });
+    assert_eq!(
+        out,
+        StepOutcome::Diverged {
+            gap_from: 5,
+            gap_to: 13
+        }
+    );
     assert!(reorgs(&f.db.pool, p).await.is_empty());
     let g = gaps(&f.db.pool, p).await;
     assert!(g[0].2.contains("diverged"), "{g:?}");
 
     f.chain.lock().unwrap().extend(1);
-    assert_eq!(w.step().await.unwrap(), StepOutcome::Extended { blocks: 1, tip: 15 });
+    assert_eq!(
+        w.step().await.unwrap(),
+        StepOutcome::Extended { blocks: 1, tip: 15 }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -603,9 +761,14 @@ async fn providers_are_tracked_independently() {
     let url_b = serve(chain_b.clone()).await;
 
     let mut wa = watcher(&f, pa, opts(1000, 16)).await;
-    let mut wb = Watcher::start(pb, TipRpc::new(&url_b, 1000.0).unwrap(), f.pool.clone(), opts(1000, 16))
-        .await
-        .unwrap();
+    let mut wb = Watcher::start(
+        pb,
+        TipRpc::new(&url_b, 1000.0).unwrap(),
+        f.pool.clone(),
+        opts(1000, 16),
+    )
+    .await
+    .unwrap();
     for round in 0..6 {
         f.chain.lock().unwrap().extend(1);
         chain_b.lock().unwrap().extend(1);
@@ -618,7 +781,10 @@ async fn providers_are_tracked_independently() {
     }
 
     assert_eq!(reorgs(&f.db.pool, pa).await.len(), 1);
-    assert!(reorgs(&f.db.pool, pb).await.is_empty(), "the two chains differ, but that is not a reorg");
+    assert!(
+        reorgs(&f.db.pool, pb).await.is_empty(),
+        "the two chains differ, but that is not a reorg"
+    );
     let sa = seen(&f.db.pool, pa).await;
     let sb = seen(&f.db.pool, pb).await;
     assert_eq!(sa, canon_for(&f.chain, &sa));
@@ -653,15 +819,26 @@ async fn requests_are_paced_to_max_rps() {
     assert!(sequential >= Duration::from_millis(450), "{sequential:?}");
 
     let start = Instant::now();
-    let calls: Vec<_> = (0..6).map(|_| { let r = rpc.clone(); tokio::spawn(async move { r.head().await }) }).collect();
+    let calls: Vec<_> = (0..6)
+        .map(|_| {
+            let r = rpc.clone();
+            tokio::spawn(async move { r.head().await })
+        })
+        .collect();
     for c in calls {
         c.await.unwrap().unwrap();
     }
     let concurrent = start.elapsed();
-    assert!(concurrent >= Duration::from_millis(500), "concurrent callers share one budget: {concurrent:?}");
+    assert!(
+        concurrent >= Duration::from_millis(500),
+        "concurrent callers share one budget: {concurrent:?}"
+    );
     assert!(concurrent < Duration::from_secs(3), "{concurrent:?}");
 
-    assert!(TipRpc::new(&f.url, 0.0).is_err(), "a zero rate would never send");
+    assert!(
+        TipRpc::new(&f.url, 0.0).is_err(),
+        "a zero rate would never send"
+    );
 }
 
 #[tokio::test]
@@ -695,8 +872,14 @@ async fn watcher_role_cannot_touch_the_indexed_tables() {
         "SELECT pg_read_file('/etc/passwd')",
     ] {
         let err = c.batch_execute(sql).await.expect_err(sql);
-        assert_eq!(err.code().map(|s| s.code()), Some(INSUFFICIENT_PRIVILEGE), "{sql}: {err}");
+        assert_eq!(
+            err.code().map(|s| s.code()),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{sql}: {err}"
+        );
     }
-    c.batch_execute("SELECT count(*) FROM tipwatch.reorgs").await.unwrap();
+    c.batch_execute("SELECT count(*) FROM tipwatch.reorgs")
+        .await
+        .unwrap();
     store::ensure_schema(&f.pool).await.expect("idempotent");
 }
