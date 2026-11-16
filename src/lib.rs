@@ -10,4 +10,5 @@ pub mod query;
 pub mod service;
 pub mod sync;
 pub mod tempo;
+pub mod tipwatch;
 pub mod types;
