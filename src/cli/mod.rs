@@ -14,6 +14,7 @@ pub mod status;
 pub mod up;
 pub mod upgrade;
 pub mod views;
+pub mod watch_tip;
 
 use clap::{Parser, Subcommand};
 
@@ -71,6 +72,10 @@ pub enum Commands {
     EnrichL1Fees(enrich_l1_fees::Args),
     /// Import verified contracts from a Blockscout explorer into local explorer metadata
     ImportBlockscout(import_blockscout::Args),
+    /// Follow each RPC provider's tip and record every reorg it makes, at any
+    /// depth, into the `tipwatch` schema (the engine's reorg archive only sees
+    /// reorgs deeper than head_delay_blocks). Runs no tidx migrations.
+    WatchTip(watch_tip::Args),
     /// Update tidx to the latest version
     Upgrade,
 }
