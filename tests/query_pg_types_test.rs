@@ -115,8 +115,8 @@ async fn json_dates_times_and_arrays_render() {
     assert_eq!(
         got,
         [
-            json!({"a": [1, 2]}),
-            json!([1, "x"]),
+            json!("{\"a\": [1, 2]}"),
+            json!("[1, \"x\"]"),
             json!("2026-11-22"),
             json!("17:05:06.500"),
             json!("2026-11-22T17:05:06.123456"),
@@ -158,7 +158,7 @@ async fn public_query_returns_jsonb_and_names_a_column_it_cannot_render() {
     )
     .await
     .unwrap();
-    assert_eq!(ok.rows[0][0], json!({"blocks": 3}));
+    assert_eq!(ok.rows[0][0], json!("{\"blocks\": 3}"));
     assert!(ok.rows[0][1].is_string(), "{:?}", ok.rows[0][1]);
     assert_eq!(ok.rows[0][2], json!(true));
 
@@ -174,6 +174,84 @@ async fn public_query_returns_jsonb_and_names_a_column_it_cannot_render() {
     assert!(
         msg.contains("\"u\"") && msg.contains("uuid") && msg.contains("::text"),
         "{msg}"
+    );
+
+    // Same answer whether or not any row matches.
+    let err = execute_query_postgres(
+        &db.pool,
+        "SELECT '00000000-0000-0000-0000-000000000000'::uuid AS u FROM kaspa_provenance_gaps WHERE false",
+        &[],
+        &options,
+    )
+    .await
+    .expect_err("an unrenderable column is an error even with no rows");
+    assert!(err.to_string().contains("\"u\""), "{err}");
+
+    // A value its type's decoder can't take is named too, never a null.
+    let err = execute_query_postgres(
+        &db.pool,
+        "SELECT reason, date '5000000-01-01' AS far FROM kaspa_provenance_gaps",
+        &[],
+        &options,
+    )
+    .await
+    .expect_err("an undecodable value is an error, not a null");
+    assert!(err.to_string().contains("\"far\""), "{err}");
+}
+
+/// JSON comes back as the text Postgres stores, as ClickHouse returns its
+/// String `calls`: parsing it into f64s would round a uint256 and turn 1e400
+/// into null.
+#[tokio::test]
+#[serial(db)]
+async fn json_is_returned_exactly() {
+    let db = TestDb::empty().await;
+    let values = [
+        "{\"v\": 115792089237316195423570985008687907853269984665640564039457584007913129639935}",
+        "{\"v\": 1e400, \"w\": 0.1}",
+        "[{\"to\": \"0xabc\", \"calls\": []}]",
+    ];
+    for ty in ["jsonb", "json"] {
+        for (v, rendered, text) in rendered_vs_text(&db, ty, &values).await {
+            assert_eq!(rendered, Value::String(text), "{ty} {v}");
+        }
+    }
+}
+
+/// Special values print as Postgres prints them, never as null.
+#[tokio::test]
+#[serial(db)]
+async fn infinities_and_nan_are_values() {
+    let db = TestDb::empty().await;
+    let conn = db.pool.get().await.unwrap();
+    let row = conn
+        .query_one(
+            "SELECT 'infinity'::timestamptz, '-infinity'::timestamp, 'infinity'::date,
+                    'NaN'::float8, 'Infinity'::real, '-Infinity'::float8, 0.1::real,
+                    ARRAY['NaN', '1.5']::float8[], ARRAY['-infinity']::timestamptz[],
+                    timestamptz '2026-11-22 17:05:06.5+00'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<Value> = (0..row.len())
+        .map(|i| format_column_json(&row, i))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            json!("infinity"),
+            json!("-infinity"),
+            json!("infinity"),
+            json!("NaN"),
+            json!("Infinity"),
+            json!("-Infinity"),
+            json!(0.1),
+            json!(["NaN", 1.5]),
+            json!(["-infinity"]),
+            // Unchanged from before: RFC 3339 with 0, 3, 6 or 9 fraction digits.
+            json!("2026-11-22T17:05:06.500+00:00"),
+        ]
     );
 }
 
