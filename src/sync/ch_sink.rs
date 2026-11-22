@@ -789,7 +789,7 @@ fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
 }
 
 /// Hex-encode bytes with 0x prefix.
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
