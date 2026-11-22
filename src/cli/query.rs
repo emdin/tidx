@@ -181,6 +181,7 @@ mod tests {
             row_count: 2,
             engine: Some("postgres".into()),
             query_time_ms: Some(1.5),
+            truncated: false,
         }
     }
 
@@ -200,6 +201,7 @@ mod tests {
             row_count: 2,
             engine: None,
             query_time_ms: None,
+            truncated: false,
         };
 
         let mut output = Vec::new();
@@ -225,6 +227,7 @@ mod tests {
             row_count: 0,
             engine: None,
             query_time_ms: None,
+            truncated: false,
         };
         print_toon(&result).unwrap();
     }
@@ -237,6 +240,7 @@ mod tests {
             row_count: 1,
             engine: None,
             query_time_ms: None,
+            truncated: false,
         };
         print_toon(&result).unwrap();
     }
@@ -324,6 +328,7 @@ async fn run_via_http(base_url: &str, args: &Args) -> Result<()> {
         row_count: parsed["row_count"].as_i64().unwrap_or(0) as usize,
         engine: parsed["engine"].as_str().map(String::from),
         query_time_ms: parsed["query_time_ms"].as_f64(),
+        truncated: parsed["truncated"].as_bool().unwrap_or(false),
     };
 
     if result.row_count == 0 {
