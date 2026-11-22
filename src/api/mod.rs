@@ -1,7 +1,7 @@
 mod explorer;
 mod explorer_api;
 mod rate_limit;
-mod tables;
+pub mod tables;
 mod views;
 
 use std::collections::HashMap;

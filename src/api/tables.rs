@@ -24,6 +24,10 @@ pub struct ColumnInfo {
 pub struct QueryExample {
     pub description: &'static str,
     pub sql: &'static str,
+    /// Event signature to pass as `?signature=` (POST: `"signature"`); the
+    /// example's FROM names the table it creates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -101,6 +105,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "10 most recent blocks",
                     sql: "SELECT num, encode(hash,'hex'), timestamp, gas_used FROM blocks ORDER BY num DESC LIMIT 10",
+                    signature: None,
                 },
             ],
         },
@@ -134,10 +139,12 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "All ERC-20 transfer() calls (selector 0xa9059cbb) — uses the indexed `selector` column",
                     sql: "SELECT block_num, encode(hash,'hex') FROM txs WHERE selector = decode('a9059cbb','hex') ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
                 QueryExample {
                     description: "Same in CH (selector is hex-prefixed)",
                     sql: "SELECT block_num, hash FROM txs WHERE selector = '0xa9059cbb' ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
             ],
         },
@@ -164,14 +171,17 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Recent ERC-20 Transfer events using ?signature= helper",
                     sql: "SELECT block_num, encode(address,'hex'), encode(topic1,'hex'), encode(topic2,'hex') FROM Transfer ORDER BY block_num DESC LIMIT 100",
+                    signature: Some("Transfer(address,address,uint256)"),
                 },
                 QueryExample {
                     description: "Equivalent without ?signature= — must hash 'Transfer(address,address,uint256)' yourself",
                     sql: "SELECT * FROM logs WHERE selector = decode('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef','hex')",
+                    signature: None,
                 },
                 QueryExample {
                     description: "All events emitted by txs sent from a specific address (uses denormalized logs.\"from\")",
                     sql: "SELECT block_num, encode(address,'hex'), encode(selector,'hex') FROM logs WHERE \"from\" = decode('abc123...','hex') ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
             ],
         },
@@ -197,6 +207,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Failed txs in the last 1000 blocks",
                     sql: "SELECT encode(tx_hash,'hex'), encode(\"from\",'hex'), gas_used FROM receipts WHERE status = 0 AND block_num > (SELECT max(num) FROM blocks) - 1000 ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
             ],
         },
@@ -220,6 +231,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Daily entry totals (CH)",
                     sql: "SELECT toStartOfDay(block_timestamp) AS day, count() AS entries, sum(amount_sompi) AS total_sompi FROM l2_withdrawals GROUP BY day ORDER BY day DESC",
+                    signature: None,
                 },
             ],
         },
@@ -249,14 +261,17 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "All ERC-20 transfer() calls made *internally* by contracts (selector 0xa9059cbb)",
                     sql: "SELECT block_num, encode(tx_hash,'hex'), encode(\"from\",'hex'), encode(\"to\",'hex') FROM internal_txs WHERE input_selector = decode('a9059cbb','hex') ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
                 QueryExample {
                     description: "Failed internal calls in the last 1000 blocks",
                     sql: "SELECT block_num, encode(tx_hash,'hex'), depth, call_type, error FROM internal_txs WHERE error IS NOT NULL AND block_num > (SELECT max(num) FROM blocks) - 1000 ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
                 QueryExample {
                     description: "Reconstruct a tx's call tree in traversal order",
                     sql: "SELECT path_idx, depth, call_type, encode(\"from\",'hex'), encode(\"to\",'hex'), value FROM internal_txs WHERE tx_hash = decode('<tx-hash-hex>','hex') ORDER BY path_idx",
+                    signature: None,
                 },
             ],
         },
@@ -277,10 +292,12 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Trace coverage of a block window: ok / empty / failed / never traced",
                     sql: "SELECT coalesce(o.outcome, 'untraced') AS outcome, count(*) FROM txs t LEFT JOIN trace_outcomes o ON o.tx_hash = t.hash WHERE t.block_num BETWEEN 17900000 AND 17900999 GROUP BY 1",
+                    signature: None,
                 },
                 QueryExample {
                     description: "Failed traces awaiting repair",
                     sql: "SELECT block_num, encode(tx_hash,'hex'), attempts, error FROM trace_outcomes WHERE outcome = 'failed' ORDER BY block_num DESC LIMIT 100",
+                    signature: None,
                 },
             ],
         },
@@ -301,6 +318,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Kaspa carriers of a given L2 tx, in acceptance order",
                     sql: "SELECT encode(kaspa_txid,'hex'), accepting_blue_score FROM kaspa_l2_submissions WHERE l2_tx_hash = '\\x<l2-hash-hex>'::bytea ORDER BY accepting_blue_score",
+                    signature: None,
                 },
             ],
         },
@@ -403,6 +421,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Most recent reorgs",
                     sql: "SELECT id, fork_point, depth, blocks_removed, occurred_at FROM reorgs ORDER BY id DESC LIMIT 20",
+                    signature: None,
                 },
             ],
         },
@@ -423,6 +442,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Which canonical block replaced an orphaned one",
                     sql: "SELECT ob.num, encode(ob.hash,'hex') AS orphaned_hash, encode(b.hash,'hex') AS replaced_by FROM orphaned_blocks ob LEFT JOIN blocks b ON b.num = ob.num WHERE ob.reorg_id = $1",
+                    signature: None,
                 },
             ],
         },
@@ -443,6 +463,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 QueryExample {
                     description: "Full history of a tx: canonical or orphaned + depth",
                     sql: "SELECT 'canonical' AS st, block_num, NULL::bigint AS reorg_id, NULL::int AS depth FROM txs WHERE hash=decode($1,'hex') UNION ALL SELECT 'orphaned', o.block_num, r.id, r.depth FROM orphaned_txs o JOIN reorgs r ON r.id=o.reorg_id WHERE o.hash=decode($1,'hex')",
+                    signature: None,
                 },
             ],
         },
