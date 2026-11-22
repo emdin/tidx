@@ -536,7 +536,7 @@ pub fn tips() -> Vec<&'static str> {
         "internal_txs only stores nested frames (depth ≥ 1). The top-level call IS the tx itself and lives in `txs`/`receipts`. A self-contained payable function (e.g. a bridge `lockForExit` that just credits storage and emits an event) produces ZERO internal_txs rows — that's expected. To track all native-iKAS flows into an address regardless of depth, union over `txs.value` and `internal_txs.value`: `SELECT block_num, value FROM txs WHERE \"to\"=decode('<addr>','hex') AND value::numeric > 0 UNION ALL SELECT block_num, value FROM internal_txs WHERE \"to\"=decode('<addr>','hex') AND value::numeric > 0`.",
         "PG helpers in the /query allowlist: `format_address(bytea) → text` returns `'0x' || encode(...,'hex')` (use it on every address column to avoid the encode/decode dance), `format_uint(bytea) → text` decodes ABI uint payloads. For numeric arithmetic on uint256 string columns in PG, cast: `CAST(gas_used AS numeric) * CAST(effective_gas_price AS numeric)`. CH: prefer the `_u256` mirror columns and skip the cast entirely.",
         "Filtering by an indexed ADDRESS topic (topic1/2/3): the topic is the 32-byte left-padded form, so use `WHERE topic2 = topic_addr('0xAbC…')` (accepts checksummed input). To read an address OUT of a topic use `abi_address(topic2)` (trailing 20 bytes) — `format_address(topic2)` returns the full 32-byte padded value and is the wrong tool for topics.",
-        "ClickHouse string literals are case-sensitive but address/topic/hash columns are stored lowercase — the API lowercases `'0x…'` literals for you, but if you build a literal dynamically, lowercase it yourself or you'll get a silent zero-row result. `abi_uint` returns null through the JSON layer for values ≥ 2^96; use `format_uint` (text) for large amounts, and `abi_uint(data, i)`/`format_uint(data, i)` to select the i-th 32-byte word of multi-word event data.",
+        "ClickHouse string literals are case-sensitive but address/topic/hash columns are stored lowercase — the API lowercases `'0x…'` literals for you, but if you build a literal dynamically, lowercase it yourself or you'll get a silent zero-row result. `abi_uint(data, i)`/`format_uint(data, i)` select the i-th 32-byte word of multi-word event data.",
     ]
 }
 
@@ -568,13 +568,13 @@ pub fn functions_metadata() -> Vec<FunctionInfo> {
             name: "abi_uint",
             signature: "abi_uint(bytea) -> numeric | abi_uint(bytea, word_index) -> numeric",
             returns: "numeric",
-            description: "Decode a big-endian ABI uint. The 1-arg form reads the WHOLE buffer as one integer (correct only for single-word data, e.g. ERC-20 Transfer); the 2-arg form reads the 0-based 32-byte word. NOTE: the JSON response renders numeric via a 96-bit decimal and returns null for values >= 2^96 — use format_uint for display of large values.",
+            description: "Decode a big-endian ABI uint. The 1-arg form reads the WHOLE buffer as one integer (correct only for single-word data, e.g. ERC-20 Transfer); the 2-arg form reads the 0-based 32-byte word.",
         },
         FunctionInfo {
             name: "format_uint",
             signature: "format_uint(bytea) -> text | format_uint(bytea, word_index) -> text",
             returns: "text",
-            description: "Same decode as abi_uint but returns text, so full uint256 (up to 2^256-1) round-trips through the API without the 2^96 null ceiling. Prefer this when returning amounts.",
+            description: "Same decode as abi_uint but returns text. Both return the exact value at any size (numeric comes back as a decimal string).",
         },
         FunctionInfo {
             name: "abi_address",

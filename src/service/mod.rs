@@ -293,17 +293,41 @@ pub async fn execute_query_postgres(
     };
 
     // Get columns from result (even if empty, prepared statement has column info)
-    let columns: Vec<String> = if rows.is_empty() {
+    let columns: Vec<(String, tokio_postgres::types::Type)> = if rows.is_empty() {
         // For empty results, prepare statement to get column metadata
         tx.prepare(&sql)
             .await
             .ok()
-            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
+            .map(|s| {
+                s.columns()
+                    .iter()
+                    .map(|c| (c.name().to_string(), c.type_().clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
-        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+        rows[0]
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_string(), c.type_().clone()))
+            .collect()
     };
     tx.commit().await?;
+
+    // An unrenderable column or value would otherwise come back as nulls that
+    // look like data. Checked by type, so it fails the same with or without rows.
+    let renderers = columns
+        .iter()
+        .map(|(name, ty)| {
+            renderer(ty).ok_or_else(|| {
+                anyhow!(
+                    "Column \"{name}\" has type {}, which /query can't return; cast it to a type it can, e.g. ::text",
+                    ty.name()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let columns: Vec<String> = columns.into_iter().map(|(name, _)| name).collect();
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -325,14 +349,23 @@ pub async fn execute_query_postgres(
     let row_count = rows.len();
     metrics::record_query_rows(row_count as u64);
 
-    let result_rows: Vec<Vec<serde_json::Value>> = rows
+    let result_rows = rows
         .iter()
         .map(|row| {
-            (0..columns.len())
-                .map(|i| format_column_json(row, i))
-                .collect()
+            renderers
+                .iter()
+                .enumerate()
+                .map(|(i, render)| {
+                    render(row, i).map_err(|e| {
+                        anyhow!(
+                            "Column \"{}\" holds a value /query can't return ({e}); cast it, e.g. ::text",
+                            columns[i]
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(QueryResult {
         columns,
@@ -344,77 +377,71 @@ pub async fn execute_query_postgres(
     })
 }
 
-
+/// One Postgres value as JSON; null for SQL NULL and for anything /query can't
+/// render (`execute_query_postgres` rejects those instead).
 pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
-    let col = &row.columns()[idx];
-
-    match col.type_().name() {
-        "int2" => row
-            .try_get::<_, i16>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
-        "int4" => row
-            .try_get::<_, i32>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
-        "int8" => row
-            .try_get::<_, i64>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
-        "numeric" => {
-            // rust_decimal::Decimal panics (not errors) for values exceeding its
-            // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
-            // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                row.try_get::<_, rust_decimal::Decimal>(idx)
-            })) {
-                Ok(Ok(v)) => serde_json::Value::String(v.to_string()),
-                _ => serde_json::Value::Null,
-            }
-        }
-        "float4" | "float8" => row
-            .try_get::<_, f64>(idx)
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        "bytea" => row
-            .try_get::<_, Vec<u8>>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::String(format!("0x{}", hex::encode(v)))),
-        "text" | "varchar" | "name" => row
-            .try_get::<_, String>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, serde_json::Value::String),
-        "timestamptz" | "timestamp" => row
-            .try_get::<_, DateTime<Utc>>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::String(v.to_rfc3339())),
-        "bool" => row
-            .try_get::<_, bool>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, serde_json::Value::Bool),
-        "_int2" => array_json::<i16>(row, idx, |v| v.into()),
-        "_int4" => array_json::<i32>(row, idx, |v| v.into()),
-        "_int8" => array_json::<i64>(row, idx, |v| v.into()),
-        "_text" | "_varchar" => array_json::<String>(row, idx, serde_json::Value::String),
-        "_bool" => array_json::<bool>(row, idx, serde_json::Value::Bool),
-        "_bytea" => array_json::<Vec<u8>>(row, idx, |v| {
-            serde_json::Value::String(format!("0x{}", hex::encode(v)))
-        }),
-        _ => serde_json::Value::Null,
-    }
+    renderer(row.columns()[idx].type_())
+        .and_then(|render| render(row, idx).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
-fn array_json<T>(
-    row: &tokio_postgres::Row,
+type Render = fn(&tokio_postgres::Row, usize) -> Result<serde_json::Value, FromSqlError>;
+
+/// How /query renders a value of `ty`, or `None` for a type it can't. A value
+/// its decoder rejects is an error, never a null.
+fn renderer(ty: &tokio_postgres::types::Type) -> Option<Render> {
+    use serde_json::Value;
+    let render: Render = match ty.name() {
+        "int2" => |r, i| one::<i16>(r, i, Value::from),
+        "int4" => |r, i| one::<i32>(r, i, Value::from),
+        "int8" => |r, i| one::<i64>(r, i, Value::from),
+        "numeric" => |r, i| one::<PgNumeric>(r, i, |v| Value::String(v.0)),
+        "float4" => |r, i| one::<f32>(r, i, float4_json),
+        "float8" => |r, i| one::<f64>(r, i, float_json),
+        "bytea" => |r, i| one::<Vec<u8>>(r, i, hex_json),
+        "text" | "varchar" | "name" | "bpchar" => |r, i| one::<String>(r, i, Value::String),
+        // The JSON text, as ClickHouse returns its String `calls`; parsing it
+        // would round big numbers to f64 and turn 1e400 into null.
+        "json" | "jsonb" => |r, i| one::<PgJson>(r, i, |v| Value::String(v.0)),
+        "timestamptz" | "timestamp" => |r, i| one::<PgTimestamp>(r, i, |v| Value::String(v.0)),
+        "date" => |r, i| one::<PgDate>(r, i, |v| Value::String(v.0)),
+        "time" => |r, i| {
+            one::<chrono::NaiveTime>(r, i, |v| Value::String(v.format("%H:%M:%S%.f").to_string()))
+        },
+        "interval" => |r, i| one::<PgInterval>(r, i, |v| Value::String(v.0)),
+        "bool" => |r, i| one::<bool>(r, i, Value::Bool),
+        "_int2" => |r, i| many::<i16>(r, i, Value::from),
+        "_int4" => |r, i| many::<i32>(r, i, Value::from),
+        "_int8" => |r, i| many::<i64>(r, i, Value::from),
+        "_numeric" => |r, i| many::<PgNumeric>(r, i, |v| Value::String(v.0)),
+        "_float4" => |r, i| many::<f32>(r, i, float4_json),
+        "_float8" => |r, i| many::<f64>(r, i, float_json),
+        "_text" | "_varchar" => |r, i| many::<String>(r, i, Value::String),
+        "_bool" => |r, i| many::<bool>(r, i, Value::Bool),
+        "_bytea" => |r, i| many::<Vec<u8>>(r, i, hex_json),
+        "_timestamptz" => |r, i| many::<PgTimestamp>(r, i, |v| Value::String(v.0)),
+        _ => return None,
+    };
+    Some(render)
+}
+
+fn one<'a, T: tokio_postgres::types::FromSql<'a>>(
+    row: &'a tokio_postgres::Row,
+    idx: usize,
+    to_json: impl FnOnce(T) -> serde_json::Value,
+) -> Result<serde_json::Value, FromSqlError> {
+    Ok(row
+        .try_get::<_, Option<T>>(idx)?
+        .map_or(serde_json::Value::Null, to_json))
+}
+
+fn many<'a, T: tokio_postgres::types::FromSql<'a>>(
+    row: &'a tokio_postgres::Row,
     idx: usize,
     to_json: impl Fn(T) -> serde_json::Value,
-) -> serde_json::Value
-where
-    T: for<'a> tokio_postgres::types::FromSql<'a>,
-{
-    row.try_get::<_, Vec<Option<T>>>(idx)
-        .ok()
+) -> Result<serde_json::Value, FromSqlError> {
+    Ok(row
+        .try_get::<_, Option<Vec<Option<T>>>>(idx)?
         .map_or(serde_json::Value::Null, |items| {
             serde_json::Value::Array(
                 items
@@ -422,7 +449,243 @@ where
                     .map(|v| v.map_or(serde_json::Value::Null, &to_json))
                     .collect(),
             )
-        })
+        }))
+}
+
+fn hex_json(v: Vec<u8>) -> serde_json::Value {
+    serde_json::Value::String(format!("0x{}", hex::encode(v)))
+}
+
+/// Non-finite floats as Postgres spells them, like numeric's.
+fn float_json(v: f64) -> serde_json::Value {
+    match serde_json::Number::from_f64(v) {
+        Some(n) => serde_json::Value::Number(n),
+        None if v.is_nan() => serde_json::Value::String("NaN".into()),
+        None if v > 0.0 => serde_json::Value::String("Infinity".into()),
+        None => serde_json::Value::String("-Infinity".into()),
+    }
+}
+
+/// `v as f64` would turn 0.1 into 0.10000000149011612; go via its text.
+fn float4_json(v: f32) -> serde_json::Value {
+    float_json(v.to_string().parse().unwrap_or(f64::from(v)))
+}
+
+/// Microseconds (timestamps) and days (dates) count from 2000-01-01.
+const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
+/// timestamptz as RFC 3339 (the format /query has always used), timestamp
+/// the same without the offset, and Postgres' `infinity` / `-infinity`.
+struct PgTimestamp(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgTimestamp {
+    fn from_sql(ty: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, FromSqlError> {
+        let micros = i64::from_be_bytes(raw.try_into().map_err(|_| "timestamp is not 8 bytes")?);
+        let text = match micros {
+            i64::MAX => "infinity".to_string(),
+            i64::MIN => "-infinity".to_string(),
+            _ => {
+                let t = micros
+                    .checked_add(PG_EPOCH_UNIX_MICROS)
+                    .and_then(DateTime::<Utc>::from_timestamp_micros)
+                    .ok_or("timestamp out of range")?;
+                if *ty == tokio_postgres::types::Type::TIMESTAMPTZ {
+                    t.to_rfc3339()
+                } else {
+                    t.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string()
+                }
+            }
+        };
+        Ok(PgTimestamp(text))
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        matches!(
+            *ty,
+            tokio_postgres::types::Type::TIMESTAMPTZ | tokio_postgres::types::Type::TIMESTAMP
+        )
+    }
+}
+
+/// date as YYYY-MM-DD, and Postgres' `infinity` / `-infinity`.
+struct PgDate(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgDate {
+    fn from_sql(_: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, FromSqlError> {
+        let days = i32::from_be_bytes(raw.try_into().map_err(|_| "date is not 4 bytes")?);
+        let text = match days {
+            i32::MAX => "infinity".to_string(),
+            i32::MIN => "-infinity".to_string(),
+            _ => chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+                .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(days.into())))
+                .ok_or("date out of range")?
+                .format("%Y-%m-%d")
+                .to_string(),
+        };
+        Ok(PgDate(text))
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::DATE
+    }
+}
+
+/// json / jsonb as the JSON text Postgres holds (jsonb's wire form is a
+/// version byte, 1, then that text).
+struct PgJson(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgJson {
+    fn from_sql(ty: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, FromSqlError> {
+        let raw = if *ty == tokio_postgres::types::Type::JSONB {
+            match raw.split_first() {
+                Some((1, text)) => text,
+                _ => return Err("unsupported jsonb version".into()),
+            }
+        } else {
+            raw
+        };
+        Ok(PgJson(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        matches!(
+            *ty,
+            tokio_postgres::types::Type::JSON | tokio_postgres::types::Type::JSONB
+        )
+    }
+}
+
+type FromSqlError = Box<dyn std::error::Error + Sync + Send>;
+
+/// NUMERIC exactly as Postgres prints it, at any size. rust_decimal, used
+/// before, stops at 2^96 (sums of wei, abi_uint of a full uint256).
+struct PgNumeric(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgNumeric {
+    fn from_sql(_: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, FromSqlError> {
+        numeric_text(raw).map(PgNumeric)
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::NUMERIC
+    }
+}
+
+/// The binary NUMERIC (ndigits, weight, sign, dscale, then base-10000 digits,
+/// the first of weight `weight`), printed like Postgres' get_str_from_var.
+fn numeric_text(raw: &[u8]) -> Result<String, FromSqlError> {
+    use std::fmt::Write;
+    let word = |i: usize| -> Result<u16, FromSqlError> {
+        let b = raw.get(2 * i..2 * i + 2).ok_or("truncated numeric")?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    };
+    let ndigits = word(0)? as usize;
+    let weight = word(1)? as i16 as i64;
+    let sign = word(2)?;
+    let dscale = word(3)? as usize;
+    let negative = match sign {
+        0x0000 => false,
+        0x4000 => true,
+        0xC000 => return Ok("NaN".into()),
+        0xD000 => return Ok("Infinity".into()),
+        0xF000 => return Ok("-Infinity".into()),
+        _ => return Err("invalid numeric sign".into()),
+    };
+    let digits = (0..ndigits)
+        .map(|i| word(4 + i))
+        .collect::<Result<Vec<_>, _>>()?;
+    let digit = |i: i64| {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| digits.get(i))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let mut out = String::from(if negative { "-" } else { "" });
+    if weight < 0 {
+        out.push('0');
+    } else {
+        write!(out, "{}", digit(0))?;
+        for i in 1..=weight {
+            write!(out, "{:04}", digit(i))?;
+        }
+    }
+    if dscale > 0 {
+        let mut frac = String::with_capacity(dscale + 4);
+        let mut i = weight + 1;
+        while frac.len() < dscale {
+            write!(frac, "{:04}", digit(i))?;
+            i += 1;
+        }
+        frac.truncate(dscale);
+        out.push('.');
+        out.push_str(&frac);
+    }
+    Ok(out)
+}
+
+/// INTERVAL as Postgres prints it with the default IntervalStyle (`postgres`):
+/// "1 year 2 mons 3 days 04:05:06.789".
+struct PgInterval(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgInterval {
+    fn from_sql(_: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, FromSqlError> {
+        let raw: [u8; 16] = raw.try_into().map_err(|_| "interval is not 16 bytes")?;
+        let micros = i64::from_be_bytes(raw[0..8].try_into()?);
+        let days = i32::from_be_bytes(raw[8..12].try_into()?);
+        let months = i32::from_be_bytes(raw[12..16].try_into()?);
+        Ok(PgInterval(interval_text(micros, days, months)))
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::INTERVAL
+    }
+}
+
+/// Postgres' EncodeInterval, INTSTYLE_POSTGRES.
+fn interval_text(micros: i64, days: i32, months: i32) -> String {
+    let mut out = String::new();
+    let (mut is_zero, mut is_before) = (true, false);
+    for (value, unit) in [
+        (i64::from(months / 12), "year"),
+        (i64::from(months % 12), "mon"),
+        (i64::from(days), "day"),
+    ] {
+        if value == 0 {
+            continue;
+        }
+        let sep = if is_zero { "" } else { " " };
+        let plus = if is_before && value > 0 { "+" } else { "" };
+        let plural = if value != 1 { "s" } else { "" };
+        out.push_str(&format!("{sep}{plus}{value} {unit}{plural}"));
+        is_before = value < 0;
+        is_zero = false;
+    }
+    let hour = micros / 3_600_000_000;
+    let min = micros / 60_000_000 % 60;
+    let sec = micros / 1_000_000 % 60;
+    let fsec = micros % 1_000_000;
+    if is_zero || micros != 0 {
+        let sep = if is_zero { "" } else { " " };
+        let sign = if micros < 0 {
+            "-"
+        } else if is_before {
+            "+"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "{sep}{sign}{:02}:{:02}:{:02}",
+            hour.abs(),
+            min.abs(),
+            sec.abs()
+        ));
+        if fsec != 0 {
+            out.push_str(format!(".{:06}", fsec.abs()).trim_end_matches('0'));
+        }
+    }
+    out
 }
 
 pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
