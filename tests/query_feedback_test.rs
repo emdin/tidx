@@ -77,6 +77,61 @@ async fn app(pool: &Pool) -> App {
         .unwrap()
 }
 
+/// A ClickHouse stand-in answering every request with `status` and `body`.
+async fn canned_clickhouse(status: &'static str, body: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn app_with_clickhouse(pool: &Pool, clickhouse_url: &str) -> App {
+    use tokio::sync::RwLock;
+    let config = tidx::config::ClickHouseConfig {
+        enabled: true,
+        url: clickhouse_url.to_string(),
+        failover_urls: vec![],
+        database: None,
+        ..Default::default()
+    };
+    let engine = Arc::new(tidx::clickhouse::ClickHouseEngine::new(&config, 1).unwrap());
+    let pools = Arc::new(RwLock::new(HashMap::from([(1u64, pool.clone())])));
+    let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> = api::router_shared(
+        pools,
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        1,
+        Arc::new(Broadcaster::new()),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::from([(1u64, engine)]))),
+        &tidx::config::HttpConfig::default(),
+    )
+    .into_make_service_with_connect_info::<SocketAddr>();
+    svc.call(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap()
+}
+
 async fn get(app: &mut App, path_and_query: &str) -> (StatusCode, Value) {
     let resp = app
         .call(
@@ -114,11 +169,12 @@ async fn every_response_reports_how_fresh_each_engine_is() {
     assert_eq!(ix["chain_head"], 1_000, "{body}");
     assert_eq!(ix["postgres_head"], 970);
     assert_eq!(ix["postgres_contiguous"], 960);
-    let age = ix["chain_head_age_secs"].as_i64().expect("age");
-    assert!(
-        (29..=40).contains(&age),
-        "a stalled indexer shows as an old chain head: {age}"
-    );
+    // updated_at moves on every sync_state write, even when the head is stuck,
+    // so staleness is how long each head has stayed at the same value.
+    for f in ["chain_head_unchanged_secs", "postgres_head_unchanged_secs"] {
+        assert_eq!(ix[f], 0, "first sighting of {f}: {ix}");
+    }
+    assert!(ix.get("chain_head_age_secs").is_none(), "replaced: {ix}");
     assert!(
         ix["clickhouse_head"].is_null(),
         "no ClickHouse configured: {ix}"
@@ -159,8 +215,8 @@ async fn timeout_says_which_engine_how_long_and_what_to_try() {
     let msg = body["error"].as_str().unwrap();
     assert!(msg.contains("postgres") && msg.contains("200"), "{msg}");
     assert!(
-        msg.contains("engine=clickhouse"),
-        "suggests the faster engine: {msg}"
+        !msg.contains("engine=clickhouse"),
+        "no ClickHouse for this chain, so no point suggesting it: {msg}"
     );
     assert!(body["indexed"].is_object());
 }
@@ -264,4 +320,68 @@ fn server_imposed_limit_fetches_one_extra_row() {
         enforce_limit_probe("SELECT num FROM blocks LIMIT 5", 10, 10_000),
         ("SELECT num FROM blocks LIMIT 5".to_string(), None)
     );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn postgres_timeout_suggests_clickhouse_where_it_exists() {
+    let db = TestDb::empty().await;
+    seed_blocks(&db.pool, 3_000).await;
+    set_sync_state(&db.pool, 10, 10, 10, 1).await;
+    let ch = canned_clickhouse("200 OK", r#"{"meta":[],"data":[]}"#.to_string()).await;
+    let mut app = app_with_clickhouse(&db.pool, &ch).await;
+
+    let sql = format!(
+        "SELECT count(*) FROM blocks a, blocks b, blocks c \
+         WHERE a.num >= {BASE} AND b.num >= {BASE} AND c.num >= {BASE}"
+    );
+    let (status, body) = get(&mut app, &q(&sql, "&timeout_ms=200")).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("engine=clickhouse"), "{body}");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn an_error_that_merely_mentions_timeout_is_not_a_timeout() {
+    let db = TestDb::empty().await;
+    set_sync_state(&db.pool, 10, 10, 10, 1).await;
+    let mut app = app(&db.pool).await;
+    let (status, body) = get(&mut app, &q(r#"SELECT "statement timeout" FROM blocks"#, "")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "a missing column, not a timeout: {body}");
+    assert!(body["error"].as_str().unwrap().contains("does not exist"), "{body}");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn clickhouse_timeout_is_a_408_naming_clickhouse() {
+    let db = TestDb::empty().await;
+    set_sync_state(&db.pool, 10, 10, 10, 1).await;
+    let exception = "Code: 159. DB::Exception: Timeout exceeded: elapsed 0.3 seconds, maximum: 0.3. (TIMEOUT_EXCEEDED)";
+    let ch = canned_clickhouse(
+        "408 Request Timeout",
+        serde_json::json!({"meta": [], "data": [], "exception": exception}).to_string(),
+    )
+    .await;
+    let mut app = app_with_clickhouse(&db.pool, &ch).await;
+    let (status, body) =
+        get(&mut app, &q("SELECT num FROM blocks", "&engine=clickhouse&timeout_ms=300")).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{body}");
+    assert_eq!(body["engine"], "clickhouse");
+    assert_eq!(body["timeout_ms"], 300);
+    assert!(body["indexed"].is_object());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn unreachable_clickhouse_is_a_503_not_a_query_error() {
+    let db = TestDb::empty().await;
+    set_sync_state(&db.pool, 10, 10, 10, 1).await;
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut app = app_with_clickhouse(&db.pool, &format!("http://127.0.0.1:{port}")).await;
+    let (status, body) = get(&mut app, &q("SELECT num FROM blocks", "&engine=clickhouse")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["engine"], "clickhouse");
 }

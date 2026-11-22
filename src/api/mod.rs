@@ -950,7 +950,7 @@ async fn handle_query_once(
         // Validated + capped public entry point (never the raw `query`, which
         // is the unvalidated DDL path used by views.rs).
         clickhouse
-            .query_public(&params.sql, &sigs, options.limit, options.timeout_ms)
+            .query_public(&params.sql, &sigs, options.limit, Some(options.timeout_ms))
             .await
             .map(|r| QueryResult {
                 columns: r.columns,

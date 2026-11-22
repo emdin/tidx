@@ -165,6 +165,12 @@ impl Default for QueryOptions {
     }
 }
 
+/// A query stopped by its time limit, on either engine. Typed so callers never
+/// have to guess from error text, which can echo the caller's own SQL.
+#[derive(Debug, thiserror::Error)]
+#[error("query timed out")]
+pub struct QueryTimeout;
+
 /// Open the transaction untrusted `/query` SQL runs in: read-only, with the
 /// caller's timeout, as the unprivileged `tidx_query` role (db/query_role.sql).
 ///
