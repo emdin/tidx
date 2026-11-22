@@ -867,6 +867,8 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "cume_dist",
     // Type casting helpers
     "cast",
+    // ClickHouse: string -> UInt256, 0 when unparsable. Pure conversion.
+    "touint256orzero",
 ];
 
 fn is_allowed_function(name: &str) -> bool {

@@ -316,8 +316,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
             examples: vec![
                 QueryExample {
-                    description: "Kaspa carriers of a given L2 tx, in acceptance order",
-                    sql: "SELECT encode(kaspa_txid,'hex'), accepting_blue_score FROM kaspa_l2_submissions WHERE l2_tx_hash = '\\x<l2-hash-hex>'::bytea ORDER BY accepting_blue_score",
+                    description: "Kaspa carriers of a given L2 tx, in acceptance order (Postgres only: accepting_blue_score is not in ClickHouse)",
+                    sql: "SELECT kaspa_txid, accepting_blue_score FROM kaspa_l2_submissions WHERE l2_tx_hash = '0x<l2-hash-hex>' ORDER BY accepting_blue_score",
                     signature: None,
                 },
             ],
@@ -440,8 +440,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
             examples: vec![
                 QueryExample {
-                    description: "Which canonical block replaced an orphaned one",
-                    sql: "SELECT ob.num, encode(ob.hash,'hex') AS orphaned_hash, encode(b.hash,'hex') AS replaced_by FROM orphaned_blocks ob LEFT JOIN blocks b ON b.num = ob.num WHERE ob.reorg_id = $1",
+                    description: "Which canonical block replaced an orphaned one (put a reorgs.id in place of 123)",
+                    sql: "SELECT ob.num, encode(ob.hash,'hex') AS orphaned_hash, encode(b.hash,'hex') AS replaced_by FROM orphaned_blocks ob LEFT JOIN blocks b ON b.num = ob.num WHERE ob.reorg_id = 123",
                     signature: None,
                 },
             ],
@@ -461,8 +461,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             ],
             examples: vec![
                 QueryExample {
-                    description: "Full history of a tx: canonical or orphaned + depth",
-                    sql: "SELECT 'canonical' AS st, block_num, NULL::bigint AS reorg_id, NULL::int AS depth FROM txs WHERE hash=decode($1,'hex') UNION ALL SELECT 'orphaned', o.block_num, r.id, r.depth FROM orphaned_txs o JOIN reorgs r ON r.id=o.reorg_id WHERE o.hash=decode($1,'hex')",
+                    description: "Full history of a tx: canonical or orphaned + depth (put the tx hash, hex without 0x, in place of abc123...)",
+                    sql: "SELECT 'canonical' AS st, block_num, NULL::bigint AS reorg_id, NULL::int AS depth FROM txs WHERE hash=decode('abc123...','hex') UNION ALL SELECT 'orphaned', o.block_num, r.id, r.depth FROM orphaned_txs o JOIN reorgs r ON r.id=o.reorg_id WHERE o.hash=decode('abc123...','hex')",
                     signature: None,
                 },
             ],
@@ -546,6 +546,24 @@ pub fn tips() -> Vec<&'static str> {
 /// asserts every entry here is actually allowed by the validator.
 pub fn functions_metadata() -> Vec<FunctionInfo> {
     vec![
+        FunctionInfo {
+            name: "startsWith",
+            signature: "startsWith(haystack, prefix) -> bool | endsWith(haystack, suffix) -> bool",
+            returns: "bool",
+            description: "ClickHouse only (engine=clickhouse). Prefix/suffix match on a string column, e.g. startsWith(hash, '0x00'). On Postgres use starts_with(text, text) or LIKE 'prefix%'.",
+        },
+        FunctionInfo {
+            name: "toStartOfDay",
+            signature: "toStartOfDay(ts) | toStartOfHour(ts) | toStartOfWeek(ts) | toStartOfMonth(ts) | toDate(ts)",
+            returns: "DateTime / Date",
+            description: "ClickHouse only (engine=clickhouse). Time buckets for GROUP BY, e.g. SELECT toStartOfDay(block_timestamp) AS day, count() FROM blocks GROUP BY day. On Postgres use date_trunc('day', block_timestamp).",
+        },
+        FunctionInfo {
+            name: "toUInt256OrZero",
+            signature: "toUInt256OrZero(text) -> UInt256",
+            returns: "UInt256",
+            description: "ClickHouse only (engine=clickhouse). Parses a uint256 string column (value, max_fee_per_gas, ...) as a number, 0 if it isn't one. The `_u256` mirror columns usually make it unnecessary.",
+        },
         FunctionInfo {
             name: "abi_uint",
             signature: "abi_uint(bytea) -> numeric | abi_uint(bytea, word_index) -> numeric",
@@ -827,7 +845,8 @@ mod tests {
     fn advertised_functions_are_all_allowed_by_the_validator() {
         for f in functions_metadata() {
             assert!(
-                crate::query::ALLOWED_FUNCTIONS.contains(&f.name),
+                // The validator lowercases names before lookup.
+                crate::query::ALLOWED_FUNCTIONS.contains(&f.name.to_lowercase().as_str()),
                 "function {:?} is advertised by /tables but not in the /query allowlist",
                 f.name
             );
