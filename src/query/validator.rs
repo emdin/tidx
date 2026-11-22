@@ -827,6 +827,9 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "position",
     "strpos",
     "starts_with",
+    // ClickHouse spellings: pure string predicates (no I/O, no settings).
+    "startswith",
+    "endswith",
     "repeat",
     "reverse",
     "to_hex",
@@ -845,6 +848,12 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "to_char",
     "now",
     "age",
+    // ClickHouse time bucketing, used by the /tables examples. Pure arithmetic.
+    "todate",
+    "tostartofhour",
+    "tostartofday",
+    "tostartofweek",
+    "tostartofmonth",
     // Window functions
     "row_number",
     "rank",
