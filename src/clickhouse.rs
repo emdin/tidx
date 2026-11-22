@@ -13,7 +13,7 @@ use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
-    enforce_limit, extract_raw_column_predicates, normalize_hex_literals_clickhouse,
+    enforce_limit_probe, extract_raw_column_predicates, normalize_hex_literals_clickhouse,
     reject_ambiguous_lexing, validate_query_with_cap, EventSignature, SqlEngine,
     HARD_LIMIT_CLICKHOUSE,
 };
@@ -130,24 +130,42 @@ impl ClickHouseEngine {
     /// `engine=clickhouse` could read `system.tables`, and the server runs as
     /// `default` with `readonly=0`. Trusted internal callers that need DDL
     /// (`views.rs`) use `query` directly and are not subject to this.
-    pub fn prepare_public_sql(sql: &str, signatures: &[&str], limit: i64) -> Result<String> {
+    ///
+    /// Returns the SQL and the row limit the server imposed, if any: then one
+    /// extra row is requested so a cut result can be told from one that fit.
+    pub fn prepare_public_sql(
+        sql: &str,
+        signatures: &[&str],
+        limit: i64,
+    ) -> Result<(String, Option<i64>)> {
         reject_ambiguous_lexing(sql, SqlEngine::ClickHouse)?;
         let sql = Self::wrap_signatures(sql, signatures)?;
         validate_query_with_cap(&sql, HARD_LIMIT_CLICKHOUSE)?;
-        Ok(enforce_limit(&sql, limit, HARD_LIMIT_CLICKHOUSE))
+        Ok(enforce_limit_probe(&sql, limit, HARD_LIMIT_CLICKHOUSE))
     }
 
     /// Public `/query` entry point: validated + capped, then executed.
+    /// `timeout_ms` becomes ClickHouse's own `max_execution_time`, so the query
+    /// stops server-side instead of running on after the HTTP client gives up.
     pub async fn query_public(
         &self,
         sql: &str,
         signatures: &[&str],
         limit: i64,
+        timeout_ms: u64,
     ) -> Result<QueryResult> {
-        let sql = Self::prepare_public_sql(sql, signatures, limit)?;
+        let (sql, imposed) = Self::prepare_public_sql(sql, signatures, limit)?;
         // Defense in depth: even if SQL validation is bypassed, run the public
         // query under ClickHouse readonly mode so it cannot INSERT/DDL/write.
-        self.run(&sql, true).await
+        let mut result = self.run(&sql, Some(timeout_ms)).await?;
+        if let Some(n) = imposed
+            && result.rows.len() as i64 > n
+        {
+            result.rows.truncate(n as usize);
+            result.row_count = result.rows.len();
+            result.truncated = true;
+        }
+        Ok(result)
     }
 
     /// Trusted entry point (no validation, no cap) for internal callers such as
@@ -155,7 +173,7 @@ impl ClickHouseEngine {
     /// `query_public`.
     pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
         let sql = Self::wrap_signatures(sql, signatures)?;
-        self.run(&sql, false).await
+        self.run(&sql, None).await
     }
 
     /// Execute already-prepared SQL, failing over across instances on
@@ -164,7 +182,9 @@ impl ClickHouseEngine {
     /// an execution concern for every CH statement: columns are lowercase
     /// 0x-strings compared case-sensitively, so a checksummed literal would
     /// silently match nothing. It is a no-op on DDL.
-    async fn run(&self, sql: &str, readonly: bool) -> Result<QueryResult> {
+    /// `public_timeout_ms`: `Some` for public queries, which run read-only with
+    /// that time limit; `None` for trusted internal ones.
+    async fn run(&self, sql: &str, public_timeout_ms: Option<u64>) -> Result<QueryResult> {
         let sql = normalize_hex_literals_clickhouse(sql);
 
         let start = std::time::Instant::now();
@@ -175,7 +195,7 @@ impl ClickHouseEngine {
             let idx = (starting + attempt) % n;
             let inst = &self.instances[idx];
 
-            match self.try_query(inst, &sql, start, readonly).await {
+            match self.try_query(inst, &sql, start, public_timeout_ms).await {
                 Ok(result) => {
                     if attempt > 0 {
                         self.active.store(idx, Ordering::Relaxed);
@@ -208,11 +228,15 @@ impl ClickHouseEngine {
         inst: &Instance,
         sql: &str,
         start: std::time::Instant,
-        readonly: bool,
+        public_timeout_ms: Option<u64>,
     ) -> Result<QueryResult> {
-        let url = build_query_url(&inst.url, &self.database, readonly);
+        let url = build_query_url(&inst.url, &self.database, public_timeout_ms);
 
-        let creds = if readonly { &inst.public } else { &inst.main };
+        let creds = if public_timeout_ms.is_some() {
+            &inst.public
+        } else {
+            &inst.main
+        };
         let mut req = inst.http_client.post(&url).body(sql.to_string());
         if let Some(ref user) = creds.user {
             req = req.header("X-ClickHouse-User", user);
@@ -242,6 +266,7 @@ impl ClickHouseEngine {
                 row_count: 0,
                 engine: Some("clickhouse".to_string()),
                 query_time_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+                truncated: false,
             });
         }
 
@@ -281,6 +306,7 @@ impl ClickHouseEngine {
             row_count,
             engine: Some("clickhouse".to_string()),
             query_time_ms: Some(elapsed_ms),
+            truncated: false,
         })
     }
 
@@ -301,14 +327,20 @@ impl ClickHouseEngine {
 /// depth behind SQL validation — while still permitting the `default_format`
 /// setting we pass (`readonly=1` would reject that). The trusted internal path
 /// (e.g. `views.rs` DDL) passes `readonly=false` and is unrestricted.
-fn build_query_url(base_url: &str, database: &str, readonly: bool) -> String {
+///
+/// Public queries also carry `max_execution_time` (whole seconds, at least 1)
+/// from the caller's `timeout_ms`, which readonly=2 still allows.
+fn build_query_url(base_url: &str, database: &str, public_timeout_ms: Option<u64>) -> String {
     let mut url = format!(
         "{}/?database={}&default_format=JSON",
         base_url.trim_end_matches('/'),
         database
     );
-    if readonly {
-        url.push_str("&readonly=2");
+    if let Some(ms) = public_timeout_ms {
+        url.push_str(&format!(
+            "&readonly=2&max_execution_time={}",
+            ms.div_ceil(1000).max(1)
+        ));
     }
     url
 }
@@ -332,6 +364,8 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
+    /// See `service::QueryResult::truncated`.
+    pub truncated: bool,
     pub row_count: usize,
     pub engine: Option<String>,
     pub query_time_ms: Option<f64>,
@@ -345,17 +379,32 @@ mod tests {
     fn public_query_url_is_readonly() {
         // The public /query path must run under readonly=2 so a validation
         // bypass still cannot write/DDL (the 2026-10-22 /views abuse).
-        let u = build_query_url("http://clickhouse:8123", "tidx_38833", true);
+        let u = build_query_url("http://clickhouse:8123", "tidx_38833", Some(5000));
         assert!(u.contains("readonly=2"), "public URL not readonly: {u}");
         assert!(u.contains("database=tidx_38833"));
         assert!(u.contains("default_format=JSON"));
+    }
+
+    /// The caller's timeout_ms reaches ClickHouse as max_execution_time (whole
+    /// seconds, rounded up, at least 1); before, it was ignored on ClickHouse.
+    #[test]
+    fn public_query_url_carries_the_callers_timeout() {
+        for (ms, secs) in [(5000, 5), (5001, 6), (200, 1), (30000, 30)] {
+            let u = build_query_url("http://clickhouse:8123", "tidx_38833", Some(ms));
+            assert!(
+                u.ends_with(&format!("max_execution_time={secs}")),
+                "{ms} ms: {u}"
+            );
+        }
+        let trusted = build_query_url("http://clickhouse:8123", "tidx_38833", None);
+        assert!(!trusted.contains("max_execution_time"), "{trusted}");
     }
 
     #[test]
     fn trusted_query_url_is_not_readonly() {
         // The trusted internal path issues DDL (views.rs); it must NOT be
         // readonly. Also check trailing-slash normalization.
-        let u = build_query_url("http://clickhouse:8123/", "tidx_38833", false);
+        let u = build_query_url("http://clickhouse:8123/", "tidx_38833", None);
         assert!(
             !u.contains("readonly"),
             "trusted URL must not be readonly: {u}"
@@ -475,8 +524,12 @@ mod tests {
 
     #[test]
     fn public_sql_appends_caller_page_size_when_no_limit() {
+        // One row more than the page size: a 251st row means the page was cut.
         let sql = ClickHouseEngine::prepare_public_sql("SELECT num FROM blocks", &[], 250).unwrap();
-        assert_eq!(sql, "SELECT num FROM blocks LIMIT 250");
+        assert_eq!(
+            sql,
+            ("SELECT num FROM blocks LIMIT 251".to_string(), Some(250))
+        );
     }
 
     /// Over the CH cap is rejected LOUDLY by the validator (not silently
@@ -503,7 +556,10 @@ mod tests {
     fn public_sql_accepts_limit_between_pg_and_ch_caps() {
         let sql = ClickHouseEngine::prepare_public_sql("SELECT num FROM blocks LIMIT 20000", &[], 100)
             .expect("20000 is within the CH cap and must validate");
-        assert_eq!(sql, "SELECT num FROM blocks LIMIT 20000");
+        assert_eq!(
+            sql,
+            ("SELECT num FROM blocks LIMIT 20000".to_string(), None)
+        );
     }
 
     /// The generated CH CTE uses unhex/reinterpretAsUInt256/reinterpretAsInt256;
@@ -511,21 +567,24 @@ mod tests {
     /// the validator is applied. This is the test that catches a missing one.
     #[test]
     fn public_sql_accepts_signature_cte_and_caps_outer_query() {
-        let sql = ClickHouseEngine::prepare_public_sql("SELECT * FROM Transfer", &[SIG], 100)
+        let (sql, _) = ClickHouseEngine::prepare_public_sql("SELECT * FROM Transfer", &[SIG], 100)
             .expect("the CH signature CTE must pass the allowlist validator");
         assert!(sql.starts_with("WITH "), "CTE wrapped; got: {sql}");
-        assert!(sql.ends_with("LIMIT 100"), "outer query capped; got: {sql}");
+        assert!(
+            sql.ends_with("LIMIT 101"),
+            "outer query capped (+1 probe); got: {sql}"
+        );
     }
 
     #[test]
     fn public_sql_signature_with_pushdown_filter_validates() {
-        let sql = ClickHouseEngine::prepare_public_sql(
+        let (sql, _) = ClickHouseEngine::prepare_public_sql(
             "SELECT count(*) FROM Transfer WHERE \"to\" = '0xC281cb25715EA8e46c9B916F22aE7c0F55b014d7'",
             &[SIG],
             100,
         )
         .expect("pushdown-rewritten signature query must validate");
-        assert!(sql.contains("LIMIT 100"), "got: {sql}");
+        assert!(sql.contains("LIMIT 101"), "got: {sql}");
     }
 
     // ---- which ClickHouse user each path authenticates as ----
@@ -584,7 +643,7 @@ mod tests {
         };
         let engine = ClickHouseEngine::new(&config, 38833).unwrap();
 
-        engine.query_public("SELECT num FROM blocks", &[], 10).await.unwrap();
+        engine.query_public("SELECT num FROM blocks", &[], 10, 5000).await.unwrap();
         assert_eq!(users.recv().await.unwrap().as_deref(), Some("tidx_query"));
 
         engine.query("SELECT 1", &[]).await.unwrap();
@@ -602,7 +661,7 @@ mod tests {
         };
         let engine = ClickHouseEngine::new(&config, 38833).unwrap();
 
-        engine.query_public("SELECT num FROM blocks", &[], 10).await.unwrap();
+        engine.query_public("SELECT num FROM blocks", &[], 10, 5000).await.unwrap();
         assert_eq!(users.recv().await.unwrap().as_deref(), Some("tidx"));
     }
 }

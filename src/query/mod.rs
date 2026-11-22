@@ -36,10 +36,17 @@ use std::ops::ControlFlow;
 /// or lowered to the cap) it asks for one row more, so the caller can tell a
 /// cut result from one that fit. Returns the limit the server imposed.
 pub fn enforce_limit_probe(sql: &str, append_if_missing: i64, cap: i64) -> (String, Option<i64>) {
-    (enforce_limit(sql, append_if_missing, cap), None)
+    rewrite_limit(sql, append_if_missing, cap, 1)
 }
 
 pub fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
+    rewrite_limit(sql, append_if_missing, cap, 0).0
+}
+
+/// Appends `append_if_missing` when there is no LIMIT and lowers a LIMIT above
+/// `cap` (or a non-literal one) to `cap`, each plus `extra`. Returns the SQL and
+/// the limit the server imposed, if it imposed one.
+fn rewrite_limit(sql: &str, append_if_missing: i64, cap: i64, extra: i64) -> (String, Option<i64>) {
     use sqlparser::ast::{Expr, LimitClause, Statement, Value};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -58,32 +65,36 @@ pub fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
 
     let mut stmts = match Parser::parse_sql(&GenericDialect {}, sql) {
         Ok(s) if s.len() == 1 => s,
-        _ => return sql.to_string(),
+        _ => return (sql.to_string(), None),
     };
 
+    let mut imposed = None;
     if let Statement::Query(q) = &mut stmts[0] {
         match &mut q.limit_clause {
             None => {
                 q.limit_clause = Some(LimitClause::LimitOffset {
-                    limit: Some(num(append_if_missing)),
+                    limit: Some(num(append_if_missing + extra)),
                     offset: None,
                     limit_by: Vec::new(),
                 });
+                imposed = Some(append_if_missing);
             }
             Some(LimitClause::LimitOffset { limit, .. }) => {
                 if limit.as_ref().and_then(literal).is_none_or(|n| n > cap) {
-                    *limit = Some(num(cap));
+                    *limit = Some(num(cap + extra));
+                    imposed = Some(cap);
                 }
             }
             Some(LimitClause::OffsetCommaLimit { limit, .. }) => {
                 if literal(limit).is_none_or(|n| n > cap) {
-                    *limit = num(cap);
+                    *limit = num(cap + extra);
+                    imposed = Some(cap);
                 }
             }
         }
     }
 
-    stmts[0].to_string()
+    (stmts[0].to_string(), imposed)
 }
 
 /// The hex body of `s` if it is an address/topic/hash literal: `0x` plus 40+

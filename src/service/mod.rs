@@ -145,6 +145,10 @@ pub struct QueryResult {
     /// Server-side query execution time in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_time_ms: Option<f64>,
+    /// The server's row cap cut the result: more rows matched than returned.
+    /// A LIMIT the caller wrote never counts.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 pub struct QueryOptions {
@@ -233,8 +237,10 @@ pub async fn execute_query_postgres(
     // Validate query (after CTE wrapping so signature-derived table names are valid)
     validate_query(&sql)?;
 
-    // Append a LIMIT when absent and clamp any explicit LIMIT to the cap.
-    let sql = crate::query::enforce_limit(&sql, options.limit, HARD_LIMIT_MAX);
+    // Append a LIMIT when absent and clamp any explicit LIMIT to the cap. When
+    // the server imposes it, one extra row is fetched to tell a cut result from
+    // one that fit.
+    let (sql, imposed) = crate::query::enforce_limit_probe(&sql, options.limit, HARD_LIMIT_MAX);
 
     // Convert '0x...' hex literals to '\x...' bytea literals for PostgreSQL
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
@@ -283,8 +289,14 @@ pub async fn execute_query_postgres(
             row_count: 0,
             engine: Some("postgres".to_string()),
             query_time_ms: Some(elapsed_ms),
+            truncated: false,
         });
     }
+    let truncated = imposed.is_some_and(|n| rows.len() as i64 > n);
+    let rows = match imposed {
+        Some(n) if truncated => &rows[..n as usize],
+        _ => &rows[..],
+    };
     let row_count = rows.len();
     metrics::record_query_rows(row_count as u64);
 
@@ -303,6 +315,7 @@ pub async fn execute_query_postgres(
         row_count,
         engine: Some("postgres".to_string()),
         query_time_ms: Some(elapsed_ms),
+        truncated,
     })
 }
 

@@ -73,6 +73,81 @@ pub struct AppState {
     pub query_limiter: Option<Arc<RateLimiter>>,
     /// Shared secret the admin endpoints require on top of the IP check.
     pub admin_token: AdminToken,
+    /// Per-chain `Indexed`, refreshed at most every `FRESHNESS_TTL`.
+    pub freshness: Freshness,
+}
+
+pub type Freshness = Arc<std::sync::Mutex<HashMap<u64, (std::time::Instant, Indexed)>>>;
+
+/// `/query` callers may raise `timeout_ms` up to this.
+pub const MAX_TIMEOUT_MS: u64 = 30_000;
+
+const FRESHNESS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How fresh each engine is, in every `/query` response. After the 2026-10-18
+/// reboot the ClickHouse sink was off for 4.5 days and no response showed it.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Indexed {
+    /// Newest chain block the indexer has seen.
+    pub chain_head: Option<i64>,
+    /// Seconds since the indexer last updated that; large means it stalled.
+    pub chain_head_age_secs: Option<i64>,
+    /// Newest block in Postgres.
+    pub postgres_head: Option<i64>,
+    /// Postgres has every block up to here.
+    pub postgres_contiguous: Option<i64>,
+    /// Newest block in ClickHouse; null without ClickHouse or when unreadable.
+    pub clickhouse_head: Option<i64>,
+}
+
+impl AppState {
+    /// Cached for a few seconds; anything unreadable is left null rather than
+    /// failing the query it accompanies.
+    pub async fn indexed(&self, chain_id: u64) -> Indexed {
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some((at, ix)) = self.freshness.lock().unwrap().get(&chain_id)
+            && at.elapsed() < FRESHNESS_TTL
+        {
+            return ix.clone();
+        }
+        let mut ix = Indexed::default();
+        if let Some(pool) = self.get_pool(Some(chain_id)).await {
+            let read = async {
+                let conn = pool.get().await?;
+                let row = conn
+                    .query_opt(
+                        "SELECT head_num, tip_num, synced_num,
+                                extract(epoch FROM now() - updated_at)::int8
+                         FROM sync_state WHERE chain_id = $1",
+                        &[&(chain_id as i64)],
+                    )
+                    .await?;
+                anyhow::Ok(row)
+            };
+            if let Ok(Ok(Some(row))) = tokio::time::timeout(READ_TIMEOUT, read).await {
+                ix.chain_head = row.get(0);
+                ix.postgres_head = row.get(1);
+                ix.postgres_contiguous = row.get(2);
+                ix.chain_head_age_secs = row.get(3);
+            }
+        }
+        if let Some(ch) = self.get_clickhouse(Some(chain_id)).await
+            && let Ok(Ok(r)) =
+                tokio::time::timeout(READ_TIMEOUT, ch.query("SELECT max(num) FROM blocks", &[]))
+                    .await
+        {
+            // The compatibility profile returns 64-bit integers as strings.
+            ix.clickhouse_head = r.rows.first().and_then(|row| row.first()).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            });
+        }
+        self.freshness
+            .lock()
+            .unwrap()
+            .insert(chain_id, (std::time::Instant::now(), ix.clone()));
+        ix
+    }
 }
 
 /// Admin endpoints trust the effective client IP, and every container on
@@ -310,6 +385,7 @@ pub fn router_with_options(
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
         kaspa_explorer_base_url: http_config.kaspa_explorer_base_url.clone(),
+        freshness: Freshness::default(),
     };
 
     build_router(state)
@@ -340,6 +416,7 @@ pub fn router_shared(
         clickhouse_engines,
         trusted_cidrs,
         kaspa_explorer_base_url,
+        freshness: Freshness::default(),
     };
 
     build_router(state)
@@ -759,6 +836,7 @@ struct QueryResponse {
     #[serde(flatten)]
     result: QueryResult,
     ok: bool,
+    indexed: Indexed,
 }
 
 async fn handle_query(
@@ -829,9 +907,7 @@ async fn dispatch_query(state: AppState, params: QueryParams, signatures: Vec<St
             .await
             .into_response()
     } else {
-        handle_query_once(state, params, signatures)
-            .await
-            .into_response()
+        handle_query_once(state, params, signatures).await
     }
 }
 
@@ -839,41 +915,42 @@ async fn handle_query_once(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
-) -> Result<Json<QueryResponse>, ApiError> {
-    let pool = state
-        .get_pool(Some(params.chain_id))
-        .await
-        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id,)))?;
+) -> Response {
+    let Some(pool) = state.get_pool(Some(params.chain_id)).await else {
+        return ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id))
+            .into_response();
+    };
 
     // Engine-specific row cap: ClickHouse handles wider result sets, so callers
     // who explicitly opt into it via ?engine=clickhouse get HARD_LIMIT_CLICKHOUSE.
     let cap = crate::query::engine_limit_cap(params.engine.as_deref());
     let options = QueryOptions {
-        timeout_ms: params.timeout_ms.clamp(100, 30000),
+        timeout_ms: params.timeout_ms.clamp(100, MAX_TIMEOUT_MS),
         limit: params.limit.clamp(1, cap),
     };
 
-    // Route to appropriate engine
+    // Postgres unless the caller asks for ClickHouse.
     let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
-
+    let engine = if use_clickhouse {
+        "clickhouse"
+    } else {
+        "postgres"
+    };
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
+    let started = std::time::Instant::now();
     let result = if use_clickhouse {
-        // Use ClickHouse engine for OLAP queries
-        let clickhouse = state
-            .get_clickhouse(Some(params.chain_id))
-            .await
-            .ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "ClickHouse not configured for chain_id: {}",
-                    params.chain_id
-                ))
-            })?;
-
+        let Some(clickhouse) = state.get_clickhouse(Some(params.chain_id)).await else {
+            return ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+            .into_response();
+        };
         // Validated + capped public entry point (never the raw `query`, which
         // is the unvalidated DDL path used by views.rs).
         clickhouse
-            .query_public(&params.sql, &sigs, options.limit)
+            .query_public(&params.sql, &sigs, options.limit, options.timeout_ms)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
@@ -881,22 +958,75 @@ async fn handle_query_once(
                 row_count: r.row_count,
                 engine: r.engine,
                 query_time_ms: r.query_time_ms,
+                truncated: r.truncated,
             })
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
-        // Use PostgreSQL
-        crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("timeout") {
-                    ApiError::Timeout
-                } else {
-                    ApiError::QueryError(e.to_string())
-                }
-            })?
+        crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options).await
     };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let indexed = state.indexed(params.chain_id).await;
 
-    Ok(Json(QueryResponse { result, ok: true }))
+    match result {
+        Ok(result) => Json(QueryResponse {
+            result,
+            ok: true,
+            indexed,
+        })
+        .into_response(),
+        Err(e) => query_failure(
+            &e.to_string(),
+            engine,
+            options.timeout_ms,
+            elapsed_ms,
+            indexed,
+        ),
+    }
+}
+
+/// Postgres: our own deadline ("Query timeout") or its statement_timeout
+/// cancel. ClickHouse: max_execution_time (TIMEOUT_EXCEEDED). Narrow on
+/// purpose: an error that merely echoes SQL containing "timeout" is not one.
+fn is_timeout(msg: &str) -> bool {
+    [
+        "Query timeout",
+        "statement timeout",
+        "TIMEOUT_EXCEEDED",
+        "Timeout exceeded",
+        "operation timed out",
+    ]
+    .iter()
+    .any(|p| msg.contains(p))
+}
+
+/// A failed `/query`: the database's own error text, which engine ran it, how
+/// long it took, and the same freshness as a successful response. A timeout
+/// also says what to try instead.
+fn query_failure(
+    msg: &str,
+    engine: &str,
+    timeout_ms: u64,
+    elapsed_ms: f64,
+    indexed: Indexed,
+) -> Response {
+    if is_timeout(msg) {
+        let hint = if engine == "postgres" {
+            "Postgres reads every matching row, so aggregations over busy addresses or long ranges are much faster with engine=clickhouse."
+        } else {
+            "Narrow the block or time range, or aggregate more coarsely."
+        };
+        let error = format!(
+            "Query timed out after {elapsed_ms:.0} ms on {engine} (timeout_ms={timeout_ms}; the maximum is {MAX_TIMEOUT_MS}). {hint}"
+        );
+        let body = serde_json::json!({
+            "ok": false, "error": error, "engine": engine,
+            "timeout_ms": timeout_ms, "elapsed_ms": elapsed_ms, "indexed": indexed,
+        });
+        return (StatusCode::REQUEST_TIMEOUT, Json(body)).into_response();
+    }
+    let body = serde_json::json!({
+        "ok": false, "error": msg, "engine": engine, "elapsed_ms": elapsed_ms, "indexed": indexed,
+    });
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
 }
 
 type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>>;
@@ -928,10 +1058,11 @@ async fn handle_query_live(
     // HARD_LIMIT_MAX. Using engine_limit_cap keeps the call site uniform.
     let cap = crate::query::engine_limit_cap(params.engine.as_deref());
     let options = QueryOptions {
-        timeout_ms: params.timeout_ms.clamp(100, 30000),
+        timeout_ms: params.timeout_ms.clamp(100, MAX_TIMEOUT_MS),
         limit: params.limit.clamp(1, cap),
     };
 
+    let chain_id = params.chain_id;
     let stream = async_stream::stream! {
         let mut last_block_num: u64 = 0;
         let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
@@ -941,7 +1072,7 @@ async fn handle_query_live(
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
-                    .json_data(QueryResponse { result, ok: true })
+                    .json_data(QueryResponse { result, ok: true, indexed: state.indexed(chain_id).await })
                     .unwrap());
             }
             Err(e) => {
@@ -1001,7 +1132,7 @@ async fn handle_query_live(
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
-                                    .json_data(QueryResponse { result, ok: true })
+                                    .json_data(QueryResponse { result, ok: true, indexed: state.indexed(chain_id).await })
                                     .unwrap());
                             }
                             Err(e) => {
@@ -1192,6 +1323,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(trusted_cidrs),
             kaspa_explorer_base_url: "https://kaspa.stream".to_string(),
+            freshness: Freshness::default(),
             query_limiter: None,
             admin_token: AdminToken::NotRequired,
         }

@@ -202,7 +202,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
         },
         TableInfo {
             name: "l2_withdrawals",
-            description: "L2 withdrawals exiting to Kaspa L1 (Engine API withdrawals field). Stores both EVM gwei and Kaspa sompi amounts.",
+            description: "Entries into Igra from Kaspa L1 (deposits), despite the name: Igra delivers each L1→L2 entry as an EIP-4895 withdrawal-style credit in the block's Engine API `withdrawals` field. One row per credit, in both EVM gwei and Kaspa sompi. `kaspa_txid` links the Kaspa transaction that made the entry; join `kaspa_entries` on it for the L1 sender (`l1_senders`).",
             engines: pg_ch(),
             columns: vec![
                 col("block_num", "INT8", "Block number containing the withdrawal"),
@@ -210,14 +210,16 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 col("idx", "INT4", "Withdrawal index within the block"),
                 col("withdrawal_index", "TEXT / String", "Withdrawal sequence number (uint64 as text)"),
                 col("validator_index", "TEXT / String", "Validator index (uint64 as text)"),
+                col("index_le", "BYTEA / String", "The withdrawal index as little-endian bytes. Equals the last 8 bytes of the entry's Kaspa transaction id."),
                 col("address", "BYTEA / String", "Recipient L2 address"),
                 col("amount_gwei", "INT8", "Amount in EVM gwei (1e-9 ETH)"),
-                col("amount_sompi", "INT8", "Amount in Kaspa sompi (1e-8 KAS) — what actually exits to L1"),
+                col("amount_sompi", "INT8", "Amount in Kaspa sompi (1e-8 KAS) credited to the recipient"),
+                col("kaspa_txid", "BYTEA (Postgres only)", "Kaspa transaction id of the entry; NULL while that transaction is not yet in `kaspa_entries`. Linked by index_le."),
             ],
             examples: vec![
                 QueryExample {
-                    description: "Daily withdrawal totals (CH)",
-                    sql: "SELECT toStartOfDay(block_timestamp) AS day, count() AS withdrawals, sum(amount_sompi) AS total_sompi FROM l2_withdrawals GROUP BY day ORDER BY day DESC",
+                    description: "Daily entry totals (CH)",
+                    sql: "SELECT toStartOfDay(block_timestamp) AS day, count() AS entries, sum(amount_sompi) AS total_sompi FROM l2_withdrawals GROUP BY day ORDER BY day DESC",
                 },
             ],
         },
@@ -503,8 +505,10 @@ pub fn tables_metadata() -> Vec<TableInfo> {
 pub fn tips() -> Vec<&'static str> {
     vec![
         "Filter logs by event signature without manually hashing topic0: append `?signature=Transfer(address,address,uint256)` and SELECT FROM the event name as if it were a table — e.g., SELECT * FROM Transfer WHERE topic1 = decode('...','hex')",
-        "Pagination: ORDER BY a stable key (block_num DESC, idx) and use LIMIT/OFFSET. Postgres caps each page at 10000 rows; ClickHouse caps at 50000 (use ?engine=clickhouse).",
-        "Force the engine with ?engine=postgres or ?engine=clickhouse. Default routing picks one based on the query shape; CH is faster for analytical scans, PG for point lookups.",
+        "Pagination: Postgres caps each page at 10000 rows, ClickHouse at 50000 (?engine=clickhouse). A response cut at the cap has `truncated: true`; a LIMIT you write never counts. Page by a stable key rather than a growing OFFSET: ORDER BY block_num DESC, idx and continue with WHERE (block_num, idx) < (last_block_num, last_idx).",
+        "Engine: Postgres unless you add ?engine=clickhouse (or \"engine\": \"clickhouse\" in a POST body). Postgres suits point lookups; aggregations over busy addresses or long ranges can time out there but take well under a second on ClickHouse. Timeouts default to 5 s; raise with timeout_ms (max 30000).",
+        "Long SQL (big IN lists): POST the same fields as JSON — {\"chainId\": 38833, \"sql\": \"...\", \"engine\": \"clickhouse\"} — instead of putting the SQL in the URL.",
+        "Freshness: every /query response has `indexed` — chain_head, chain_head_age_secs (large means the indexer stalled), postgres_head, postgres_contiguous and clickhouse_head. The two engines can lag differently; check the one you query.",
         "uint256 columns (value, max_fee_per_gas, effective_gas_price) are stored as strings for portability. ClickHouse also has UInt256 mirror columns (`value_u256`, `max_fee_per_gas_u256`, `max_priority_fee_per_gas_u256`, `effective_gas_price_u256`) so you can write `WHERE value_u256 > 1000000000000000000` directly without `toUInt256OrZero()`. Postgres: cast the string columns with `::numeric` for arithmetic.",
         "BYTEA columns: filter via decode('hex_no_prefix','hex'); display via encode(col,'hex'). In ClickHouse the same columns are hex-prefixed strings (e.g., '0xabc...') so LIKE '0xprefix%' works directly.",
         "Internal calls (CALL, DELEGATECALL, CREATE, etc.) made by contracts inside a tx are indexed in `internal_txs` — captured from debug_traceTransaction's callTracer. Use it to find ERC-20 transfers performed by routers, internal value moves, or to reconstruct a tx's full call tree via (tx_hash, path_idx).",
@@ -583,7 +587,7 @@ fn limits() -> Limits {
         max_rows_postgres: crate::query::HARD_LIMIT_MAX,
         max_rows_clickhouse: crate::query::HARD_LIMIT_CLICKHOUSE,
         default_timeout_ms: 5000,
-        max_timeout_ms: 30000,
+        max_timeout_ms: crate::api::MAX_TIMEOUT_MS,
         max_query_bytes: 65_536,
         select_only: true,
         methods: vec!["GET", "POST"],
