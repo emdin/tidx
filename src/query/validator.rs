@@ -827,6 +827,9 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "position",
     "strpos",
     "starts_with",
+    // ClickHouse spellings: pure string predicates (no I/O, no settings).
+    "startswith",
+    "endswith",
     "repeat",
     "reverse",
     "to_hex",
@@ -845,6 +848,12 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "to_char",
     "now",
     "age",
+    // ClickHouse time bucketing, used by the /tables examples. Pure arithmetic.
+    "todate",
+    "tostartofhour",
+    "tostartofday",
+    "tostartofweek",
+    "tostartofmonth",
     // Window functions
     "row_number",
     "rank",
@@ -858,6 +867,8 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "cume_dist",
     // Type casting helpers
     "cast",
+    // ClickHouse: string -> UInt256, 0 when unparsable. Pure conversion.
+    "touint256orzero",
 ];
 
 fn is_allowed_function(name: &str) -> bool {

@@ -4,6 +4,8 @@ mod rate_limit;
 mod tables;
 mod views;
 
+pub use tables::tables_metadata;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
