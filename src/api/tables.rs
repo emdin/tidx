@@ -525,13 +525,13 @@ pub fn functions_metadata() -> Vec<FunctionInfo> {
             name: "abi_uint",
             signature: "abi_uint(bytea) -> numeric | abi_uint(bytea, word_index) -> numeric",
             returns: "numeric",
-            description: "Decode a big-endian ABI uint. The 1-arg form reads the WHOLE buffer as one integer (correct only for single-word data, e.g. ERC-20 Transfer); the 2-arg form reads the 0-based 32-byte word. NOTE: the JSON response renders numeric via a 96-bit decimal and returns null for values >= 2^96 — use format_uint for display of large values.",
+            description: "Decode a big-endian ABI uint. The 1-arg form reads the WHOLE buffer as one integer (correct only for single-word data, e.g. ERC-20 Transfer); the 2-arg form reads the 0-based 32-byte word.",
         },
         FunctionInfo {
             name: "format_uint",
             signature: "format_uint(bytea) -> text | format_uint(bytea, word_index) -> text",
             returns: "text",
-            description: "Same decode as abi_uint but returns text, so full uint256 (up to 2^256-1) round-trips through the API without the 2^96 null ceiling. Prefer this when returning amounts.",
+            description: "Same decode as abi_uint but returns text. Both return the exact value at any size (numeric comes back as a decimal string).",
         },
         FunctionInfo {
             name: "abi_address",

@@ -176,3 +176,54 @@ async fn public_query_returns_jsonb_and_names_a_column_it_cannot_render() {
         "{msg}"
     );
 }
+
+/// Seeded random values over wide ranges: mixed signs, scales up to 30, up to
+/// ~250 digits, intervals mixing every field with both signs.
+#[tokio::test]
+#[serial(db)]
+async fn numeric_and_interval_match_postgres_on_generated_values() {
+    let db = TestDb::empty().await;
+    let conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET IntervalStyle = 'postgres'; SELECT setseed(0.42)")
+        .await
+        .unwrap();
+    let rows = conn
+        .query(
+            "SELECT v, v::text FROM (
+               SELECT round(((random() - 0.5)::numeric * 10::numeric ^ (trunc(random() * 60) - 30)::numeric) ^ (1 + trunc(random() * 4))::numeric,
+                            trunc(random() * 30)::int) AS v
+               FROM generate_series(1, 2000)) t",
+            &[],
+        )
+        .await
+        .unwrap();
+    for row in &rows {
+        let text: String = row.get(1);
+        assert_eq!(
+            format_column_json(row, 0),
+            Value::String(text.clone()),
+            "numeric {text}"
+        );
+    }
+    let rows = conn
+        .query(
+            "SELECT v, v::text FROM (
+               SELECT make_interval(years => (random() * 20 - 10)::int, months => (random() * 30 - 15)::int,
+                                    days => (random() * 60 - 30)::int, hours => (random() * 100 - 50)::int,
+                                    mins => (random() * 120 - 60)::int,
+                                    secs => round((random() * 120 - 60)::numeric, (random() * 6)::int)::float8)
+                      * (random() < 0.2)::int AS v
+               FROM generate_series(1, 1000)) t",
+            &[],
+        )
+        .await
+        .unwrap();
+    for row in &rows {
+        let text: String = row.get(1);
+        assert_eq!(
+            format_column_json(row, 0),
+            Value::String(text.clone()),
+            "interval {text}"
+        );
+    }
+}
