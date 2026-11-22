@@ -7,26 +7,30 @@
 //! 2026-11-06 incident went through `/query`), so additions are pure functions
 //! only, and the dangerous neighbours are pinned as blocked.
 
-use tidx::api::tables::tables_metadata;
+use tidx::api::tables_metadata;
 use tidx::clickhouse::ClickHouseEngine;
-use tidx::query::{HARD_LIMIT_CLICKHOUSE, validate_query, validate_query_with_cap};
+use tidx::query::{HARD_LIMIT_CLICKHOUSE, validate_query};
+use tidx::service::prepare_public_sql_postgres;
 
+/// Each example goes through the same preparation `/query` gives it (lexing
+/// guard, `?signature=` wrapping, allowlist) on every engine its table lists.
 #[test]
 fn every_example_published_in_tables_passes_the_query_checker() {
     let mut failing = Vec::new();
     for t in tables_metadata() {
         for e in &t.examples {
-            // A `?signature=` example queries the event as a table; the API
-            // wraps it in a CTE first, so it is checked the same way.
-            let checked = match e.signature {
-                Some(sig) => {
-                    ClickHouseEngine::prepare_public_sql(e.sql, &[sig], HARD_LIMIT_CLICKHOUSE)
-                        .map(|_| ())
+            let sigs: Vec<&str> = e.signature.into_iter().collect();
+            for engine in &t.engines {
+                let checked = match *engine {
+                    "clickhouse" => {
+                        ClickHouseEngine::prepare_public_sql(e.sql, &sigs, HARD_LIMIT_CLICKHOUSE)
+                            .map(|_| ())
+                    }
+                    _ => prepare_public_sql_postgres(e.sql, &sigs).map(|_| ()),
+                };
+                if let Err(err) = checked {
+                    failing.push(format!("{} / {} on {engine}: {err}", t.name, e.description));
                 }
-                None => validate_query_with_cap(e.sql, HARD_LIMIT_CLICKHOUSE),
-            };
-            if let Err(err) = checked {
-                failing.push(format!("{} / {}: {err}", t.name, e.description));
             }
         }
     }

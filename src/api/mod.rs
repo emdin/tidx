@@ -1,8 +1,10 @@
 mod explorer;
 mod explorer_api;
 mod rate_limit;
-pub mod tables;
+mod tables;
 mod views;
+
+pub use tables::tables_metadata;
 
 use std::collections::HashMap;
 use std::convert::Infallible;

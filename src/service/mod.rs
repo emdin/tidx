@@ -201,13 +201,10 @@ pub async fn begin_public_query(
     Ok(tx)
 }
 
-/// Execute a query on PostgreSQL.
-pub async fn execute_query_postgres(
-    pool: &Pool,
-    sql: &str,
-    signatures: &[&str],
-    options: &QueryOptions,
-) -> Result<QueryResult> {
+/// Everything the public `/query` path does to untrusted SQL before it reaches
+/// Postgres, apart from the row limit: the lexing guard, `?signature=` CTE
+/// wrapping, then the allowlist. Mirrors `ClickHouseEngine::prepare_public_sql`.
+pub fn prepare_public_sql_postgres(sql: &str, signatures: &[&str]) -> Result<String> {
     crate::query::reject_ambiguous_lexing(sql, crate::query::SqlEngine::Postgres)?;
 
     // Generate CTE SQL if signatures are provided
@@ -242,6 +239,17 @@ pub async fn execute_query_postgres(
 
     // Validate query (after CTE wrapping so signature-derived table names are valid)
     validate_query(&sql)?;
+    Ok(sql)
+}
+
+/// Execute a query on PostgreSQL.
+pub async fn execute_query_postgres(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    let sql = prepare_public_sql_postgres(sql, signatures)?;
 
     // Append a LIMIT when absent and clamp any explicit LIMIT to the cap. When
     // the server imposes it, one extra row is fetched to tell a cut result from
