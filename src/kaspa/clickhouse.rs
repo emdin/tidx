@@ -40,21 +40,25 @@ impl KaspaClickHouseMirror {
             .execute()
             .await
             .map_err(|e| anyhow!("failed to create ClickHouse kaspa_entries: {e}"))?;
-        if let Ok(Some(key)) = self.stale_l2_sorting_key().await {
-            tracing::warn!(
-                sorting_key = %key,
-                "ClickHouse kaspa_l2_submissions keeps one Kaspa carrier per L2 tx; \
+        match self.rebuild_reasons().await {
+            Ok(reasons) if reasons.is_empty() => {}
+            Ok(reasons) => tracing::warn!(
+                reasons = %reasons.join("; "),
+                "ClickHouse Kaspa tables predate (l2_tx_hash, kaspa_txid) keys and 0x hex; \
                  run deploy/prod/ch-resync-kaspa.sh --rebuild"
-            );
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not check the ClickHouse Kaspa tables"),
         }
         Ok(())
     }
 
-    /// The sorting key of a `kaspa_l2_submissions` made before the key became
-    /// (l2_tx_hash, kaspa_txid); `CREATE TABLE IF NOT EXISTS` leaves such a
-    /// table as it was, still merging an L2 tx's carriers into one row.
-    /// Rebuilding it needs Postgres, so startup only warns.
-    pub async fn stale_l2_sorting_key(&self) -> Result<Option<String>> {
+    /// Why the Kaspa tables need `ch-resync-kaspa.sh --rebuild`, if they do:
+    /// `CREATE TABLE IF NOT EXISTS` leaves a table from before the 2026-11
+    /// change as it was, with kaspa_l2_submissions keyed on l2_tx_hash alone
+    /// (one carrier per L2 tx) and hex without 0x. Rebuilding needs Postgres,
+    /// so startup only warns.
+    pub async fn rebuild_reasons(&self) -> Result<Vec<String>> {
+        let mut reasons = Vec::new();
         let key = self
             .client
             .query(
@@ -63,7 +67,29 @@ impl KaspaClickHouseMirror {
             )
             .fetch_optional::<String>()
             .await?;
-        Ok(key.filter(|k| k != L2_SORTING_KEY))
+        if let Some(key) = key.filter(|k| k != L2_SORTING_KEY) {
+            reasons.push(format!("kaspa_l2_submissions is keyed on ({key})"));
+        }
+        for (table, bare) in [
+            (
+                "kaspa_l2_submissions",
+                "NOT startsWith(l2_tx_hash, '0x') OR NOT startsWith(kaspa_txid, '0x')",
+            ),
+            (
+                "kaspa_entries",
+                "NOT startsWith(kaspa_txid, '0x') OR NOT startsWith(recipient, '0x')",
+            ),
+        ] {
+            let found = self
+                .client
+                .query(&format!("SELECT 1 FROM {table} WHERE {bare} LIMIT 1"))
+                .fetch_optional::<u8>()
+                .await?;
+            if found.is_some() {
+                reasons.push(format!("{table} has hex without 0x"));
+            }
+        }
+        Ok(reasons)
     }
 
     pub async fn write_l2_submissions(&self, rows: &[FinalL2Submission]) -> Result<()> {

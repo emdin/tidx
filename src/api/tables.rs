@@ -287,8 +287,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             description: "Confirmed Kaspa L1 transactions that carried an L2 tx to Igra. Promoted from kaspa_pending_l2_submissions after the configured finality delay (60 s on mainnet). One L2 tx can have several L1 carriers (one row each).",
             engines: pg_ch(),
             columns: vec![
-                col("l2_tx_hash", "BYTEA / String", "L2 transaction hash committed by this Kaspa tx"),
-                col("kaspa_txid", "BYTEA / String", "Kaspa L1 transaction id (32 bytes, prefixed `97b1...`)"),
+                col("l2_tx_hash", "BYTEA / String", "L2 transaction hash committed by this Kaspa tx; `0x...` hex on both engines"),
+                col("kaspa_txid", "BYTEA / String", "Kaspa L1 transaction id (32 bytes, `0x97b1...`)"),
                 col("accepting_block_hash", "BYTEA", "Kaspa chain block that accepted the tx (PG only; NULL until enriched)"),
                 col("accepting_blue_score", "INT8", "Blue score of the accepting block; orders multiple carriers of one L2 tx, equal = same accepting block (PG only; NULL until enriched)"),
                 col("l1_senders", "TEXT[]", "Kaspa addresses of the carrier's inputs (PG only)"),
@@ -307,8 +307,8 @@ pub fn tables_metadata() -> Vec<TableInfo> {
             description: "Confirmed Kaspa L1 entries (native iKAS deposits to Igra). Promoted from kaspa_pending_entries after finality delay.",
             engines: pg_ch(),
             columns: vec![
-                col("kaspa_txid", "BYTEA / String", "Kaspa L1 transaction id"),
-                col("recipient", "BYTEA / String", "L2 address receiving the iKAS"),
+                col("kaspa_txid", "BYTEA / String", "Kaspa L1 transaction id (`0x97b1...`)"),
+                col("recipient", "BYTEA / String", "L2 address receiving the iKAS; `0x...` hex on both engines"),
                 col("amount_sompi", "INT8", "Deposit amount in Kaspa sompi"),
                 col("accepting_block_hash", "BYTEA", "Kaspa chain block that accepted the entry (PG only; NULL until enriched)"),
                 col("accepting_blue_score", "INT8", "Blue score of the accepting block (PG only; NULL until enriched)"),

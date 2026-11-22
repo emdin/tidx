@@ -116,11 +116,18 @@ async fn hashes_and_addresses_are_0x_hex_like_every_other_clickhouse_table() {
 
 #[tokio::test]
 #[serial(clickhouse)]
-async fn a_table_with_the_old_key_is_reported() {
+async fn tables_from_before_the_change_are_reported() {
     let Some((ch, mirror)) = fresh_mirror().await else {
         return;
     };
-    assert_eq!(mirror.stale_l2_sorting_key().await.unwrap(), None);
+    mirror
+        .write_l2_submissions(&[carrier(0xab, 0xcd)])
+        .await
+        .unwrap();
+    assert_eq!(
+        mirror.rebuild_reasons().await.unwrap(),
+        Vec::<String>::new()
+    );
 
     ch.query("DROP TABLE kaspa_l2_submissions").await.unwrap();
     ch.query(
@@ -129,9 +136,23 @@ async fn a_table_with_the_old_key_is_reported() {
     )
     .await
     .unwrap();
+    ch.query("INSERT INTO kaspa_entries SELECT '0x97b1', 'ee', 1, now64(3)")
+        .await
+        .unwrap();
     mirror.ensure_schema().await.unwrap();
     assert_eq!(
-        mirror.stale_l2_sorting_key().await.unwrap().as_deref(),
-        Some("l2_tx_hash")
+        mirror.rebuild_reasons().await.unwrap(),
+        [
+            "kaspa_l2_submissions is keyed on (l2_tx_hash)",
+            "kaspa_entries has hex without 0x",
+        ]
+    );
+
+    ch.query("INSERT INTO kaspa_l2_submissions SELECT 'ab', '0xcd', now64(3)")
+        .await
+        .unwrap();
+    assert_eq!(
+        mirror.rebuild_reasons().await.unwrap()[1],
+        "kaspa_l2_submissions has hex without 0x"
     );
 }
