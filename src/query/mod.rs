@@ -32,20 +32,16 @@ use std::ops::ControlFlow;
 ///
 /// Callers pass SQL that `validate_query` has already parsed; an unexpected
 /// parse failure returns the input unchanged rather than risk corrupting it.
-/// Like [`enforce_limit`], but when the server imposes the limit (appended,
-/// or lowered to the cap) it asks for one row more, so the caller can tell a
-/// cut result from one that fit. Returns the limit the server imposed.
+///
+/// When the server imposes the limit (appended, or lowered to the cap) it asks
+/// for one row more, so the caller can tell a cut result from one that fit.
+/// Returns the SQL and the limit the server imposed, if it imposed one.
 pub fn enforce_limit_probe(sql: &str, append_if_missing: i64, cap: i64) -> (String, Option<i64>) {
     rewrite_limit(sql, append_if_missing, cap, 1)
 }
 
-pub fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
-    rewrite_limit(sql, append_if_missing, cap, 0).0
-}
-
-/// Appends `append_if_missing` when there is no LIMIT and lowers a LIMIT above
-/// `cap` (or a non-literal one) to `cap`, each plus `extra`. Returns the SQL and
-/// the limit the server imposed, if it imposed one.
+/// The rule of [`enforce_limit_probe`], with `extra` added to whatever limit
+/// the server writes (1 there; 0 in the tests of the rule itself).
 fn rewrite_limit(sql: &str, append_if_missing: i64, cap: i64, extra: i64) -> (String, Option<i64>) {
     use sqlparser::ast::{Expr, LimitClause, Statement, Value};
     use sqlparser::dialect::GenericDialect;
@@ -197,7 +193,9 @@ pub fn normalize_hex_literals_clickhouse(sql: &str) -> String {
 
 #[cfg(test)]
 mod enforce_limit_tests {
-    use super::enforce_limit;
+    fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
+        super::rewrite_limit(sql, append_if_missing, cap, 0).0
+    }
 
     // append_if_missing = 100, cap = 1000 for these unless noted.
     fn el(sql: &str) -> String {

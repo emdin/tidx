@@ -145,8 +145,8 @@ impl ClickHouseEngine {
     }
 
     /// Public `/query` entry point: validated + capped, then executed.
-    /// `timeout_ms` becomes ClickHouse's own `max_execution_time`, so the query
-    /// stops server-side instead of running on after the HTTP client gives up.
+    /// `timeout_ms`, when the caller set one, becomes ClickHouse's own
+    /// `max_execution_time`; without it the query is not time-limited, as before.
     pub async fn query_public(
         &self,
         sql: &str,
@@ -157,7 +157,7 @@ impl ClickHouseEngine {
         let (sql, imposed) = Self::prepare_public_sql(sql, signatures, limit)?;
         // Defense in depth: even if SQL validation is bypassed, run the public
         // query under ClickHouse readonly mode so it cannot INSERT/DDL/write.
-        let mut result = self.run(&sql, Some(timeout_ms.unwrap_or(5000))).await?;
+        let mut result = self.run(&sql, Access::Public { timeout_ms }).await?;
         if let Some(n) = imposed
             && result.rows.len() as i64 > n
         {
@@ -173,7 +173,7 @@ impl ClickHouseEngine {
     /// `query_public`.
     pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
         let sql = Self::wrap_signatures(sql, signatures)?;
-        self.run(&sql, None).await
+        self.run(&sql, Access::Trusted).await
     }
 
     /// Execute already-prepared SQL, failing over across instances on
@@ -182,9 +182,7 @@ impl ClickHouseEngine {
     /// an execution concern for every CH statement: columns are lowercase
     /// 0x-strings compared case-sensitively, so a checksummed literal would
     /// silently match nothing. It is a no-op on DDL.
-    /// `public_timeout_ms`: `Some` for public queries, which run read-only with
-    /// that time limit; `None` for trusted internal ones.
-    async fn run(&self, sql: &str, public_timeout_ms: Option<u64>) -> Result<QueryResult> {
+    async fn run(&self, sql: &str, access: Access) -> Result<QueryResult> {
         let sql = normalize_hex_literals_clickhouse(sql);
 
         let start = std::time::Instant::now();
@@ -195,7 +193,7 @@ impl ClickHouseEngine {
             let idx = (starting + attempt) % n;
             let inst = &self.instances[idx];
 
-            match self.try_query(inst, &sql, start, public_timeout_ms).await {
+            match self.try_query(inst, &sql, start, access).await {
                 Ok(result) => {
                     if attempt > 0 {
                         self.active.store(idx, Ordering::Relaxed);
@@ -208,7 +206,7 @@ impl ClickHouseEngine {
                     }
                     return Ok(result);
                 }
-                Err(e) if is_connection_error(&e) && attempt + 1 < n => {
+                Err(e) if e.is::<ClickHouseUnreachable>() && attempt + 1 < n => {
                     error!(
                         url = %inst.url,
                         error = %e,
@@ -220,7 +218,7 @@ impl ClickHouseEngine {
             }
         }
 
-        Err(anyhow!("All ClickHouse instances unreachable"))
+        Err(ClickHouseUnreachable("no instances configured".to_string()).into())
     }
 
     async fn try_query(
@@ -228,14 +226,13 @@ impl ClickHouseEngine {
         inst: &Instance,
         sql: &str,
         start: std::time::Instant,
-        public_timeout_ms: Option<u64>,
+        access: Access,
     ) -> Result<QueryResult> {
-        let url = build_query_url(&inst.url, &self.database, public_timeout_ms.map(Some));
+        let url = build_query_url(&inst.url, &self.database, access);
 
-        let creds = if public_timeout_ms.is_some() {
-            &inst.public
-        } else {
-            &inst.main
+        let creds = match access {
+            Access::Public { .. } => &inst.public,
+            Access::Trusted => &inst.main,
         };
         let mut req = inst.http_client.post(&url).body(sql.to_string());
         if let Some(ref user) = creds.user {
@@ -244,20 +241,30 @@ impl ClickHouseEngine {
         if let Some(ref password) = creds.password {
             req = req.header("X-ClickHouse-Key", password);
         }
+        // The client has no timeout of its own, so a send error is transport:
+        // refused, reset, DNS.
         let resp = req
             .send()
             .await
-            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ClickHouse query failed: {error_text}"));
-        }
-
+            .map_err(|e| ClickHouseUnreachable(e.to_string()))?;
+        let status = resp.status();
+        let code = resp
+            .headers()
+            .get("x-clickhouse-exception-code")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let json_response = resp
             .text()
             .await
             .map_err(|e| anyhow!("Failed to read response: {e}"))?;
+
+        // ClickHouse answers its timeouts with 408 (TIMEOUT_EXCEEDED and kin).
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+            return Err(crate::service::QueryTimeout.into());
+        }
+        if !status.is_success() {
+            return Err(clickhouse_error(&exception_text(&json_response), code.as_deref()));
+        }
 
         if json_response.trim().is_empty() {
             return Ok(QueryResult {
@@ -272,6 +279,11 @@ impl ClickHouseEngine {
 
         let parsed: serde_json::Value = serde_json::from_str(&json_response)
             .map_err(|e| anyhow!("Failed to parse ClickHouse JSON response: {e}"))?;
+        // An error after rows were already sent arrives as a 200 whose JSON ends
+        // with `exception`; the rows before it are not a result.
+        if let Some(exception) = parsed.get("exception").and_then(|e| e.as_str()) {
+            return Err(clickhouse_error(exception, code.as_deref()));
+        }
 
         let meta = parsed.get("meta").and_then(|m| m.as_array());
         let data = parsed.get("data").and_then(|d| d.as_array());
@@ -327,41 +339,56 @@ impl ClickHouseEngine {
 #[error("ClickHouse unreachable: {0}")]
 pub struct ClickHouseUnreachable(pub String);
 
+/// How a statement runs: trusted internal DDL, or a public `/query` (read-only,
+/// time-limited when the caller asked for a limit).
+#[derive(Clone, Copy, Debug)]
+enum Access {
+    Trusted,
+    Public { timeout_ms: Option<u64> },
+}
+
+/// The exception text of an error body: the `exception` field when the body is
+/// JSON, else the body itself.
+fn exception_text(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("exception").and_then(|e| e.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// Code 159 is TIMEOUT_EXCEEDED. Read from the response header or the start of
+/// the exception, never from words elsewhere in it, which can quote the SQL.
+fn clickhouse_error(exception: &str, code: Option<&str>) -> anyhow::Error {
+    if code == Some("159") || exception.trim_start().starts_with("Code: 159.") {
+        crate::service::QueryTimeout.into()
+    } else {
+        anyhow!("ClickHouse query failed: {exception}")
+    }
+}
+
 /// Build the ClickHouse HTTP query URL. For public (`readonly`) queries we send
 /// `readonly=2`, which makes ClickHouse reject any INSERT/DDL/write — defense in
 /// depth behind SQL validation — while still permitting the `default_format`
 /// setting we pass (`readonly=1` would reject that). The trusted internal path
 /// (e.g. `views.rs` DDL) passes `readonly=false` and is unrestricted.
 ///
-/// Public queries also carry `max_execution_time` (whole seconds, at least 1)
-/// from the caller's `timeout_ms`, which readonly=2 still allows.
-fn build_query_url(base_url: &str, database: &str, public_timeout_ms: Option<Option<u64>>) -> String {
+/// Public queries also wait for the whole result before sending it
+/// (`wait_end_of_query=1`), so a failure part-way can't look like a short
+/// result, and carry the caller's `timeout_ms`, if any, as `max_execution_time`
+/// in seconds to the millisecond. readonly=2 allows both settings.
+fn build_query_url(base_url: &str, database: &str, access: Access) -> String {
     let mut url = format!(
         "{}/?database={}&default_format=JSON",
         base_url.trim_end_matches('/'),
         database
     );
-    if let Some(ms) = public_timeout_ms.map(|t| t.unwrap_or(5000)) {
-        url.push_str(&format!(
-            "&readonly=2&max_execution_time={}",
-            ms.div_ceil(1000).max(1)
-        ));
+    if let Access::Public { timeout_ms } = access {
+        url.push_str("&readonly=2&wait_end_of_query=1");
+        if let Some(ms) = timeout_ms {
+            url.push_str(&format!("&max_execution_time={}.{:03}", ms / 1000, ms % 1000));
+        }
     }
     url
-}
-
-/// Returns true for errors that indicate the ClickHouse instance is unreachable
-/// (connection refused, timeout, DNS failure, etc.) — as opposed to query-level
-/// errors that would happen on any instance.
-fn is_connection_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("HTTP request failed")
-        || msg.contains("connection refused")
-        || msg.contains("Connection refused")
-        || msg.contains("connect error")
-        || msg.contains("dns error")
-        || msg.contains("timed out")
-        || msg.contains("hyper::Error")
 }
 
 /// Query result from ClickHouse.
@@ -384,7 +411,7 @@ mod tests {
     fn public_query_url_is_readonly() {
         // The public /query path must run under readonly=2 so a validation
         // bypass still cannot write/DDL (the 2026-10-22 /views abuse).
-        let u = build_query_url("http://clickhouse:8123", "tidx_38833", Some(Some(5000)));
+        let u = build_query_url("http://clickhouse:8123", "tidx_38833", Access::Public { timeout_ms: Some(5000) });
         assert!(u.contains("readonly=2"), "public URL not readonly: {u}");
         assert!(u.contains("database=tidx_38833"));
         assert!(u.contains("default_format=JSON"));
@@ -395,12 +422,12 @@ mod tests {
     #[test]
     fn public_query_url_carries_the_callers_timeout() {
         for (ms, secs) in [(5000, "5.000"), (5001, "5.001"), (200, "0.200"), (30000, "30.000")] {
-            let u = build_query_url("http://clickhouse:8123", "tidx_38833", Some(Some(ms)));
+            let u = build_query_url("http://clickhouse:8123", "tidx_38833", Access::Public { timeout_ms: Some(ms) });
             assert!(u.ends_with(&format!("max_execution_time={secs}")), "{ms} ms: {u}");
         }
-        let unlimited = build_query_url("http://clickhouse:8123", "tidx_38833", Some(None));
+        let unlimited = build_query_url("http://clickhouse:8123", "tidx_38833", Access::Public { timeout_ms: None });
         assert!(!unlimited.contains("max_execution_time"), "{unlimited}");
-        let trusted = build_query_url("http://clickhouse:8123", "tidx_38833", None);
+        let trusted = build_query_url("http://clickhouse:8123", "tidx_38833", Access::Trusted);
         assert!(!trusted.contains("max_execution_time"), "{trusted}");
     }
 
@@ -408,7 +435,7 @@ mod tests {
     fn trusted_query_url_is_not_readonly() {
         // The trusted internal path issues DDL (views.rs); it must NOT be
         // readonly. Also check trailing-slash normalization.
-        let u = build_query_url("http://clickhouse:8123/", "tidx_38833", None);
+        let u = build_query_url("http://clickhouse:8123/", "tidx_38833", Access::Trusted);
         assert!(
             !u.contains("readonly"),
             "trusted URL must not be readonly: {u}"
@@ -417,13 +444,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_connection_error() {
-        let conn_err = anyhow!("ClickHouse HTTP request failed: connection refused");
-        assert!(is_connection_error(&conn_err));
-
-        let query_err =
-            anyhow!("ClickHouse query failed: Code: 60. DB::Exception: Table logs doesn't exist");
-        assert!(!is_connection_error(&query_err));
+    fn only_code_159_is_a_timeout() {
+        let timeout = clickhouse_error("Code: 159. DB::Exception: Timeout exceeded: elapsed 5 seconds", None);
+        assert!(timeout.is::<crate::service::QueryTimeout>());
+        let by_header = clickhouse_error("whatever", Some("159"));
+        assert!(by_header.is::<crate::service::QueryTimeout>());
+        let quoted = clickhouse_error("Code: 60. DB::Exception: Table Timeout_exceeded doesn't exist", Some("60"));
+        assert!(!quoted.is::<crate::service::QueryTimeout>());
+        assert!(quoted.to_string().contains("Code: 60"), "{quoted}");
     }
 
     #[test]
@@ -623,7 +651,8 @@ mod tests {
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     let head = String::from_utf8_lossy(&buf);
-                    tx.send(head.lines().next().unwrap_or_default().to_string()).unwrap();
+                    // Callers that don't look at requests drop the receiver.
+                    let _ = tx.send(head.lines().next().unwrap_or_default().to_string());
                     let resp = format!(
                         "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
@@ -657,6 +686,17 @@ mod tests {
             .query_public("SELECT num FROM blocks", &[], 10, Some(500))
             .await
             .expect_err("a timeout is an error");
+        assert!(err.downcast_ref::<crate::service::QueryTimeout>().is_some(), "{err:#}");
+    }
+
+    /// Production ClickHouse 26.8 answered a max_execution_time stop with 408.
+    #[tokio::test]
+    async fn any_408_is_a_typed_timeout() {
+        let (url, _) = spawn_canned("408 Request Time-out", "Code: 209. DB::NetException: Timeout".to_string()).await;
+        let err = engine_at(&url)
+            .query_public("SELECT num FROM blocks", &[], 10, Some(500))
+            .await
+            .expect_err("a 408 is an error");
         assert!(err.downcast_ref::<crate::service::QueryTimeout>().is_some(), "{err:#}");
     }
 

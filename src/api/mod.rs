@@ -77,75 +77,139 @@ pub struct AppState {
     pub freshness: Freshness,
 }
 
-pub type Freshness = Arc<std::sync::Mutex<HashMap<u64, (std::time::Instant, Indexed)>>>;
+pub type Freshness = Arc<FreshnessCache>;
+
+/// `Indexed` per chain, refreshed at most every `FRESHNESS_TTL`, plus when each
+/// head last changed value.
+#[derive(Default)]
+pub struct FreshnessCache {
+    entries: std::sync::Mutex<HashMap<u64, FreshnessEntry>>,
+    /// One refresh at a time; concurrent requests wait for it instead of each
+    /// taking a pool connection for the same reads.
+    refresh: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone, Default)]
+struct FreshnessEntry {
+    fetched_at: Option<std::time::Instant>,
+    indexed: Indexed,
+    /// (value, first seen at) for the chain, Postgres and ClickHouse heads.
+    since: [Option<(i64, std::time::Instant)>; 3],
+}
 
 /// `/query` callers may raise `timeout_ms` up to this.
 pub const MAX_TIMEOUT_MS: u64 = 30_000;
+/// Postgres `timeout_ms` when the caller sets none. ClickHouse has no default:
+/// it was never time-limited, and long aggregations rely on that.
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
 const FRESHNESS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How fresh each engine is, in every `/query` response. After the 2026-10-18
 /// reboot the ClickHouse sink was off for 4.5 days and no response showed it.
+///
+/// Staleness is how long a head has kept the same value, as seen from this API
+/// (0 the first time it is seen). `sync_state.updated_at` can't serve: every
+/// sync_state writer bumps it, including while the head is stuck.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Indexed {
     /// Newest chain block the indexer has seen.
     pub chain_head: Option<i64>,
-    /// Seconds since the indexer last updated that; large means it stalled.
-    pub chain_head_age_secs: Option<i64>,
+    pub chain_head_unchanged_secs: Option<u64>,
     /// Newest block in Postgres.
     pub postgres_head: Option<i64>,
+    pub postgres_head_unchanged_secs: Option<u64>,
     /// Postgres has every block up to here.
     pub postgres_contiguous: Option<i64>,
-    /// Newest block in ClickHouse; null without ClickHouse or when unreadable.
+    /// Newest block in ClickHouse; null without ClickHouse, when it is empty
+    /// or when it can't be read.
     pub clickhouse_head: Option<i64>,
+    pub clickhouse_head_unchanged_secs: Option<u64>,
 }
 
 impl AppState {
     /// Cached for a few seconds; anything unreadable is left null rather than
     /// failing the query it accompanies.
     pub async fn indexed(&self, chain_id: u64) -> Indexed {
-        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-        if let Some((at, ix)) = self.freshness.lock().unwrap().get(&chain_id)
-            && at.elapsed() < FRESHNESS_TTL
-        {
-            return ix.clone();
+        let cached = |cache: &FreshnessCache| {
+            cache
+                .entries
+                .lock()
+                .unwrap()
+                .get(&chain_id)
+                .filter(|e| e.fetched_at.is_some_and(|t| t.elapsed() < FRESHNESS_TTL))
+                .map(|e| e.indexed.clone())
+        };
+        if let Some(ix) = cached(&self.freshness) {
+            return ix;
         }
-        let mut ix = Indexed::default();
-        if let Some(pool) = self.get_pool(Some(chain_id)).await {
+        let _refreshing = self.freshness.refresh.lock().await;
+        if let Some(ix) = cached(&self.freshness) {
+            return ix;
+        }
+
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let pg = async {
+            let pool = self.get_pool(Some(chain_id)).await?;
             let read = async {
                 let conn = pool.get().await?;
                 let row = conn
                     .query_opt(
-                        "SELECT head_num, tip_num, synced_num,
-                                extract(epoch FROM now() - updated_at)::int8
-                         FROM sync_state WHERE chain_id = $1",
+                        "SELECT head_num, tip_num, synced_num FROM sync_state WHERE chain_id = $1",
                         &[&(chain_id as i64)],
                     )
                     .await?;
                 anyhow::Ok(row)
             };
-            if let Ok(Ok(Some(row))) = tokio::time::timeout(READ_TIMEOUT, read).await {
-                ix.chain_head = row.get(0);
-                ix.postgres_head = row.get(1);
-                ix.postgres_contiguous = row.get(2);
-                ix.chain_head_age_secs = row.get(3);
-            }
-        }
-        if let Some(ch) = self.get_clickhouse(Some(chain_id)).await
-            && let Ok(Ok(r)) =
-                tokio::time::timeout(READ_TIMEOUT, ch.query("SELECT max(num) FROM blocks", &[]))
-                    .await
-        {
+            let row = tokio::time::timeout(READ_TIMEOUT, read)
+                .await
+                .ok()?
+                .ok()??;
+            Some((
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(2),
+            ))
+        };
+        let ch = async {
+            let ch = self.get_clickhouse(Some(chain_id)).await?;
+            let sql = "SELECT max(num) FROM blocks HAVING count() > 0";
+            let r = tokio::time::timeout(READ_TIMEOUT, ch.query(sql, &[]))
+                .await
+                .ok()?
+                .ok()?;
             // The compatibility profile returns 64-bit integers as strings.
-            ix.clickhouse_head = r.rows.first().and_then(|row| row.first()).and_then(|v| {
+            r.rows.first().and_then(|row| row.first()).and_then(|v| {
                 v.as_i64()
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            });
-        }
-        self.freshness
-            .lock()
-            .unwrap()
-            .insert(chain_id, (std::time::Instant::now(), ix.clone()));
+            })
+        };
+        let (pg, ch) = tokio::join!(pg, ch);
+
+        let now = std::time::Instant::now();
+        let mut entries = self.freshness.entries.lock().unwrap();
+        let entry = entries.entry(chain_id).or_default();
+        let mut unchanged = |i: usize, v: Option<i64>| -> Option<u64> {
+            let v = v?;
+            match entry.since[i] {
+                Some((seen, at)) if seen == v => Some(now.duration_since(at).as_secs()),
+                _ => {
+                    entry.since[i] = Some((v, now));
+                    Some(0)
+                }
+            }
+        };
+        let ix = Indexed {
+            chain_head: pg.map(|r| r.0),
+            chain_head_unchanged_secs: unchanged(0, pg.map(|r| r.0)),
+            postgres_head: pg.map(|r| r.1),
+            postgres_head_unchanged_secs: unchanged(1, pg.map(|r| r.1)),
+            postgres_contiguous: pg.map(|r| r.2),
+            clickhouse_head: ch,
+            clickhouse_head_unchanged_secs: unchanged(2, ch),
+        };
+        entry.fetched_at = Some(now);
+        entry.indexed = ix.clone();
         ix
     }
 }
@@ -779,9 +843,10 @@ pub struct QueryParams {
     /// Enable live streaming mode (SSE) - streams updates on new blocks
     #[serde(default)]
     live: bool,
-    /// Query timeout in milliseconds
-    #[serde(default = "default_timeout")]
-    timeout_ms: u64,
+    /// Query timeout in milliseconds. Postgres defaults to DEFAULT_TIMEOUT_MS;
+    /// ClickHouse is only time-limited when this is set.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
@@ -814,9 +879,6 @@ where
     })
 }
 
-fn default_timeout() -> u64 {
-    5000
-}
 fn default_limit() -> i64 {
     crate::query::HARD_LIMIT_MAX
 }
@@ -925,11 +987,14 @@ async fn handle_query_once(
     // who explicitly opt into it via ?engine=clickhouse get HARD_LIMIT_CLICKHOUSE.
     let cap = crate::query::engine_limit_cap(params.engine.as_deref());
     let options = QueryOptions {
-        timeout_ms: params.timeout_ms.clamp(100, MAX_TIMEOUT_MS),
+        timeout_ms: params
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(100, MAX_TIMEOUT_MS),
         limit: params.limit.clamp(1, cap),
     };
+    let clickhouse_timeout_ms = params.timeout_ms.map(|t| t.clamp(100, MAX_TIMEOUT_MS));
 
-    // Postgres unless the caller asks for ClickHouse.
     let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
     let engine = if use_clickhouse {
         "clickhouse"
@@ -941,16 +1006,20 @@ async fn handle_query_once(
     let started = std::time::Instant::now();
     let result = if use_clickhouse {
         let Some(clickhouse) = state.get_clickhouse(Some(params.chain_id)).await else {
-            return ApiError::BadRequest(format!(
+            let error = format!(
                 "ClickHouse not configured for chain_id: {}",
                 params.chain_id
-            ))
-            .into_response();
+            );
+            let body = serde_json::json!({
+                "ok": false, "error": error, "engine": engine,
+                "indexed": state.indexed(params.chain_id).await,
+            });
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
         };
         // Validated + capped public entry point (never the raw `query`, which
         // is the unvalidated DDL path used by views.rs).
         clickhouse
-            .query_public(&params.sql, &sigs, options.limit, Some(options.timeout_ms))
+            .query_public(&params.sql, &sigs, options.limit, clickhouse_timeout_ms)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
@@ -973,60 +1042,58 @@ async fn handle_query_once(
             indexed,
         })
         .into_response(),
-        Err(e) => query_failure(
-            &e.to_string(),
-            engine,
-            options.timeout_ms,
-            elapsed_ms,
-            indexed,
-        ),
+        Err(e) => {
+            let timeout_ms = if use_clickhouse {
+                clickhouse_timeout_ms
+            } else {
+                Some(options.timeout_ms)
+            };
+            let has_clickhouse = state.get_clickhouse(Some(params.chain_id)).await.is_some();
+            query_failure(&e, engine, timeout_ms, has_clickhouse, elapsed_ms, indexed)
+        }
     }
 }
 
-/// Postgres: our own deadline ("Query timeout") or its statement_timeout
-/// cancel. ClickHouse: max_execution_time (TIMEOUT_EXCEEDED). Narrow on
-/// purpose: an error that merely echoes SQL containing "timeout" is not one.
-fn is_timeout(msg: &str) -> bool {
-    [
-        "Query timeout",
-        "statement timeout",
-        "TIMEOUT_EXCEEDED",
-        "Timeout exceeded",
-        "operation timed out",
-    ]
-    .iter()
-    .any(|p| msg.contains(p))
-}
-
 /// A failed `/query`: the database's own error text, which engine ran it, how
-/// long it took, and the same freshness as a successful response. A timeout
-/// also says what to try instead.
+/// long it took, and the same freshness as a successful response. Timeouts
+/// (408) and an unreachable ClickHouse (503) are recognised by error type,
+/// never by error text, which can echo the caller's SQL.
 fn query_failure(
-    msg: &str,
+    e: &anyhow::Error,
     engine: &str,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
+    has_clickhouse: bool,
     elapsed_ms: f64,
     indexed: Indexed,
 ) -> Response {
-    if is_timeout(msg) {
-        let hint = if engine == "postgres" {
+    if e.is::<crate::service::QueryTimeout>() {
+        let hint = if engine == "postgres" && has_clickhouse {
             "Postgres reads every matching row, so aggregations over busy addresses or long ranges are much faster with engine=clickhouse."
         } else {
             "Narrow the block or time range, or aggregate more coarsely."
         };
-        let error = format!(
-            "Query timed out after {elapsed_ms:.0} ms on {engine} (timeout_ms={timeout_ms}; the maximum is {MAX_TIMEOUT_MS}). {hint}"
-        );
+        let limit = match timeout_ms {
+            Some(t) => format!("timeout_ms={t}; the maximum is {MAX_TIMEOUT_MS}"),
+            None => "no timeout_ms set".to_string(),
+        };
+        let error =
+            format!("Query timed out after {elapsed_ms:.0} ms on {engine} ({limit}). {hint}");
         let body = serde_json::json!({
             "ok": false, "error": error, "engine": engine,
             "timeout_ms": timeout_ms, "elapsed_ms": elapsed_ms, "indexed": indexed,
         });
         return (StatusCode::REQUEST_TIMEOUT, Json(body)).into_response();
     }
+    let status = if e.is::<crate::clickhouse::ClickHouseUnreachable>() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
     let body = serde_json::json!({
-        "ok": false, "error": msg, "engine": engine, "elapsed_ms": elapsed_ms, "indexed": indexed,
+        "ok": false, "error": e.to_string(), "engine": engine,
+        "elapsed_ms": elapsed_ms, "indexed": indexed,
     });
-    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+    (status, Json(body)).into_response()
 }
 
 type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>>;
@@ -1058,7 +1125,10 @@ async fn handle_query_live(
     // HARD_LIMIT_MAX. Using engine_limit_cap keeps the call site uniform.
     let cap = crate::query::engine_limit_cap(params.engine.as_deref());
     let options = QueryOptions {
-        timeout_ms: params.timeout_ms.clamp(100, MAX_TIMEOUT_MS),
+        timeout_ms: params
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(100, MAX_TIMEOUT_MS),
         limit: params.limit.clamp(1, cap),
     };
 

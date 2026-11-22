@@ -267,10 +267,21 @@ pub async fn execute_query_postgres(
             metrics::record_query_duration(start.elapsed());
             rows
         }
+        // statement_timeout and lock_timeout cancels, by SQLSTATE: the message
+        // text can echo the caller's own SQL.
+        Ok(Err(e))
+            if matches!(
+                e.code(),
+                Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+                    | Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+            ) =>
+        {
+            return Err(QueryTimeout.into());
+        }
         Ok(Err(e)) => {
             return Err(anyhow!("Query error: {}", sanitize_db_error(&format_pg_error(&e))));
         }
-        Err(_) => return Err(anyhow!("Query timeout")),
+        Err(_) => return Err(QueryTimeout.into()),
     };
 
     // Get columns from result (even if empty, prepared statement has column info)

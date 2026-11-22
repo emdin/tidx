@@ -214,7 +214,7 @@ pub fn tables_metadata() -> Vec<TableInfo> {
                 col("address", "BYTEA / String", "Recipient L2 address"),
                 col("amount_gwei", "INT8", "Amount in EVM gwei (1e-9 ETH)"),
                 col("amount_sompi", "INT8", "Amount in Kaspa sompi (1e-8 KAS) credited to the recipient"),
-                col("kaspa_txid", "BYTEA (Postgres only)", "Kaspa transaction id of the entry; NULL while that transaction is not yet in `kaspa_entries`. Linked by index_le."),
+                col("kaspa_txid", "BYTEA (Postgres only)", "Kaspa transaction id of the entry, when known (NULL otherwise); its last 8 bytes equal index_le. Join `kaspa_entries` on it for the L1 sender."),
             ],
             examples: vec![
                 QueryExample {
@@ -508,7 +508,7 @@ pub fn tips() -> Vec<&'static str> {
         "Pagination: Postgres caps each page at 10000 rows, ClickHouse at 50000 (?engine=clickhouse). A response cut at the cap has `truncated: true`; a LIMIT you write never counts. Page by a stable key rather than a growing OFFSET: ORDER BY block_num DESC, idx and continue with WHERE (block_num, idx) < (last_block_num, last_idx).",
         "Engine: Postgres unless you add ?engine=clickhouse (or \"engine\": \"clickhouse\" in a POST body). Postgres suits point lookups; aggregations over busy addresses or long ranges can time out there but take well under a second on ClickHouse. Timeouts default to 5 s; raise with timeout_ms (max 30000).",
         "Long SQL (big IN lists): POST the same fields as JSON — {\"chainId\": 38833, \"sql\": \"...\", \"engine\": \"clickhouse\"} — instead of putting the SQL in the URL.",
-        "Freshness: every /query response has `indexed` — chain_head, chain_head_age_secs (large means the indexer stalled), postgres_head, postgres_contiguous and clickhouse_head. The two engines can lag differently; check the one you query.",
+        "Freshness: every /query response has `indexed`: chain_head, postgres_head, postgres_contiguous and clickhouse_head, each head with `*_unchanged_secs` (how long it has kept that value; a large number means that copy stopped advancing). The two engines can lag differently; check the one you query.",
         "uint256 columns (value, max_fee_per_gas, effective_gas_price) are stored as strings for portability. ClickHouse also has UInt256 mirror columns (`value_u256`, `max_fee_per_gas_u256`, `max_priority_fee_per_gas_u256`, `effective_gas_price_u256`) so you can write `WHERE value_u256 > 1000000000000000000` directly without `toUInt256OrZero()`. Postgres: cast the string columns with `::numeric` for arithmetic.",
         "BYTEA columns: filter via decode('hex_no_prefix','hex'); display via encode(col,'hex'). In ClickHouse the same columns are hex-prefixed strings (e.g., '0xabc...') so LIKE '0xprefix%' works directly.",
         "Internal calls (CALL, DELEGATECALL, CREATE, etc.) made by contracts inside a tx are indexed in `internal_txs` — captured from debug_traceTransaction's callTracer. Use it to find ERC-20 transfers performed by routers, internal value moves, or to reconstruct a tx's full call tree via (tx_hash, path_idx).",

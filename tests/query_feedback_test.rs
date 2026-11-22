@@ -129,7 +129,9 @@ async fn app_with_clickhouse(pool: &Pool, clickhouse_url: &str) -> App {
         &tidx::config::HttpConfig::default(),
     )
     .into_make_service_with_connect_info::<SocketAddr>();
-    svc.call(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap()
+    svc.call(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap()
 }
 
 async fn get(app: &mut App, path_and_query: &str) -> (StatusCode, Value) {
@@ -337,7 +339,13 @@ async fn postgres_timeout_suggests_clickhouse_where_it_exists() {
     );
     let (status, body) = get(&mut app, &q(&sql, "&timeout_ms=200")).await;
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("engine=clickhouse"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("engine=clickhouse"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -346,9 +354,20 @@ async fn an_error_that_merely_mentions_timeout_is_not_a_timeout() {
     let db = TestDb::empty().await;
     set_sync_state(&db.pool, 10, 10, 10, 1).await;
     let mut app = app(&db.pool).await;
-    let (status, body) = get(&mut app, &q(r#"SELECT "statement timeout" FROM blocks"#, "")).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "a missing column, not a timeout: {body}");
-    assert!(body["error"].as_str().unwrap().contains("does not exist"), "{body}");
+    let (status, body) = get(
+        &mut app,
+        &q(r#"SELECT "statement timeout" FROM blocks"#, ""),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a missing column, not a timeout: {body}"
+    );
+    assert!(
+        body["error"].as_str().unwrap().contains("does not exist"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -363,8 +382,14 @@ async fn clickhouse_timeout_is_a_408_naming_clickhouse() {
     )
     .await;
     let mut app = app_with_clickhouse(&db.pool, &ch).await;
-    let (status, body) =
-        get(&mut app, &q("SELECT num FROM blocks", "&engine=clickhouse&timeout_ms=300")).await;
+    let (status, body) = get(
+        &mut app,
+        &q(
+            "SELECT num FROM blocks",
+            "&engine=clickhouse&timeout_ms=300",
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{body}");
     assert_eq!(body["engine"], "clickhouse");
     assert_eq!(body["timeout_ms"], 300);
