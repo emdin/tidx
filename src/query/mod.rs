@@ -32,6 +32,13 @@ use std::ops::ControlFlow;
 ///
 /// Callers pass SQL that `validate_query` has already parsed; an unexpected
 /// parse failure returns the input unchanged rather than risk corrupting it.
+/// Like [`enforce_limit`], but when the server imposes the limit (appended,
+/// or lowered to the cap) it asks for one row more, so the caller can tell a
+/// cut result from one that fit. Returns the limit the server imposed.
+pub fn enforce_limit_probe(sql: &str, append_if_missing: i64, cap: i64) -> (String, Option<i64>) {
+    (enforce_limit(sql, append_if_missing, cap), None)
+}
+
 pub fn enforce_limit(sql: &str, append_if_missing: i64, cap: i64) -> String {
     use sqlparser::ast::{Expr, LimitClause, Statement, Value};
     use sqlparser::dialect::GenericDialect;
