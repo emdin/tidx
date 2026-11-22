@@ -3,4 +3,4 @@ CREATE TABLE IF NOT EXISTS kaspa_l2_submissions (
     kaspa_txid  String,
     created_at  DateTime64(3, 'UTC')
 ) ENGINE = ReplacingMergeTree()
-ORDER BY (l2_tx_hash)
+ORDER BY (l2_tx_hash, kaspa_txid)

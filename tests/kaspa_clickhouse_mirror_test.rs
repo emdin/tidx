@@ -46,11 +46,22 @@ async fn every_kaspa_carrier_of_an_l2_tx_survives_merges() {
         return;
     };
     // Separate inserts make separate parts, as promotions minutes apart do.
-    mirror.write_l2_submissions(&[carrier(0xaa, 0x01)]).await.unwrap();
-    mirror.write_l2_submissions(&[carrier(0xaa, 0x02)]).await.unwrap();
+    mirror
+        .write_l2_submissions(&[carrier(0xaa, 0x01)])
+        .await
+        .unwrap();
+    mirror
+        .write_l2_submissions(&[carrier(0xaa, 0x02)])
+        .await
+        .unwrap();
     // A re-promotion of the same carrier is still one row.
-    mirror.write_l2_submissions(&[carrier(0xaa, 0x02)]).await.unwrap();
-    ch.query("OPTIMIZE TABLE kaspa_l2_submissions FINAL").await.unwrap();
+    mirror
+        .write_l2_submissions(&[carrier(0xaa, 0x02)])
+        .await
+        .unwrap();
+    ch.query("OPTIMIZE TABLE kaspa_l2_submissions FINAL")
+        .await
+        .unwrap();
 
     let rows = ch
         .query("SELECT kaspa_txid FROM kaspa_l2_submissions FINAL ORDER BY kaspa_txid FORMAT TSV")
@@ -58,7 +69,10 @@ async fn every_kaspa_carrier_of_an_l2_tx_survives_merges() {
         .unwrap();
     assert_eq!(
         rows.lines().collect::<Vec<_>>(),
-        [format!("0x{}", "01".repeat(32)), format!("0x{}", "02".repeat(32))],
+        [
+            format!("0x{}", "01".repeat(32)),
+            format!("0x{}", "02".repeat(32))
+        ],
     );
 }
 
@@ -68,7 +82,10 @@ async fn hashes_and_addresses_are_0x_hex_like_every_other_clickhouse_table() {
     let Some((ch, mirror)) = fresh_mirror().await else {
         return;
     };
-    mirror.write_l2_submissions(&[carrier(0xab, 0xcd)]).await.unwrap();
+    mirror
+        .write_l2_submissions(&[carrier(0xab, 0xcd)])
+        .await
+        .unwrap();
     mirror
         .write_entries(&[FinalEntry {
             kaspa_txid: [0x97; 32],
@@ -94,5 +111,27 @@ async fn hashes_and_addresses_are_0x_hex_like_every_other_clickhouse_table() {
     assert_eq!(
         entry.trim_end(),
         format!("0x{}\t0x{}", "97".repeat(32), "ee".repeat(20))
+    );
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn a_table_with_the_old_key_is_reported() {
+    let Some((ch, mirror)) = fresh_mirror().await else {
+        return;
+    };
+    assert_eq!(mirror.stale_l2_sorting_key().await.unwrap(), None);
+
+    ch.query("DROP TABLE kaspa_l2_submissions").await.unwrap();
+    ch.query(
+        "CREATE TABLE kaspa_l2_submissions (l2_tx_hash String, kaspa_txid String, \
+         created_at DateTime64(3, 'UTC')) ENGINE = ReplacingMergeTree() ORDER BY (l2_tx_hash)",
+    )
+    .await
+    .unwrap();
+    mirror.ensure_schema().await.unwrap();
+    assert_eq!(
+        mirror.stale_l2_sorting_key().await.unwrap().as_deref(),
+        Some("l2_tx_hash")
     );
 }

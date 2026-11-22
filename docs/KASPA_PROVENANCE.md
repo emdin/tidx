@@ -106,6 +106,18 @@ kaspa_entries
 
 Pending rows are intentionally not mirrored because they are reorg-sensitive.
 
+Hashes and addresses are `0x`-prefixed lowercase hex, as in every other
+ClickHouse table. `kaspa_l2_submissions` is keyed on `(l2_tx_hash, kaspa_txid)`:
+one L2 tx can have several Kaspa carriers, and each is a row.
+
+Only the engine's promotion step writes to ClickHouse. `tidx backfill-kaspa*`
+write Postgres only, so after one of them run
+`deploy/prod/ch-resync-kaspa.sh`, which copies both tables from Postgres and
+checks the counts match. A table created before the
+`(l2_tx_hash, kaspa_txid)` key (the engine warns at startup) needs
+`deploy/prod/ch-resync-kaspa.sh --rebuild`, run once the engine writing `0x`
+hex is live.
+
 ## Smoke Queries
 
 Postgres:
